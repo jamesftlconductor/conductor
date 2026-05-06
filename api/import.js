@@ -19,6 +19,45 @@ function contentFingerprint(signal) {
   return `desc:${desc}|from:${sender}`;
 }
 
+// Word-bounded so "office" / "officer" don't trip the "off" rule. The "% off"
+// branch is separate because the leading "%" isn't a word character.
+const PROMO_REGEX = /\b(?:sale|off|discount|promo|deal|offer|coupon|shop now|limited time|exclusive|unsubscribe)\b|%\s*off/i;
+const PROMO_SENDER_PREFIXES = ["noreply", "no-reply", "marketing", "promotions"];
+
+function senderLocalPart(from) {
+  const match = from.match(/<([^>]+)>/) || from.match(/(\S+@\S+)/);
+  if (!match) return "";
+  return match[1].toLowerCase().split("@")[0];
+}
+
+// Runs after Claude parses the email but before we write the signal. Returns
+// a reason string when the signal should be discarded, or null to keep.
+function postParseDiscardReason(signal, from) {
+  // All-Unknown shell: Claude couldn't extract anything actionable. Storing
+  // these clutters the ring with phantom signals.
+  if (
+    signal.type === "unknown" &&
+    signal.status === "Unknown" &&
+    !signal.eta &&
+    !signal.trackingNumber
+  ) {
+    return "all-unknown";
+  }
+  // Promo language in the description — Claude correctly extracted the words
+  // but the email is marketing, not a real arrival.
+  if (PROMO_REGEX.test(signal.description || "")) return "promo-keyword";
+  // Promo sender — kept if status conveys real info (e.g. "Order shipped"
+  // notices legitimately come from noreply@).
+  const local = senderLocalPart(from);
+  if (
+    PROMO_SENDER_PREFIXES.some(p => local.startsWith(p)) &&
+    (!signal.status || signal.status === "Unknown")
+  ) {
+    return "promo-sender";
+  }
+  return null;
+}
+
 export async function runImport(userId) {
   if (!userId) throw new Error("No userId provided");
 
@@ -135,6 +174,18 @@ ${emailText.substring(0, 1000)}`,
       // Mark as imported once parsing succeeds — covers both the lpush path
       // below and the stale-eta skip, so neither gets re-processed.
       await redis.sadd(importedSetKey, message.id);
+
+      // Quality gate — runs after the messageId is stamped so we don't reprocess
+      // the same junk on every sync. The signal is silently dropped (no list
+      // write, no fingerprint write) when Claude's output is meaningless or the
+      // email is clearly promotional.
+      const discardReason = postParseDiscardReason(signal, from);
+      if (discardReason) {
+        console.log(
+          `[import] discard ${discardReason}: "${(signal.description || "").slice(0, 60)}" from "${from.slice(0, 60)}"`
+        );
+        continue;
+      }
 
       // Content guard catches duplicates the messageId set can't see — e.g.
       // legacy signals stored before messageId was tracked, or the same order

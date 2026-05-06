@@ -66,6 +66,16 @@ function isHomeRequirement(s) {
   return offset === 0 || offset === 1;
 }
 
+// Coarse ring classification used by the briefedToday mute logic. Inner =
+// urgent right now, middle = within next 14 days, outer = everything else
+// (including signals with no ETA — they live on the outer ring conceptually
+// because we have no signal that they're imminent).
+function computeRing(s) {
+  if (classifyUrgent(s)) return "inner";
+  if (isInNearWindow(s)) return "middle";
+  return "outer";
+}
+
 function eventClassifiedAs(e, keywords) {
   const haystack = [
     e.category,
@@ -182,6 +192,10 @@ export default async function handler(req, res) {
       rawBriefed,
       rawPreferences,
       firstRunFlag,
+      rawBriefedToday,
+      rawBriefedThisWeek,
+      rawClearanceBriefed,
+      rawCarriedForward,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       redis.get(`household:${householdId}:calendar`),
@@ -191,9 +205,42 @@ export default async function handler(req, res) {
       redis.lrange(`household:${householdId}:briefed`, 0, -1),
       userId ? redis.get(`user:${userId}:preferences`) : Promise.resolve(null),
       redis.get(`household:${householdId}:firstRun`),
+      redis.hgetall(`household:${householdId}:briefedToday`),
+      redis.smembers(`household:${householdId}:briefedThisWeek`),
+      redis.smembers(`household:${householdId}:clearanceBriefed`),
+      redis.smembers(`household:${householdId}:carriedForward`),
     ]);
 
     const allSignals = (rawSignals || []).map(safeJson).filter(Boolean);
+
+    // Carry-forward marking — happens before activeSignals is derived so the
+    // flag is visible to downstream pools and the prompt. A signal that landed
+    // in last night's clearanceBriefed (LAST CHANCE) and is still active this
+    // morning gets carriedForward stamped on its record + an entry in the
+    // carriedForward set so notify.js can detect "still open" at push time.
+    const clearanceBriefedIds = new Set((rawClearanceBriefed || []).map(String));
+    const carriedForwardKey = `household:${householdId}:carriedForward`;
+    const carriedForwardIdsToAdd = [];
+    if (clearanceBriefedIds.size > 0) {
+      const signalsListKey = `household:${householdId}:signals`;
+      for (let i = 0; i < allSignals.length; i++) {
+        const s = allSignals[i];
+        if (!s) continue;
+        if (!clearanceBriefedIds.has(String(s.id))) continue;
+        const stillActive = !s.state || s.state === "incoming" || s.state === "active";
+        if (!stillActive) continue;
+        if (s.carriedForward === true) continue; // already stamped on a prior run
+        s.carriedForward = true;
+        s.carriedForwardAt = Date.now();
+        await redis.lset(signalsListKey, i, JSON.stringify(s));
+        carriedForwardIdsToAdd.push(String(s.id));
+      }
+      if (carriedForwardIdsToAdd.length > 0) {
+        await redis.sadd(carriedForwardKey, ...carriedForwardIdsToAdd);
+        await redis.expire(carriedForwardKey, 48 * 60 * 60);
+      }
+    }
+
     const activeSignals = allSignals.filter(
       (s) => !s.state || s.state === "incoming" || s.state === "active"
     );
@@ -204,14 +251,61 @@ export default async function handler(req, res) {
     if (!Array.isArray(preferences.flaggedCategories)) preferences.flaggedCategories = [];
     const briefedIds = new Set((rawBriefed || []).map((s) => String(s)));
 
-    // URGENT
+    // Carry-forward pool — signals flagged on this run plus pre-existing ones
+    // from the 48h set, intersected with still-active records. Drives both the
+    // prompt section and (separately) the morning push suffix.
+    const carriedForwardIds = new Set([
+      ...(rawCarriedForward || []).map(String),
+      ...carriedForwardIdsToAdd,
+    ]);
+    const carriedForwardSignals = activeSignals.filter((s) =>
+      carriedForwardIds.has(String(s.id))
+    );
+
+    // Background-mute state — what was already narrated in the last 20h, and
+    // what's been acknowledged this week. Both keys carry their own TTLs so
+    // we don't have to prune here.
+    const briefedTodayMap = (rawBriefedToday && typeof rawBriefedToday === "object")
+      ? rawBriefedToday
+      : {};
+    const briefedThisWeek = new Set((rawBriefedThisWeek || []).map(String));
+
+    // Returns the snapshot stored at the last brief, or null if this signal
+    // wasn't in the previous run.
+    function previousSnapshot(s) {
+      const raw = briefedTodayMap[String(s.id)];
+      if (raw == null) return null;
+      if (typeof raw === "string") {
+        try { return JSON.parse(raw); } catch { return null; }
+      }
+      return raw;
+    }
+
+    // True when status, state, and ring all match the prior brief — signal
+    // hasn't moved meaningfully, so don't re-narrate. Urgent signals bypass
+    // this check explicitly at the call site.
+    function isBackgroundFiltered(s) {
+      const prev = previousSnapshot(s);
+      if (!prev) return false;
+      const sameStatus = (prev.status || "") === (s.status || "");
+      const sameState = (prev.state || "") === (s.state || "");
+      const sameRing = (prev.ring || "") === computeRing(s);
+      return sameStatus && sameState && sameRing;
+    }
+
+    // URGENT — never background-filtered. The user's instruction is explicit:
+    // urgent always surfaces, even if the same signal landed in the last brief.
     const urgentSignals = activeSignals.filter(classifyUrgent);
     const urgentIds = new Set(urgentSignals.map((s) => String(s.id)));
 
-    // NEAR WINDOW (excluding urgent)
+    // NEAR WINDOW (excluding urgent) — background-filter applies. A near-window
+    // signal that's already been narrated and hasn't shifted ring/status/state
+    // moves to the silent background pool (still on the Hover radar, just not
+    // narrated again until something changes).
     const nearSignals = activeSignals
       .filter((s) => !urgentIds.has(String(s.id)))
-      .filter(isInNearWindow);
+      .filter(isInNearWindow)
+      .filter((s) => !isBackgroundFiltered(s));
 
     // DEADLINES — pull from :deadlines and classify into urgent / near pools.
     // 1-3 days → urgent, 4-14 days → near, 15-90 days → horizon (handled below).
@@ -248,7 +342,11 @@ export default async function handler(req, res) {
       // them with the [DEADLINE] prefix and a Category field.
       const tagged = { ...d, _isDeadline: true, type: "deadline" };
       if (days >= -1 && days <= 3) urgentDeadlines.push(tagged);
-      else if (days > 3 && days <= 14) nearDeadlines.push(tagged);
+      else if (days > 3 && days <= 14) {
+        // Near-window deadlines get the background-filter treatment too,
+        // since they are also subject to the "don't repeat last brief" rule.
+        if (!isBackgroundFiltered(tagged)) nearDeadlines.push(tagged);
+      }
       // 15-90 reserved for horizon; handled below.
     }
 
@@ -264,10 +362,16 @@ export default async function handler(req, res) {
         return start && isWithinNextHours(start, 48);
       });
 
-    // HOME REQUIREMENTS — service signals today or tomorrow
-    const homeRequirements = activeSignals.filter(isHomeRequirement);
+    // HOME REQUIREMENTS — service signals today or tomorrow. Same mute rule:
+    // if we already flagged "Plumber tomorrow at 9" yesterday and nothing
+    // changed, don't say it again this morning.
+    const homeRequirements = activeSignals
+      .filter(isHomeRequirement)
+      .filter((s) => !isBackgroundFiltered(s));
 
-    // FLAGGED CATEGORIES — match against nearSignals + calendar events
+    // FLAGGED CATEGORIES — match against nearSignals + calendar events.
+    // nearSignals is already background-filtered above, so flagged-category
+    // matches inherit the mute behavior automatically.
     const flaggedSignals = {};
     for (const cat of preferences.flaggedCategories) {
       if (!cat || typeof cat !== "string") continue;
@@ -320,6 +424,26 @@ export default async function handler(req, res) {
         );
         await redis.lpush(`household:${householdId}:briefed`, String(horizonSignal.id));
       }
+    }
+
+    // HORIZON AWARENESS — outer-ring signals (ETA > 14 days) that haven't
+    // been acknowledged this week. Broader than HORIZON SIGNAL: any active
+    // signal qualifies, not just deadlines. Picks the closest-ETA so the
+    // weekly nod lands on the most imminent of the far-out things. We mark
+    // the picked signal in briefedThisWeek after the response is generated.
+    let horizonAwarenessSignal = null;
+    {
+      const candidates = activeSignals.filter((s) => {
+        if (s.status === "Delivered") return false;
+        if (briefedThisWeek.has(String(s.id))) return false;
+        const eta = parseDateLoose(s.eta);
+        if (!eta) return false;
+        return dayOffsetFromToday(eta) > 14;
+      });
+      candidates.sort(
+        (a, b) => parseDateLoose(a.eta).getTime() - parseDateLoose(b.eta).getTime()
+      );
+      horizonAwarenessSignal = candidates[0] || null;
     }
 
     const isFirstRun =
@@ -395,10 +519,20 @@ export default async function handler(req, res) {
       `FLAGGED CATEGORIES:`,
       Object.keys(flaggedSignals).length > 0 ? JSON.stringify(flaggedSignals) : "No flagged categories set",
       ``,
+      `CARRIED FORWARD FROM YESTERDAY (quiet note, end of brief before horizon, only if present):`,
+      carriedForwardSignals.length > 0
+        ? carriedForwardSignals.map(formatSignal).join("\n")
+        : "None",
+      ``,
       `HORIZON SIGNAL (one sentence, end of brief, surprising, specific):`,
       horizonSignal
         ? `- ${horizonSignal.description || "Unknown"} | ETA/Deadline: ${etaWithFriendly(horizonSignal.eta)}`
         : "None this week",
+      ``,
+      `HORIZON AWARENESS (mention at most once, at end of brief, one sentence only):`,
+      horizonAwarenessSignal
+        ? `- ${horizonAwarenessSignal.description || "Unknown"} | ETA: ${etaWithFriendly(horizonAwarenessSignal.eta)}`
+        : "None",
     ].join("\n");
 
     const baseRules = `RULES:
@@ -408,7 +542,9 @@ export default async function handler(req, res) {
 - Health context: one sentence only if genuinely notable — silent if normal. If sleep.duration is under 6 hours, surface it in a calm, day-shaping way (e.g. "${userName} slept under six hours last night — worth keeping the day manageable"). If hrv.current is meaningfully below hrv.baseline7d (roughly 15% or more lower), surface it as a recovery cue (e.g. "Recovery looks low today — a lighter afternoon might serve you well"). Never quote specific numbers, percentages, or units — only contextual observations. If both sleep and HRV look normal (or data is missing), say nothing about health.
 - Childcare: mention only if it affects coordination today or tomorrow
 - Home requirements: flag naturally if service window conflicts with likely schedule
+- Carried forward: if CARRIED FORWARD FROM YESTERDAY is populated, weave in one understated sentence near the end (before the horizon line) — e.g. "Carrying forward from yesterday: the HVAC appointment is still unconfirmed." Never alarming, never repetitive of the main brief narrative. If multiple carry-forwards exist, name at most one or two; the rest are implied.
 - Horizon signal: one sentence at the end, tonal shift to future-aware, specific and surprising
+- Horizon awareness: if HORIZON AWARENESS is populated, surface it as one quiet sentence near the end (a "by the way..." not a lead). If both HORIZON SIGNAL and HORIZON AWARENESS are populated, prefer HORIZON AWARENESS — at most one horizon-style sentence per brief total.
 - If multiple layers are silent, the brief is shorter — that is correct and good
 - A quiet brief is a gift — end with confidence not apology
 - Never say "here is your brief" or use assistant language
@@ -456,8 +592,9 @@ export default async function handler(req, res) {
     }
 
     // Tag clickable signal phrases — pass everything that could plausibly appear.
-    const tagPool = [...urgentForPrompt, ...nearForPrompt, ...homeRequirements];
+    const tagPool = [...urgentForPrompt, ...nearForPrompt, ...homeRequirements, ...carriedForwardSignals];
     if (horizonSignal) tagPool.push(horizonSignal);
+    if (horizonAwarenessSignal) tagPool.push(horizonAwarenessSignal);
     // dedupe by id
     const seen = new Set();
     const tagSignals = tagPool.filter((s) => {
@@ -467,6 +604,56 @@ export default async function handler(req, res) {
       return true;
     });
     const segments = await tagBriefSegments(brief, tagSignals);
+
+    // Track which signals Claude actually narrated this run so the next brief
+    // knows what to mute. Lookup uses the union of pools we considered, since
+    // a signal can land in segments from any of them.
+    const signalLookup = new Map();
+    for (const s of [...activeSignals, ...allDeadlines]) {
+      signalLookup.set(String(s.id), s);
+    }
+    if (horizonSignal) signalLookup.set(String(horizonSignal.id), horizonSignal);
+    if (horizonAwarenessSignal) {
+      signalLookup.set(String(horizonAwarenessSignal.id), horizonAwarenessSignal);
+    }
+
+    const briefedTodayKey = `household:${householdId}:briefedToday`;
+    const briefedTodayFields = {};
+    for (const seg of segments || []) {
+      if (!seg || seg.type !== "signal" || seg.signalId == null) continue;
+      const id = String(seg.signalId);
+      const sig = signalLookup.get(id);
+      if (!sig) continue;
+      briefedTodayFields[id] = JSON.stringify({
+        status: sig.status || "",
+        state: sig.state || "",
+        ring: computeRing(sig),
+      });
+    }
+    if (Object.keys(briefedTodayFields).length > 0) {
+      await redis.hset(briefedTodayKey, briefedTodayFields);
+      // Refresh TTL so a signal that keeps appearing stays muted; once it
+      // stops appearing the entire hash drops in 20 hours.
+      await redis.expire(briefedTodayKey, 20 * 60 * 60);
+
+      // morningBriefed mirrors the same shape but with a 26h TTL so it
+      // survives until tomorrow morning and clearance can read it tonight to
+      // build the LAST CHANCE pool. Distinct from briefedToday, which
+      // clearance also writes into and which has shorter TTL purely for
+      // narration-mute purposes.
+      const morningBriefedKey = `household:${householdId}:morningBriefed`;
+      await redis.hset(morningBriefedKey, briefedTodayFields);
+      await redis.expire(morningBriefedKey, 26 * 60 * 60);
+    }
+
+    // Acknowledge the horizon-awareness pick for the week. We mark it whether
+    // or not Claude explicitly inlined it — the prompt budget is already spent
+    // and re-offering the same signal next morning would feel repetitive.
+    if (horizonAwarenessSignal) {
+      const briefedThisWeekKey = `household:${householdId}:briefedThisWeek`;
+      await redis.sadd(briefedThisWeekKey, String(horizonAwarenessSignal.id));
+      await redis.expire(briefedThisWeekKey, 6 * 24 * 60 * 60);
+    }
 
     return res.status(200).json({
       brief,

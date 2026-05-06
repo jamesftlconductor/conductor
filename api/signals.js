@@ -28,6 +28,47 @@ function safeJson(value) {
   }
 }
 
+async function handleMissedCues(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for missedcues" });
+  }
+
+  const householdId = await resolveHouseholdId(req.query.userId);
+  const { signals } = await loadSignals(householdId);
+
+  const FORTY_EIGHT_HOURS_MS = 48 * 60 * 60 * 1000;
+  const now = Date.now();
+
+  // Age in ms since the signal last meaningfully changed. lastUpdate is a
+  // locale-formatted string from import.js and the PATCH handler — Date.parse
+  // generally handles it. Falls back to signal.id (which is Date.now() at
+  // import time) so we always have *some* timestamp to sort on.
+  function ageMs(s) {
+    const lastMs = s.lastUpdate ? Date.parse(s.lastUpdate) : NaN;
+    if (!isNaN(lastMs)) return now - lastMs;
+    if (typeof s.id === "number" && s.id > 0) return now - s.id;
+    return 0;
+  }
+
+  const missed = [];
+  for (const s of signals) {
+    const stillOpen = !s.state || s.state === "incoming" || s.state === "active";
+    if (!stillOpen) continue;
+    const age = ageMs(s);
+    if (s.carriedForward === true || age > FORTY_EIGHT_HOURS_MS) {
+      missed.push({ ...s, _ageMs: age });
+    }
+  }
+
+  // Oldest first — biggest age at the top so the list reads as "what's been
+  // sitting open longest."
+  missed.sort((a, b) => b._ageMs - a._ageMs);
+  for (const m of missed) delete m._ageMs;
+
+  return res.status(200).json({ household: householdId, signals: missed });
+}
+
 async function handlePreferences(req, res) {
   if (req.method === "GET") {
     const { userId } = req.query;
@@ -110,6 +151,12 @@ export default async function handler(req, res) {
     const bodyType = req.body?.type;
     if (queryType === "preferences" || bodyType === "preferences") {
       return handlePreferences(req, res);
+    }
+
+    // Missed cues — feeds the future Missed Cues screen. Returns active
+    // signals where carriedForward is set OR they've sat unchanged > 48h.
+    if (queryType === "missedcues" || bodyType === "missedcues") {
+      return handleMissedCues(req, res);
     }
 
     if (req.method === "GET") {

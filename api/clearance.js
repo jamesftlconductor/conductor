@@ -67,6 +67,43 @@ ${signalList}`,
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Replicated from brief.js so the briefedToday hash uses identical ring
+// values regardless of which endpoint wrote the snapshot. Keep these in
+// sync if brief.js's logic changes.
+function dayOffsetFromTodayUtil(date) {
+  const a = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const now = new Date();
+  const t = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((a.getTime() - t.getTime()) / DAY_MS);
+}
+function withinNextDaysUtil(date, days) {
+  const ms = date.getTime() - Date.now();
+  return ms <= days * DAY_MS && ms > -DAY_MS;
+}
+function classifyUrgentUtil(s) {
+  if (s.priority === "urgent") return true;
+  const eta = parseDateLoose(s.eta);
+  if (!eta) return false;
+  const offset = dayOffsetFromTodayUtil(eta);
+  if (offset === 0) {
+    if (s.type === "service" || s.type === "reservation") return true;
+    if (s.status === "Out for Delivery") return true;
+  }
+  if (s.type === "deadline" && withinNextDaysUtil(eta, 3)) return true;
+  return false;
+}
+function isInNearWindowUtil(s) {
+  if (s.status === "Delivered") return false;
+  const eta = parseDateLoose(s.eta);
+  if (!eta) return true;
+  return withinNextDaysUtil(eta, 14);
+}
+function computeRing(s) {
+  if (classifyUrgentUtil(s)) return "inner";
+  if (isInNearWindowUtil(s)) return "middle";
+  return "outer";
+}
+
 function isSameDay(d1, d2) {
   return d1.getFullYear() === d2.getFullYear()
     && d1.getMonth() === d2.getMonth()
@@ -134,16 +171,48 @@ export default async function handler(req, res) {
       if (hid) householdId = hid;
     }
 
-    const [rawSignals, rawCal, rawDeadlines, rawHorizon, rawBriefed] = await Promise.all([
+    const [
+      rawSignals,
+      rawCal,
+      rawDeadlines,
+      rawHorizon,
+      rawBriefed,
+      rawBriefedToday,
+      rawMorningBriefed,
+    ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       redis.get(`household:${householdId}:calendar`),
       redis.lrange(`household:${householdId}:deadlines`, 0, -1),
       redis.get(`household:${householdId}:horizon`),
       redis.lrange(`household:${householdId}:briefed`, 0, -1),
+      redis.hgetall(`household:${householdId}:briefedToday`),
+      redis.hgetall(`household:${householdId}:morningBriefed`),
     ]);
 
     const signals = (rawSignals || []).map(s => typeof s === "string" ? JSON.parse(s) : s);
     const briefedIds = new Set((rawBriefed || []).map(s => String(s)));
+
+    // briefedToday hash shared with brief.js — same shape, same TTL. We use it
+    // here to mute signals already narrated in the morning brief whose
+    // status/state/ring haven't shifted since.
+    const briefedTodayMap =
+      (rawBriefedToday && typeof rawBriefedToday === "object") ? rawBriefedToday : {};
+    function previousSnapshot(s) {
+      const raw = briefedTodayMap[String(s.id)];
+      if (raw == null) return null;
+      if (typeof raw === "string") {
+        try { return JSON.parse(raw); } catch { return null; }
+      }
+      return raw;
+    }
+    function isBackgroundFiltered(s) {
+      const prev = previousSnapshot(s);
+      if (!prev) return false;
+      const sameStatus = (prev.status || "") === (s.status || "");
+      const sameState = (prev.state || "") === (s.state || "");
+      const sameRing = (prev.ring || "") === computeRing(s);
+      return sameStatus && sameState && sameRing;
+    }
 
     const resolvedToday = [];
     const expiredToday = [];
@@ -154,6 +223,8 @@ export default async function handler(req, res) {
       const eta = parseDateLoose(s.eta);
       const lastUpdate = parseDateLoose(s.lastUpdate);
 
+      // Resolved/expired today are state changes — never mute. They're the
+      // whole point of the evening brief.
       if (s.state === "resolved" && lastUpdate && isSameDay(lastUpdate, now)) {
         resolvedToday.push(s);
         continue;
@@ -167,14 +238,46 @@ export default async function handler(req, res) {
         }
       }
 
+      // Still-in-motion and delayed-carrying signals are stable shapes — skip
+      // narration when nothing's changed since the last brief.
       if ((s.state === "incoming" || s.state === "active") && eta && eta > now) {
-        stillActive.push(s);
+        if (!isBackgroundFiltered(s)) stillActive.push(s);
       }
 
-      if (s.status === "Delayed" && s.state !== "expired" && s.state !== "resolved" && (!eta || eta > now)) {
+      if (
+        s.status === "Delayed" &&
+        s.state !== "expired" &&
+        s.state !== "resolved" &&
+        (!eta || eta > now) &&
+        !isBackgroundFiltered(s)
+      ) {
         carryingForward.push(s);
       }
     }
+
+    // LAST CHANCE pool — signals worth one final calm acknowledgment as the
+    // day closes. Sources:
+    //   1. Anything we narrated this morning that's still incoming/active.
+    //   2. Anything currently on the Act Now ring today (ETA today/overdue,
+    //      state incoming/active) — even if it wasn't in the morning brief.
+    // Dedupe by ID; same key (lastChancePool) feeds both the prompt and the
+    // clearanceBriefed writeback below.
+    const morningBriefedMap =
+      (rawMorningBriefed && typeof rawMorningBriefed === "object") ? rawMorningBriefed : {};
+    const morningBriefedIds = new Set(Object.keys(morningBriefedMap));
+    const endOfToday = new Date(today.getTime() + DAY_MS - 1);
+    const lastChanceById = new Map();
+    for (const s of signals) {
+      const stillOpen = !s.state || s.state === "incoming" || s.state === "active";
+      if (!stillOpen) continue;
+      const inMorning = morningBriefedIds.has(String(s.id));
+      const eta = parseDateLoose(s.eta);
+      const onActNowToday = !!eta && eta <= endOfToday;
+      if (inMorning || onActNowToday) {
+        lastChanceById.set(String(s.id), s);
+      }
+    }
+    const lastChancePool = [...lastChanceById.values()];
 
     let tomorrowEvents = [];
     if (rawCal) {
@@ -218,7 +321,10 @@ export default async function handler(req, res) {
       const days = (eta.getTime() - Date.now()) / DAY_MS;
       const tagged = { ...d, _isDeadline: true, type: "deadline" };
       if (days >= -1 && days <= 3) urgentDeadlines.push(tagged);
-      else if (days > 3 && days <= 14) nearDeadlines.push(tagged);
+      else if (days > 3 && days <= 14) {
+        // Near-window deadlines apply the same mute rule.
+        if (!isBackgroundFiltered(tagged)) nearDeadlines.push(tagged);
+      }
       else if (days >= 15 && days <= 90 && !briefedIds.has(String(d.id))) {
         horizonDeadlineCandidates.push(tagged);
       }
@@ -273,6 +379,7 @@ export default async function handler(req, res) {
     const horizonSummary = horizonSignal
       ? fmt({ ...horizonSignal, _isDeadline: true })
       : "";
+    const lastChanceSummary = lastChancePool.map(fmt).join("\n");
 
     const tomorrowSummary = tomorrowEvents
       .map(e => {
@@ -319,6 +426,9 @@ ${horizonSummary || "None"}
 
 Important: ignore promotional events, store launches, marketing emails, and account/loyalty notifications. Only narrate signals that represent real deliveries, services, reservations, or travel — things with a concrete arrival, commitment, or action. Deadlines (marked [DEADLINE]) are documents/renewals/registrations the user needs to handle — surface them naturally in the close-of-day reflection.
 
+LAST CHANCE (end of brief, only if non-empty): One calm sentence acknowledging signals that are still unresolved from today. Not alarming. Something like: "Before you close out — [description] still needs attention if you haven't gotten to it." Maximum one sentence, only if there are genuinely unresolved signals.
+${lastChanceSummary || "None"}
+
 On the household calendar tomorrow:
 ${tomorrowSummary || "None"}
 
@@ -351,9 +461,51 @@ Rules:
       ...carryingForward,
       ...urgentDeadlines,
       ...nearDeadlines,
+      ...lastChancePool,
     ];
     if (horizonSignal) tagSet.push(horizonSignal);
     const segments = await tagBriefSegments(brief, tagSet);
+
+    // Write narrated signal snapshots into the shared briefedToday hash so the
+    // morning brief knows what's already been said. Same shape, same TTL as
+    // brief.js. State-change pools (resolvedToday, expiredToday) intentionally
+    // get written too — if the signal stays resolved/expired tomorrow morning,
+    // it's the right behavior to keep silent about it.
+    const signalLookup = new Map();
+    for (const s of [...signals, ...allDeadlines]) {
+      signalLookup.set(String(s.id), s);
+    }
+    if (horizonSignal) signalLookup.set(String(horizonSignal.id), horizonSignal);
+
+    const briefedTodayKey = `household:${householdId}:briefedToday`;
+    const briefedTodayFields = {};
+    for (const seg of segments || []) {
+      if (!seg || seg.type !== "signal" || seg.signalId == null) continue;
+      const id = String(seg.signalId);
+      const sig = signalLookup.get(id);
+      if (!sig) continue;
+      briefedTodayFields[id] = JSON.stringify({
+        status: sig.status || "",
+        state: sig.state || "",
+        ring: computeRing(sig),
+      });
+    }
+    if (Object.keys(briefedTodayFields).length > 0) {
+      await redis.hset(briefedTodayKey, briefedTodayFields);
+      await redis.expire(briefedTodayKey, 20 * 60 * 60);
+    }
+
+    // clearanceBriefed — IDs of every signal in the LAST CHANCE pool, regardless
+    // of whether Claude actually mentioned each one. The morning brief reads
+    // this set to mark survivors as carriedForward, so we want a complete
+    // record of what was offered up at evening close, not just what got
+    // narrated. 14h TTL spans evening to next morning's brief run.
+    if (lastChancePool.length > 0) {
+      const clearanceBriefedKey = `household:${householdId}:clearanceBriefed`;
+      const lastChanceIds = lastChancePool.map(s => String(s.id));
+      await redis.sadd(clearanceBriefedKey, ...lastChanceIds);
+      await redis.expire(clearanceBriefedKey, 14 * 60 * 60);
+    }
 
     return res.status(200).json({ brief, segments, household: householdId, user: userName });
 

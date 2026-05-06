@@ -162,7 +162,25 @@ export default async function handler(req, res) {
         continue;
       }
 
-      const body = await generateSummary(hid, type);
+      let body = await generateSummary(hid, type);
+
+      // Carry-forward suffix on Takeoff only — if anything was flagged in last
+      // night's LAST CHANCE pool and is still active this morning (the morning
+      // brief stamps it on the carriedForward set), nudge the user.
+      if (type === "takeoff") {
+        const carriedCount = await redis.scard(`household:${hid}:carriedForward`);
+        if (carriedCount > 0) {
+          const suffix = " Something from yesterday is still open.";
+          // Reserve room for the suffix; total stays ≤100 chars. If the base
+          // body alone barely fits, trim it before appending so the suffix
+          // isn't itself truncated mid-sentence.
+          const budget = 100 - suffix.length;
+          if (body.length > budget) {
+            body = body.slice(0, Math.max(0, budget - 3)).trimEnd() + "...";
+          }
+          body = body + suffix;
+        }
+      }
 
       for (const { userId, token } of tokensByUser) {
         const push = await sendExpoPush(token, title, body);
