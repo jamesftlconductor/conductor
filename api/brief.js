@@ -109,6 +109,8 @@ async function tagBriefSegments(brief, signals) {
 - { type: 'text', content: '...' } for plain text
 - { type: 'signal', content: '...', signalId: '...', signalType: '...' } for phrases that refer to a specific signal
 
+signalType MUST be exactly one of: package, delivery, food, grocery, service, reservation, appointment, travel, deadline, unknown. Pick the closest match for the signal's nature. Use "unknown" if no value fits — never invent a different label.
+
 Split the brief exactly — every character must appear in exactly one segment. Signal phrases should be the natural language reference to that signal as it appears in the brief (e.g. 'hair styling items' not the full description). Only tag phrases that clearly refer to a specific signal. Return only the JSON array, nothing else.
 
 Brief:
