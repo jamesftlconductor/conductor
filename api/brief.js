@@ -185,7 +185,7 @@ export default async function handler(req, res) {
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       redis.get(`household:${householdId}:calendar`),
-      redis.get(`household:${householdId}:health`),
+      userId ? redis.get(`user:${userId}:health`) : Promise.resolve(null),
       redis.get(`household:${householdId}:horizon`),
       redis.lrange(`household:${householdId}:deadlines`, 0, -1),
       redis.lrange(`household:${householdId}:briefed`, 0, -1),
@@ -405,7 +405,7 @@ export default async function handler(req, res) {
 - Maximum 5-6 sentences total
 - Synthesize all layers into flowing prose — never a list
 - Lead with urgent if present
-- Health context: one sentence only if genuinely notable — silent if normal
+- Health context: one sentence only if genuinely notable — silent if normal. If sleep.duration is under 6 hours, surface it in a calm, day-shaping way (e.g. "${userName} slept under six hours last night — worth keeping the day manageable"). If hrv.current is meaningfully below hrv.baseline7d (roughly 15% or more lower), surface it as a recovery cue (e.g. "Recovery looks low today — a lighter afternoon might serve you well"). Never quote specific numbers, percentages, or units — only contextual observations. If both sleep and HRV look normal (or data is missing), say nothing about health.
 - Childcare: mention only if it affects coordination today or tomorrow
 - Home requirements: flag naturally if service window conflicts with likely schedule
 - Horizon signal: one sentence at the end, tonal shift to future-aware, specific and surprising

@@ -37,12 +37,12 @@ async function handlePreferences(req, res) {
   }
 
   if (req.method === "POST") {
-    const { userId, preferences, expoPushToken } = req.body || {};
+    const { userId, preferences, expoPushToken, healthData } = req.body || {};
     if (!userId || typeof userId !== "string") {
       return res.status(400).json({ error: "Missing or invalid userId" });
     }
-    if (preferences === undefined && expoPushToken === undefined) {
-      return res.status(400).json({ error: "Provide preferences and/or expoPushToken" });
+    if (preferences === undefined && expoPushToken === undefined && healthData === undefined) {
+      return res.status(400).json({ error: "Provide preferences, expoPushToken, and/or healthData" });
     }
     if (preferences !== undefined && (preferences === null || typeof preferences !== "object")) {
       return res.status(400).json({ error: "Invalid preferences" });
@@ -50,11 +50,19 @@ async function handlePreferences(req, res) {
     if (expoPushToken !== undefined && typeof expoPushToken !== "string") {
       return res.status(400).json({ error: "Invalid expoPushToken" });
     }
+    if (healthData !== undefined && (healthData === null || typeof healthData !== "object")) {
+      return res.status(400).json({ error: "Invalid healthData" });
+    }
     if (preferences !== undefined) {
       await redis.set(`user:${userId}:preferences`, JSON.stringify(preferences));
     }
     if (typeof expoPushToken === "string" && expoPushToken.length > 0) {
       await redis.set(`user:${userId}:expoPushToken`, expoPushToken);
+    }
+    if (healthData !== undefined) {
+      // Stamp receipt so brief.js can decide whether the snapshot is stale.
+      const stamped = { ...healthData, receivedAt: Date.now() };
+      await redis.set(`user:${userId}:health`, JSON.stringify(stamped));
     }
     return res.status(200).json({ ok: true, userId });
   }
