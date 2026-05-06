@@ -454,7 +454,7 @@ Rules:
     const data = await response.json();
     const brief = data.content[0].text;
 
-    const tagSet = [
+    const tagPool = [
       ...resolvedToday,
       ...expiredToday,
       ...stillActive,
@@ -463,7 +463,18 @@ Rules:
       ...nearDeadlines,
       ...lastChancePool,
     ];
-    if (horizonSignal) tagSet.push(horizonSignal);
+    if (horizonSignal) tagPool.push(horizonSignal);
+    // Dedupe by id — lastChancePool overlaps with stillActive/carryingForward
+    // by design, and Claude's segment tagger gets confused when the same
+    // signal appears multiple times with the same id but slightly different
+    // descriptions, falling back to the plain-text path.
+    const seen = new Set();
+    const tagSet = tagPool.filter((s) => {
+      const key = String(s.id);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     const segments = await tagBriefSegments(brief, tagSet);
 
     // Write narrated signal snapshots into the shared briefedToday hash so the
