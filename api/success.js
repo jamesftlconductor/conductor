@@ -1,5 +1,26 @@
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[c]));
+}
+
 export default async function handler(req, res) {
-  const { userId, email, name } = req.query;
+  const { email, householdId } = req.query;
+
+  const isJoin = typeof householdId === "string" && householdId.length > 0;
+  const heading = isJoin
+    ? `You've joined ${escapeHtml(householdId)}'s household.`
+    : "You're connected.";
+  const body = isJoin
+    ? "Conductor will start syncing your signals.<br>Your first Takeoff will be ready shortly."
+    : "Conductor is syncing your signals.<br>Your first Takeoff will be ready shortly.";
+  const status = isJoin
+    ? `✓ Joined ${escapeHtml(householdId)}`
+    : "✓ Gmail + Calendar connected";
 
   return res.status(200).send(`
     <!DOCTYPE html>
@@ -48,10 +69,10 @@ export default async function handler(req, res) {
     </head>
     <body>
       <div class="logo">C</div>
-      <h1>You're connected.</h1>
-      <p>Conductor is syncing your signals.<br>Your first Takeoff will be ready shortly.</p>
-      <div class="email">${email}</div>
-      <div class="status">✓ Gmail + Calendar connected</div>
+      <h1>${heading}</h1>
+      <p>${body}</p>
+      <div class="email">${escapeHtml(email || "")}</div>
+      <div class="status">${status}</div>
     </body>
     </html>
   `);

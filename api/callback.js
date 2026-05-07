@@ -6,7 +6,7 @@ const redis = new Redis({
 });
 
 export default async function handler(req, res) {
-  const { code, error } = req.query;
+  const { code, error, state: stateRaw } = req.query;
 
   if (error) {
     return res.redirect("conductorapp://auth?error=" + error);
@@ -14,6 +14,20 @@ export default async function handler(req, res) {
 
   if (!code) {
     return res.status(400).json({ error: "No code provided" });
+  }
+
+  // Recover any invite code that was forwarded through the OAuth state param
+  // by /api/auth. JSON-parsed defensively — bad state shouldn't block sign-in.
+  let inviteCode = null;
+  if (stateRaw) {
+    try {
+      const parsed = typeof stateRaw === "string" ? JSON.parse(stateRaw) : stateRaw;
+      if (parsed && typeof parsed.inviteCode === "string" && parsed.inviteCode.length > 0) {
+        inviteCode = parsed.inviteCode;
+      }
+    } catch {
+      // ignored — proceed without invite consumption
+    }
   }
 
   try {
@@ -64,6 +78,25 @@ export default async function handler(req, res) {
       connectedAt: Date.now(),
     }));
 
+    // Consume the invite (if any) — tied to user.email's userId, before we
+    // kick off onboarding so the user's household is set when imports start
+    // writing into household:{id}:signals.
+    let joinedHouseholdId = null;
+    if (inviteCode) {
+      const inviteRaw = await redis.get(`invite:${inviteCode}`);
+      const invite = typeof inviteRaw === "string" ? JSON.parse(inviteRaw) : inviteRaw;
+      const stillValid =
+        invite && (!invite.expiresAt || Date.now() <= invite.expiresAt);
+      if (stillValid) {
+        await redis.set(`user:${userId}:household`, invite.householdId);
+        await redis.sadd(`household:${invite.householdId}:members`, userId);
+        // Single-use semantics — deleting prevents re-joins or sharing the
+        // link beyond the first redemption.
+        await redis.del(`invite:${inviteCode}`);
+        joinedHouseholdId = invite.householdId;
+      }
+    }
+
     // Trigger the full onboarding sweep (email + calendar + horizon) via QStash.
     // Replaces the old separate import + calendar fire-and-forgets.
     const baseUrl = "https://conductor-ivory.vercel.app";
@@ -73,10 +106,15 @@ export default async function handler(req, res) {
       body: JSON.stringify({ userId }),
     }).catch(err => console.error("Onboard trigger error:", err));
 
-    // Redirect back to app immediately
-    return res.redirect(
-  `https://conductor-ivory.vercel.app/api/success?userId=${encodeURIComponent(userId)}&email=${encodeURIComponent(user.email)}&name=${encodeURIComponent(user.name)}`
-);
+    // Redirect back to app — append householdId when the user joined via
+    // invite so the success page can render the right copy.
+    const successParams = new URLSearchParams({
+      userId,
+      email: user.email,
+      name: user.name,
+    });
+    if (joinedHouseholdId) successParams.set("householdId", joinedHouseholdId);
+    return res.redirect(`${baseUrl}/api/success?${successParams.toString()}`);
 
   } catch (error) {
     console.error("Callback error:", error);
