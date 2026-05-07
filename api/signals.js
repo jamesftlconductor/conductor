@@ -28,6 +28,113 @@ function safeJson(value) {
   }
 }
 
+const MEMORY_TRIM_TO = 500;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Append a single entry to household:{id}:memory and trim to the last
+// MEMORY_TRIM_TO entries. The signal passed in should still carry the
+// pre-action lastUpdate so daysInSystem reflects "how long the signal sat
+// in its prior state before being acted on" — callers in PATCH must capture
+// the previous value before bumping lastUpdate; the auto-expire path can
+// pass the signal as-is since applyDefaultsAndExpiry doesn't touch it.
+async function writeMemoryEntry(householdId, signal, action, userId) {
+  let daysInSystem = null;
+  if (signal && signal.lastUpdate) {
+    const ms = Date.parse(signal.lastUpdate);
+    if (!isNaN(ms)) {
+      daysInSystem = Math.max(0, Math.round((Date.now() - ms) / DAY_MS));
+    }
+  }
+  const entry = {
+    signalId: signal?.id ?? null,
+    description: signal?.description ?? null,
+    type: signal?.type ?? null,
+    sender: signal?.sender ?? null,
+    eta: signal?.eta ?? null,
+    action,
+    actionAt: new Date().toISOString(),
+    userId: userId || signal?.userId || null,
+    source: signal?.source ?? null,
+    daysInSystem,
+  };
+  const key = `household:${householdId}:memory`;
+  await redis.lpush(key, JSON.stringify(entry));
+  await redis.ltrim(key, 0, MEMORY_TRIM_TO - 1);
+}
+
+async function handleMemory(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for memory" });
+  }
+  const householdId = await resolveHouseholdId(req.query.userId);
+  const limitRaw = parseInt(req.query.limit, 10);
+  const limit = Math.max(1, Math.min(MEMORY_TRIM_TO, isNaN(limitRaw) ? 20 : limitRaw));
+  const raw = await redis.lrange(`household:${householdId}:memory`, 0, limit - 1);
+  const entries = raw.map((item) => (typeof item === "string" ? JSON.parse(item) : item));
+  return res.status(200).json({ household: householdId, count: entries.length, entries });
+}
+
+// Pattern detection stub — pure aggregation over the memory log, no model
+// calls. Intended as the seed for a future learning layer; the structure
+// here defines the shape downstream consumers will rely on.
+async function handlePatterns(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for patterns" });
+  }
+  const householdId = await resolveHouseholdId(req.query.userId);
+  const raw = await redis.lrange(`household:${householdId}:memory`, 0, -1);
+  const entries = raw.map((item) => (typeof item === "string" ? JSON.parse(item) : item));
+
+  const senderCounts = new Map();
+  const typeBreakdown = {}; // { [type]: { resolved, held, expired } }
+  const dayCounts = new Map();
+
+  for (const e of entries) {
+    if (e.sender) {
+      senderCounts.set(e.sender, (senderCounts.get(e.sender) || 0) + 1);
+    }
+    if (e.type) {
+      if (!typeBreakdown[e.type]) {
+        typeBreakdown[e.type] = { resolved: 0, held: 0, expired: 0 };
+      }
+      if (e.action && typeBreakdown[e.type][e.action] !== undefined) {
+        typeBreakdown[e.type][e.action] += 1;
+      }
+    }
+    // Peak days are computed against actionAt (when the user / system acted
+    // on the signal), since that's the timestamp every memory entry carries.
+    // Useful for spotting "Sunday is when we tend to resolve things" style
+    // patterns. If you need arrival-time peaks later, store importedAt on
+    // signals at import time and switch this to that field.
+    if (e.actionAt) {
+      const d = new Date(e.actionAt);
+      if (!isNaN(d.getTime())) {
+        const day = d.toLocaleString("en-US", { weekday: "long" });
+        dayCounts.set(day, (dayCounts.get(day) || 0) + 1);
+      }
+    }
+  }
+
+  const topSenders = [...senderCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([sender, count]) => ({ sender, count }));
+
+  const peakDays = [...dayCounts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([day, count]) => ({ day, count }));
+
+  return res.status(200).json({
+    household: householdId,
+    sampleSize: entries.length,
+    topSenders,
+    typeBreakdown,
+    peakDays,
+  });
+}
+
 async function handleMissedCues(req, res) {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
@@ -121,6 +228,7 @@ async function handlePreferences(req, res) {
 
 function applyDefaultsAndExpiry(signal) {
   const original = JSON.stringify(signal);
+  const wasNotExpired = signal.state !== "expired";
   if (!signal.state) signal.state = "incoming";
 
   if (signal.state !== "resolved" && signal.state !== "expired" && signal.eta) {
@@ -131,7 +239,9 @@ function applyDefaultsAndExpiry(signal) {
     }
   }
 
-  return { signal, changed: JSON.stringify(signal) !== original };
+  const changed = JSON.stringify(signal) !== original;
+  const justExpired = wasNotExpired && signal.state === "expired";
+  return { signal, changed, justExpired };
 }
 
 async function loadSignals(householdId) {
@@ -140,10 +250,15 @@ async function loadSignals(householdId) {
   const signals = raw.map(parseSignal);
 
   for (let i = 0; i < signals.length; i++) {
-    const { signal, changed } = applyDefaultsAndExpiry(signals[i]);
+    const { signal, changed, justExpired } = applyDefaultsAndExpiry(signals[i]);
     signals[i] = signal;
     if (changed) {
       await redis.lset(key, i, JSON.stringify(signal));
+    }
+    if (justExpired) {
+      // applyDefaultsAndExpiry doesn't touch lastUpdate, so the signal still
+      // carries its prior "in system since" anchor — pass it directly.
+      await writeMemoryEntry(householdId, signal, "expired", null);
     }
   }
 
@@ -164,6 +279,19 @@ export default async function handler(req, res) {
     // signals where carriedForward is set OR they've sat unchanged > 48h.
     if (queryType === "missedcues" || bodyType === "missedcues") {
       return handleMissedCues(req, res);
+    }
+
+    // Memory log — last N entries from household:{id}:memory. Useful for
+    // debugging the lifecycle and as the substrate the patterns endpoint
+    // aggregates over.
+    if (queryType === "memory" || bodyType === "memory") {
+      return handleMemory(req, res);
+    }
+
+    // Pattern detection (counting only, no model calls). Foundation of the
+    // future learning layer.
+    if (queryType === "patterns" || bodyType === "patterns") {
+      return handlePatterns(req, res);
     }
 
     if (req.method === "GET") {
@@ -190,9 +318,22 @@ export default async function handler(req, res) {
         return res.status(404).json({ error: "signal not found" });
       }
 
+      // Capture the prior "in system since" anchor before we bump lastUpdate
+      // so the memory entry's daysInSystem reflects how long the signal sat
+      // in its previous state, not zero.
+      const previousLastUpdate = signals[index].lastUpdate;
       signals[index].state = state;
       signals[index].lastUpdate = new Date().toLocaleString();
       await redis.lset(key, index, JSON.stringify(signals[index]));
+
+      // Memory log on resolved (Rest) or active (Hold) transitions only.
+      // Incoming and expired aren't user actions worth recording here —
+      // expiry is handled by the auto-expire path in loadSignals.
+      if (state === "resolved" || state === "active") {
+        const action = state === "resolved" ? "resolved" : "held";
+        const memorySignal = { ...signals[index], lastUpdate: previousLastUpdate };
+        await writeMemoryEntry(householdId, memorySignal, action, userId);
+      }
 
       return res.status(200).json({ household: householdId, signal: signals[index] });
     }
