@@ -179,6 +179,26 @@ async function runEmailJob(userId, householdId) {
       .filter(Boolean)
   );
 
+  // Same dedup pattern for vault — the deadline branch below now writes to
+  // :vault rather than :deadlines (single source of truth). Built once
+  // outside the per-batch loop so we only pay the lrange cost once.
+  const existingVaultRaw = await redis.lrange(`household:${householdId}:vault`, 0, -1);
+  const existingVaultDescs = new Set(
+    existingVaultRaw
+      .map((s) => safeJson(s))
+      .filter(Boolean)
+      .map((v) => (v.description || "").toLowerCase().trim())
+      .filter(Boolean)
+  );
+  function isDuplicateVaultDesc(desc) {
+    if (!desc) return true;
+    if (existingVaultDescs.has(desc)) return true;
+    for (const ex of existingVaultDescs) {
+      if (ex.length >= 6 && desc.length >= 6 && (ex.includes(desc) || desc.includes(ex))) return true;
+    }
+    return false;
+  }
+
   let totalDeadlines = 0;
   let totalSignals = 0;
   let totalPatterns = 0;
@@ -227,14 +247,25 @@ ${formatted}`,
         // here in case it slips through (typo, ambiguous email, etc.).
         const etaMs = item.date ? Date.parse(item.date) : NaN;
         if (!isNaN(etaMs) && etaMs < Date.now()) continue;
+        if (isDuplicateVaultDesc(desc)) continue;
+        existingVaultDescs.add(desc);
 
-        await redis.lpush(`household:${householdId}:deadlines`, JSON.stringify({
-          id: `deadline_${Date.now()}_${totalDeadlines}`,
+        // Write to :vault (not :deadlines) so brief.js's deadline pool sees
+        // these. The dedicated vault sweep (Job 3) is strict and tends to
+        // null-out auto-renewals; this branch picks up the action-bearing
+        // deadlines the broader email query catches. Source tag distinguishes
+        // them from the per-email vault sweep entries.
+        await redis.lpush(`household:${householdId}:vault`, JSON.stringify({
+          id: `vault_email_${Date.now()}_${totalDeadlines}`,
+          category: item.category || "other",
           description: item.description,
-          eta: item.date,
-          category: item.category,
-          source: "onboard",
-          createdAt: Date.now(),
+          provider: null,
+          renewalDate: item.date,
+          amount: null,
+          consequence: null,
+          confidence: "medium",
+          source: "email-sweep",
+          foundAt: Date.now(),
         }));
         totalDeadlines++;
       } else if (item.type === "signal") {

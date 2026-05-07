@@ -265,19 +265,20 @@ async function handleHorizon(req, res) {
   const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
   const now = Date.now();
 
-  // Deadlines arrive in their own list with a `date` field rather than
-  // `eta` (per onboard-worker's prompt). Normalize to a single `eta`
-  // string so the horizon list can sort + render consistently.
+  // Vault items use `renewalDate`, signals use `eta`, legacy deadline
+  // records used `date` — normalize to a single ms timestamp for filtering
+  // and sorting. (Legacy `date` kept in case any pre-vault entries leak
+  // through somehow; new code only writes `renewalDate` or `eta`.)
   function etaMs(item) {
-    const v = item.eta || item.date;
+    const v = item.eta || item.renewalDate || item.date;
     if (!v) return NaN;
     const parsed = Date.parse(v);
     return isNaN(parsed) ? NaN : parsed;
   }
 
-  const [{ signals }, rawDeadlines] = await Promise.all([
+  const [{ signals }, rawVault] = await Promise.all([
     loadSignals(householdId),
-    redis.lrange(`household:${householdId}:deadlines`, 0, -1),
+    redis.lrange(`household:${householdId}:vault`, 0, -1),
   ]);
 
   const farSignals = signals.filter((s) => {
@@ -289,21 +290,22 @@ async function handleHorizon(req, res) {
     return ms - now > FOURTEEN_DAYS_MS;
   });
 
-  const taggedDeadlines = (rawDeadlines || [])
+  const taggedDeadlines = (rawVault || [])
     .map((item) => (typeof item === "string" ? JSON.parse(item) : item))
     .filter(Boolean)
-    .filter((d) => {
-      if (d.state === "resolved" || d.state === "expired") return false;
-      return !isNaN(etaMs(d));
+    .filter((v) => {
+      if (v.handled) return false;
+      if (v.state === "resolved" || v.state === "expired") return false;
+      return !isNaN(etaMs(v));
     })
-    .map((d) => ({
-      ...d,
+    .map((v) => ({
+      ...v,
       type: "deadline",
-      eta: d.eta || d.date,
+      eta: v.renewalDate || v.eta,
     }));
 
-  // Dedupe by id — a deadline that ended up in :signals (rare, but possible
-  // via hand-curation) shouldn't appear twice.
+  // Dedupe by id — a vault item that ended up in :signals (rare) shouldn't
+  // appear twice.
   const seen = new Set();
   const combined = [];
   for (const item of [...farSignals, ...taggedDeadlines]) {
