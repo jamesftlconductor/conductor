@@ -95,7 +95,14 @@ async function handlePreferences(req, res) {
       return res.status(400).json({ error: "Invalid healthData" });
     }
     if (preferences !== undefined) {
-      await redis.set(`user:${userId}:preferences`, JSON.stringify(preferences));
+      // Shallow-merge into existing prefs so a partial update (settings-screen
+      // toggle, diagnostic marker) doesn't nuke unrelated keys. Callers that
+      // genuinely want a full replacement can fetch first and send the full
+      // merged object themselves.
+      const existingRaw = await redis.get(`user:${userId}:preferences`);
+      const existing = safeJson(existingRaw) || {};
+      const merged = { ...existing, ...preferences };
+      await redis.set(`user:${userId}:preferences`, JSON.stringify(merged));
     }
     if (typeof expoPushToken === "string" && expoPushToken.length > 0) {
       await redis.set(`user:${userId}:expoPushToken`, expoPushToken);
