@@ -5,6 +5,69 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+// Same shape as brief.js's generateTransparency, with clearance-specific
+// pool labels. Best-effort: returns null on any failure so the response
+// still ships the prose without a transparency entry.
+async function generateTransparency(brief, pools) {
+  if (!brief) return null;
+
+  const briefList = (arr) => {
+    if (!arr || arr.length === 0) return "(none)";
+    return arr.map((s) => `- ${s.description || "Unknown"}`).join("\n");
+  };
+  const eventList = (arr) => {
+    if (!arr || arr.length === 0) return "(none)";
+    return arr.map((e) => `- ${e.title || "Untitled"}`).join("\n");
+  };
+
+  const prompt = `You just generated this evening brief: ${brief}
+
+The signals you considered were:
+Resolved today: ${briefList(pools.resolvedToday)}
+Expired today: ${briefList(pools.expiredToday)}
+Still in motion: ${briefList(pools.stillActive)}
+Delayed: ${briefList(pools.carryingForward)}
+Imminent deadlines: ${briefList(pools.urgentDeadlines)}
+Near deadlines: ${briefList(pools.nearDeadlines)}
+Last chance (still unresolved from today): ${briefList(pools.lastChance)}
+Tomorrow's calendar: ${eventList(pools.tomorrow)}
+Horizon: ${pools.horizon ? `- ${pools.horizon.description || "Unknown"}` : "(none)"}
+
+Write a plain-language explanation of how you thought about closing the day. Cover:
+1. What you included and why (1-2 sentences)
+2. What you excluded and why (1 sentence)
+3. What you're watching that didn't make the brief (1 sentence)
+
+Rules:
+- Write in first person as Conductor — "I noted..." "I left out..."
+- Plain text only, no markdown
+- Maximum 4 sentences total
+- Honest and specific — name actual signals
+- Calm, not defensive`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim();
+    return text || null;
+  } catch (err) {
+    console.error("Clearance transparency generation failed:", err);
+    return null;
+  }
+}
+
 async function tagBriefSegments(brief, signals) {
   const fallback = [{ type: "text", content: brief || "" }];
   if (!brief || !signals || signals.length === 0) return fallback;
@@ -517,7 +580,21 @@ Rules:
       seen.add(key);
       return true;
     });
-    const segments = await tagBriefSegments(brief, tagSet);
+    // Run segment tagging and transparency generation in parallel.
+    const [segments, transparency] = await Promise.all([
+      tagBriefSegments(brief, tagSet),
+      generateTransparency(brief, {
+        resolvedToday,
+        expiredToday,
+        stillActive,
+        carryingForward,
+        urgentDeadlines,
+        nearDeadlines,
+        lastChance: lastChancePool,
+        tomorrow: tomorrowEvents,
+        horizon: horizonSignal,
+      }),
+    ]);
 
     // Write narrated signal snapshots into the shared briefedToday hash so the
     // morning brief knows what's already been said. Same shape, same TTL as
@@ -560,7 +637,7 @@ Rules:
       await redis.expire(clearanceBriefedKey, 14 * 60 * 60);
     }
 
-    return res.status(200).json({ brief, segments, household: householdId, user: userName });
+    return res.status(200).json({ brief, segments, transparency, household: householdId, user: userName });
 
   } catch (error) {
     console.error("Clearance error:", error);

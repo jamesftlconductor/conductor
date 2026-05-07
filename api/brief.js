@@ -137,6 +137,68 @@ function isWithinNextHours(date, hours) {
   return ms >= -HOUR_MS && ms <= hours * HOUR_MS;
 }
 
+// Third Claude call after the brief itself is generated and segment-tagged.
+// Produces a 4-sentence first-person explanation of what the model included,
+// excluded, and is watching but didn't surface. Best-effort: any failure
+// returns null and the brief still ships without a transparency entry.
+async function generateTransparency(brief, pools) {
+  if (!brief) return null;
+
+  const briefList = (arr) => {
+    if (!arr || arr.length === 0) return "(none)";
+    return arr.map((s) => `- ${s.description || "Unknown"}`).join("\n");
+  };
+  const eventList = (arr) => {
+    if (!arr || arr.length === 0) return "(none)";
+    return arr.map((e) => `- ${e.title || "Untitled"}`).join("\n");
+  };
+
+  const prompt = `You just generated this brief: ${brief}
+
+The signals you considered were:
+Urgent: ${briefList(pools.urgent)}
+Near window: ${briefList(pools.near)}
+Health context: ${pools.healthContext ? JSON.stringify(pools.healthContext) : "(not connected)"}
+Childcare: ${eventList(pools.childcare)}
+Home requirements: ${briefList(pools.homeRequirements)}
+Horizon: ${pools.horizon ? `- ${pools.horizon.description || "Unknown"}` : "(none)"}
+Carried forward: ${briefList(pools.carriedForward)}
+
+Write a plain-language explanation of how you thought about today. Cover:
+1. What you included and why (1-2 sentences)
+2. What you excluded and why (1 sentence)
+3. What you're watching that didn't make the brief (1 sentence)
+
+Rules:
+- Write in first person as Conductor — "I included..." "I left out..."
+- Plain text only, no markdown
+- Maximum 4 sentences total
+- Honest and specific — name actual signals
+- Calm, not defensive`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim();
+    return text || null;
+  } catch (err) {
+    console.error("Transparency generation failed:", err);
+    return null;
+  }
+}
+
 async function tagBriefSegments(brief, signals) {
   const fallback = [{ type: "text", content: brief || "" }];
   if (!brief || !signals || signals.length === 0) return fallback;
@@ -657,7 +719,22 @@ export default async function handler(req, res) {
       seen.add(key);
       return true;
     });
-    const segments = await tagBriefSegments(brief, tagSignals);
+    // Run segment tagging and transparency generation in parallel — both
+    // depend only on the brief text and existing pools, so there's no
+    // ordering constraint between them. Saves ~one Claude round-trip of
+    // latency vs sequential.
+    const [segments, transparency] = await Promise.all([
+      tagBriefSegments(brief, tagSignals),
+      generateTransparency(brief, {
+        urgent: urgentForPrompt,
+        near: nearForPrompt,
+        healthContext,
+        childcare: childcareEvents,
+        homeRequirements,
+        horizon: horizonAwarenessSignal || horizonSignal,
+        carriedForward: carriedForwardSignals,
+      }),
+    ]);
 
     // Track which signals Claude actually narrated this run so the next brief
     // knows what to mute. Lookup uses the union of pools we considered, since
@@ -712,6 +789,7 @@ export default async function handler(req, res) {
     return res.status(200).json({
       brief,
       segments,
+      transparency,
       household: householdId,
       user: userName,
       isFirstRun,
