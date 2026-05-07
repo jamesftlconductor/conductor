@@ -104,6 +104,43 @@ function computeRing(s) {
   return "outer";
 }
 
+// Replicated from brief.js — keep the two implementations identical so the
+// ownership tag a user sees in the morning matches what they see at evening.
+async function buildHouseholdNameMap(redis, householdId, requestingUserId) {
+  const map = new Map();
+  let cursor = "0";
+  const memberKeys = [];
+  do {
+    const [next, batch] = await redis.scan(cursor, {
+      match: "user:*:household",
+      count: 100,
+    });
+    cursor = next;
+    if (batch?.length) memberKeys.push(...batch);
+  } while (cursor !== "0" && cursor !== 0);
+
+  for (const key of memberKeys) {
+    const memberUserId = key.slice("user:".length, -":household".length);
+    if (memberUserId === requestingUserId) continue;
+    const memberHouseholdId = await redis.get(key);
+    if (memberHouseholdId !== householdId) continue;
+    const profileRaw = await redis.get(`user:${memberUserId}:profile`);
+    const profile =
+      typeof profileRaw === "string" ? JSON.parse(profileRaw) : profileRaw;
+    const firstName = profile?.name?.split(" ")[0];
+    if (firstName) map.set(memberUserId, firstName);
+  }
+  return map;
+}
+
+function ownershipTag(item, requestingUserId, nameMap) {
+  if (!item || !item.userId) return "HOUSEHOLD";
+  if (item.userId === requestingUserId) return "YOURS";
+  const firstName = nameMap.get(item.userId);
+  if (firstName) return `${firstName.toUpperCase()}'S`;
+  return "HOUSEHOLD";
+}
+
 function isSameDay(d1, d2) {
   return d1.getFullYear() === d2.getFullYear()
     && d1.getMonth() === d2.getMonth()
@@ -179,6 +216,7 @@ export default async function handler(req, res) {
       rawBriefed,
       rawBriefedToday,
       rawMorningBriefed,
+      householdNameMap,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       redis.get(`household:${householdId}:calendar`),
@@ -187,6 +225,7 @@ export default async function handler(req, res) {
       redis.lrange(`household:${householdId}:briefed`, 0, -1),
       redis.hgetall(`household:${householdId}:briefedToday`),
       redis.hgetall(`household:${householdId}:morningBriefed`),
+      buildHouseholdNameMap(redis, householdId, userId),
     ]);
 
     const signals = (rawSignals || []).map(s => typeof s === "string" ? JSON.parse(s) : s);
@@ -364,10 +403,11 @@ export default async function handler(req, res) {
     // Resolve raw timestamps server-side so Claude never has to compute day-of-week
     // or date arithmetic. The model just lifts the friendly string into the prose.
     const fmt = s => {
+      const owner = `[${ownershipTag(s, userId, householdNameMap)}]`;
       if (s._isDeadline) {
-        return `- [DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
+        return `- ${owner} [DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
       }
-      return `- ${s.description || "Unknown item"} from ${s.sender || "Unknown"} | Status: ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}`;
+      return `- ${owner} ${s.description || "Unknown item"} from ${s.sender || "Unknown"} | Status: ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}`;
     };
 
     const resolvedSummary = resolvedToday.map(fmt).join("\n");
@@ -383,9 +423,10 @@ export default async function handler(req, res) {
 
     const tomorrowSummary = tomorrowEvents
       .map(e => {
+        const owner = `[${ownershipTag(e, userId, householdNameMap)}]`;
         const friendly = friendlyDateTime(e.start);
         const when = friendly || (e.start ? `raw: ${e.start}` : "Unknown");
-        return `- ${e.title} | ${when} | Owner: ${e.userId}`;
+        return `- ${owner} ${e.title} | ${when}`;
       })
       .join("\n");
 
@@ -440,6 +481,7 @@ Rules:
 - Surface anything important tomorrow so it lands gently in advance
 - Skip signals with no useful information
 - Tone: reflective, closing the day, like a thought ${userName} was already having as the evening settles
+- Ownership tags: every signal, deadline, and event is prefixed [YOURS], [NAME'S] (a household member), or [HOUSEHOLD]. When the tag is [YOURS], speak in second person — "your spray tan tonight." When it's [NAME'S], use that person's first name naturally — "Sarah's spray tan went well." When it's [HOUSEHOLD], use neutral framing. NEVER include the bracket tags in the brief output — they're routing metadata.
 - Never say "here is your brief" or use assistant language
 - Output plain text only. No markdown. No hashtags. No headers.
 - Do not begin with a date or header. Start directly with the first sentence.

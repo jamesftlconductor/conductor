@@ -76,6 +76,49 @@ function computeRing(s) {
   return "outer";
 }
 
+// Returns Map<userId, firstName> for every household member except the
+// requesting user (whose first name comes from the existing userName
+// resolution path). Uses the same scan pattern as sync.js and notify.js so
+// new members joining via /api/invite are automatically picked up.
+async function buildHouseholdNameMap(redis, householdId, requestingUserId) {
+  const map = new Map();
+  let cursor = "0";
+  const memberKeys = [];
+  do {
+    const [next, batch] = await redis.scan(cursor, {
+      match: "user:*:household",
+      count: 100,
+    });
+    cursor = next;
+    if (batch?.length) memberKeys.push(...batch);
+  } while (cursor !== "0" && cursor !== 0);
+
+  for (const key of memberKeys) {
+    const memberUserId = key.slice("user:".length, -":household".length);
+    if (memberUserId === requestingUserId) continue;
+    const memberHouseholdId = await redis.get(key);
+    if (memberHouseholdId !== householdId) continue;
+    const profileRaw = await redis.get(`user:${memberUserId}:profile`);
+    const profile =
+      typeof profileRaw === "string" ? JSON.parse(profileRaw) : profileRaw;
+    const firstName = profile?.name?.split(" ")[0];
+    if (firstName) map.set(memberUserId, firstName);
+  }
+  return map;
+}
+
+// Returns the bracket tag for a signal/event/deadline based on its userId
+// field. The requesting user's own signals get YOURS; another household
+// member's get their first name; missing or unknown userIds fall back to
+// HOUSEHOLD so Claude can choose neutral framing.
+function ownershipTag(item, requestingUserId, nameMap) {
+  if (!item || !item.userId) return "HOUSEHOLD";
+  if (item.userId === requestingUserId) return "YOURS";
+  const firstName = nameMap.get(item.userId);
+  if (firstName) return `${firstName.toUpperCase()}'S`;
+  return "HOUSEHOLD";
+}
+
 function eventClassifiedAs(e, keywords) {
   const haystack = [
     e.category,
@@ -196,6 +239,7 @@ export default async function handler(req, res) {
       rawBriefedThisWeek,
       rawClearanceBriefed,
       rawCarriedForward,
+      householdNameMap,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       redis.get(`household:${householdId}:calendar`),
@@ -209,6 +253,7 @@ export default async function handler(req, res) {
       redis.smembers(`household:${householdId}:briefedThisWeek`),
       redis.smembers(`household:${householdId}:clearanceBriefed`),
       redis.smembers(`household:${householdId}:carriedForward`),
+      buildHouseholdNameMap(redis, householdId, userId),
     ]);
 
     const allSignals = (rawSignals || []).map(safeJson).filter(Boolean);
@@ -386,8 +431,13 @@ export default async function handler(req, res) {
             description: s.description,
             eta: s.eta,
             status: s.status,
+            owner: ownershipTag(s, userId, householdNameMap),
           })),
-          events: matchingEvents.map((e) => ({ title: e.title, start: e.start })),
+          events: matchingEvents.map((e) => ({
+            title: e.title,
+            start: e.start,
+            owner: ownershipTag(e, userId, householdNameMap),
+          })),
         };
       }
     }
@@ -483,15 +533,17 @@ export default async function handler(req, res) {
     };
 
     const formatSignal = (s) => {
+      const owner = `[${ownershipTag(s, userId, householdNameMap)}]`;
       if (s._isDeadline) {
-        return `- [DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
+        return `- ${owner} [DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
       }
-      return `- ${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}`;
+      return `- ${owner} ${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}`;
     };
     const formatEvent = (e) => {
+      const owner = `[${ownershipTag(e, userId, householdNameMap)}]`;
       const friendly = friendlyDateTime(e.start);
       const when = friendly || (e.start ? `raw: ${e.start}` : "Unknown");
-      return `- ${e.title || "Untitled"} | ${when}`;
+      return `- ${owner} ${e.title || "Untitled"} | ${when}`;
     };
 
     const layeredContext = [
@@ -551,6 +603,7 @@ export default async function handler(req, res) {
 - Plain text only, no markdown
 - Do not begin with date or header
 - Personalize to ${userName} — use "you" naturally
+- Ownership tags: every signal, deadline, and calendar event is prefixed with [YOURS], a household member's name in the form [NAME'S], or [HOUSEHOLD]. When the tag is [YOURS], speak in second person — "your spray tan tonight." When it's [SARAH'S] (or any other name), use that person's first name naturally — "Sarah has a spray tan tonight." When it's [HOUSEHOLD], use neutral household framing — "the vehicle registration renewal is due Wednesday." Flagged-categories signals carry an "owner" field with the same possible values; treat it identically. NEVER include the bracket tags or the literal word "owner" in the brief — they're routing metadata.
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field (e.g., "Sunday, May 10"). NEVER compute, infer, or recalculate a day-of-week or date — the resolved string is authoritative. Ignore the "raw:" portion. Drop the year unless it differs from the current year.
 - If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date for it — even if the description mentions a holiday or named event. Either omit the date or use a phrase like "no confirmed date yet". Do NOT translate "Mother's Day", "the weekend", or similar phrases into specific calendar dates yourself.`;
 
@@ -562,6 +615,7 @@ export default async function handler(req, res) {
 - Plain text only, no markdown
 - Do not begin with date or header
 - Personalize to ${userName}
+- Ownership tags: every item is prefixed [YOURS], [NAME'S], or [HOUSEHOLD]. Use "you" for [YOURS], the named person for [NAME'S], household framing for [HOUSEHOLD]. Never include the bracket tags in the brief.
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field. NEVER compute or infer a date.
 - If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date — even for holidays mentioned in the description.`;
 
