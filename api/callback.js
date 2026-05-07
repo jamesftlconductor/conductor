@@ -89,7 +89,22 @@ export default async function handler(req, res) {
         invite && (!invite.expiresAt || Date.now() <= invite.expiresAt);
       if (stillValid) {
         await redis.set(`user:${userId}:household`, invite.householdId);
-        await redis.sadd(`household:${invite.householdId}:members`, userId);
+        const membersKey = `household:${invite.householdId}:members`;
+        try {
+          await redis.sadd(membersKey, userId);
+        } catch (sErr) {
+          // Defensive: if some prior write left :members as a non-SET type
+          // (string, list, etc.), SADD throws WRONGTYPE. Delete and recreate
+          // as a fresh SET so the join still completes. Without this, an
+          // accidental write upstream would permanently break new joins.
+          if (String(sErr?.message || "").includes("WRONGTYPE")) {
+            console.warn(`Members key ${membersKey} had wrong type; resetting to SET`);
+            await redis.del(membersKey);
+            await redis.sadd(membersKey, userId);
+          } else {
+            throw sErr;
+          }
+        }
         // Single-use semantics — deleting prevents re-joins or sharing the
         // link beyond the first redemption.
         await redis.del(`invite:${inviteCode}`);
