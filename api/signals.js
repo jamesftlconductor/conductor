@@ -62,6 +62,79 @@ async function writeMemoryEntry(householdId, signal, action, userId) {
   await redis.ltrim(key, 0, MEMORY_TRIM_TO - 1);
 }
 
+async function handleHorizon(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for horizon" });
+  }
+
+  const householdId = await resolveHouseholdId(req.query.userId);
+  const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+
+  // Deadlines arrive in their own list with a `date` field rather than
+  // `eta` (per onboard-worker's prompt). Normalize to a single `eta`
+  // string so the horizon list can sort + render consistently.
+  function etaMs(item) {
+    const v = item.eta || item.date;
+    if (!v) return NaN;
+    const parsed = Date.parse(v);
+    return isNaN(parsed) ? NaN : parsed;
+  }
+
+  const [{ signals }, rawDeadlines] = await Promise.all([
+    loadSignals(householdId),
+    redis.lrange(`household:${householdId}:deadlines`, 0, -1),
+  ]);
+
+  const farSignals = signals.filter((s) => {
+    const stillOpen = !s.state || s.state === "incoming" || s.state === "active";
+    if (!stillOpen) return false;
+    if (s.type === "deadline") return true;
+    const ms = etaMs(s);
+    if (isNaN(ms)) return false;
+    return ms - now > FOURTEEN_DAYS_MS;
+  });
+
+  const taggedDeadlines = (rawDeadlines || [])
+    .map((item) => (typeof item === "string" ? JSON.parse(item) : item))
+    .filter(Boolean)
+    .filter((d) => {
+      if (d.state === "resolved" || d.state === "expired") return false;
+      return !isNaN(etaMs(d));
+    })
+    .map((d) => ({
+      ...d,
+      type: "deadline",
+      eta: d.eta || d.date,
+    }));
+
+  // Dedupe by id — a deadline that ended up in :signals (rare, but possible
+  // via hand-curation) shouldn't appear twice.
+  const seen = new Set();
+  const combined = [];
+  for (const item of [...farSignals, ...taggedDeadlines]) {
+    const id = String(item.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    combined.push(item);
+  }
+
+  combined.sort((a, b) => {
+    const aMs = etaMs(a);
+    const bMs = etaMs(b);
+    if (isNaN(aMs)) return 1;
+    if (isNaN(bMs)) return -1;
+    return aMs - bMs;
+  });
+
+  return res.status(200).json({
+    household: householdId,
+    count: combined.length,
+    signals: combined,
+  });
+}
+
 async function handleMemory(req, res) {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
@@ -294,6 +367,12 @@ export default async function handler(req, res) {
       return handlePatterns(req, res);
     }
 
+    // Horizon — outer-ring active signals + all unresolved deadlines,
+    // sorted by ETA ascending. Feeds the Horizon screen on mobile.
+    if (queryType === "horizon" || bodyType === "horizon") {
+      return handleHorizon(req, res);
+    }
+
     if (req.method === "GET") {
       const householdId = await resolveHouseholdId(req.query.userId);
       const { signals } = await loadSignals(householdId);
@@ -301,7 +380,7 @@ export default async function handler(req, res) {
     }
 
     if (req.method === "PATCH") {
-      const { id, state, userId } = req.body || {};
+      const { id, state, userId, notedAt } = req.body || {};
 
       if (id === undefined || id === null) {
         return res.status(400).json({ error: "id is required" });
@@ -313,29 +392,57 @@ export default async function handler(req, res) {
       const householdId = await resolveHouseholdId(userId);
       const { key, signals } = await loadSignals(householdId);
 
-      const index = signals.findIndex(s => s.id === id || String(s.id) === String(id));
+      let index = signals.findIndex(s => s.id === id || String(s.id) === String(id));
+
+      if (index !== -1) {
+        // Primary path — id is in :signals.
+        const previousLastUpdate = signals[index].lastUpdate;
+        signals[index].state = state;
+        signals[index].lastUpdate = new Date().toLocaleString();
+        if (typeof notedAt === "string" && notedAt.length > 0) {
+          signals[index].notedAt = notedAt;
+        }
+        await redis.lset(key, index, JSON.stringify(signals[index]));
+
+        if (state === "resolved" || state === "active") {
+          const action = state === "resolved" ? "resolved" : "held";
+          const memorySignal = { ...signals[index], lastUpdate: previousLastUpdate };
+          await writeMemoryEntry(householdId, memorySignal, action, userId);
+        }
+        return res.status(200).json({ household: householdId, signal: signals[index] });
+      }
+
+      // Fallback path — id might belong to the :deadlines list, which is a
+      // separate store but is exposed alongside signals on the Horizon
+      // screen. Same state/notedAt + memory-log semantics apply.
+      const deadlinesKey = `household:${householdId}:deadlines`;
+      const rawDeadlines = await redis.lrange(deadlinesKey, 0, -1);
+      const deadlines = rawDeadlines.map(parseSignal);
+      index = deadlines.findIndex(d => d.id === id || String(d.id) === String(id));
       if (index === -1) {
         return res.status(404).json({ error: "signal not found" });
       }
 
-      // Capture the prior "in system since" anchor before we bump lastUpdate
-      // so the memory entry's daysInSystem reflects how long the signal sat
-      // in its previous state, not zero.
-      const previousLastUpdate = signals[index].lastUpdate;
-      signals[index].state = state;
-      signals[index].lastUpdate = new Date().toLocaleString();
-      await redis.lset(key, index, JSON.stringify(signals[index]));
+      const previousLastUpdate = deadlines[index].lastUpdate;
+      deadlines[index].state = state;
+      deadlines[index].lastUpdate = new Date().toLocaleString();
+      if (typeof notedAt === "string" && notedAt.length > 0) {
+        deadlines[index].notedAt = notedAt;
+      }
+      await redis.lset(deadlinesKey, index, JSON.stringify(deadlines[index]));
 
-      // Memory log on resolved (Rest) or active (Hold) transitions only.
-      // Incoming and expired aren't user actions worth recording here —
-      // expiry is handled by the auto-expire path in loadSignals.
       if (state === "resolved" || state === "active") {
         const action = state === "resolved" ? "resolved" : "held";
-        const memorySignal = { ...signals[index], lastUpdate: previousLastUpdate };
+        // Tag type as "deadline" for the memory entry so the patterns
+        // endpoint can see it in the typeBreakdown bucket.
+        const memorySignal = {
+          ...deadlines[index],
+          lastUpdate: previousLastUpdate,
+          type: deadlines[index].type || "deadline",
+        };
         await writeMemoryEntry(householdId, memorySignal, action, userId);
       }
-
-      return res.status(200).json({ household: householdId, signal: signals[index] });
+      return res.status(200).json({ household: householdId, signal: deadlines[index] });
     }
 
     if (req.method === "DELETE") {
