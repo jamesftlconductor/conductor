@@ -62,6 +62,84 @@ async function writeMemoryEntry(householdId, signal, action, userId) {
   await redis.ltrim(key, 0, MEMORY_TRIM_TO - 1);
 }
 
+// Vault — dedicated deadline storage. GET returns items not marked handled,
+// sorted by renewalDate ascending. POST handles three mobile actions:
+//   add    — LPUSH a user-supplied vault item
+//   handle — mark an existing item handled (hides it from active GETs)
+//   delete — remove an item from the list entirely
+async function handleVault(req, res) {
+  const householdId = await resolveHouseholdId(req.query?.userId || req.body?.userId);
+  const key = `household:${householdId}:vault`;
+
+  if (req.method === "GET") {
+    const raw = await redis.lrange(key, 0, -1);
+    const items = raw
+      .map(parseSignal)
+      .filter(Boolean)
+      .filter((v) => !v.handled);
+    items.sort((a, b) => {
+      const aMs = Date.parse(a.renewalDate);
+      const bMs = Date.parse(b.renewalDate);
+      if (isNaN(aMs)) return 1;
+      if (isNaN(bMs)) return -1;
+      return aMs - bMs;
+    });
+    return res.status(200).json({ household: householdId, count: items.length, items });
+  }
+
+  if (req.method === "POST") {
+    const { action, id, item } = req.body || {};
+
+    if (action === "add") {
+      if (!item || typeof item !== "object" || !item.description) {
+        return res.status(400).json({ error: "Missing item.description" });
+      }
+      const vaultItem = {
+        id: `vault_user_${Date.now()}`,
+        category: item.category || "other",
+        description: item.description,
+        provider: item.provider || null,
+        renewalDate: item.renewalDate || null,
+        amount: item.amount || null,
+        consequence: item.consequence || null,
+        confidence: item.confidence || "medium",
+        source: "user",
+        foundAt: Date.now(),
+      };
+      await redis.lpush(key, JSON.stringify(vaultItem));
+      return res.status(200).json({ ok: true, item: vaultItem });
+    }
+
+    if (action === "handle" || action === "delete") {
+      if (!id) return res.status(400).json({ error: "Missing id" });
+      const raw = await redis.lrange(key, 0, -1);
+      const items = raw.map(parseSignal).filter(Boolean);
+      const index = items.findIndex((v) => String(v.id) === String(id));
+      if (index === -1) return res.status(404).json({ error: "vault item not found" });
+
+      if (action === "handle") {
+        items[index].handled = true;
+        items[index].handledAt = Date.now();
+        await redis.lset(key, index, JSON.stringify(items[index]));
+        return res.status(200).json({ ok: true, item: items[index] });
+      }
+
+      // delete: rewrite the list without this item.
+      const remaining = items.filter((_, i) => i !== index);
+      await redis.del(key);
+      if (remaining.length > 0) {
+        await redis.rpush(key, ...remaining.map((v) => JSON.stringify(v)));
+      }
+      return res.status(200).json({ ok: true, deleted: id, remaining: remaining.length });
+    }
+
+    return res.status(400).json({ error: "action must be 'add', 'handle', or 'delete'" });
+  }
+
+  res.setHeader("Allow", "GET, POST");
+  return res.status(405).json({ error: "Method not allowed for vault" });
+}
+
 async function handleHorizon(req, res) {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
@@ -371,6 +449,13 @@ export default async function handler(req, res) {
     // sorted by ETA ascending. Feeds the Horizon screen on mobile.
     if (queryType === "horizon" || bodyType === "horizon") {
       return handleHorizon(req, res);
+    }
+
+    // Vault — dedicated deadline storage with categories. GET lists active
+    // (non-handled) items; POST handles add / handle / delete actions from
+    // the mobile vault screen.
+    if (queryType === "vault" || bodyType === "vault") {
+      return handleVault(req, res);
     }
 
     if (req.method === "GET") {

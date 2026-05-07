@@ -341,7 +341,7 @@ export default async function handler(req, res) {
       redis.get(`household:${householdId}:calendar`),
       userId ? redis.get(`user:${userId}:health`) : Promise.resolve(null),
       redis.get(`household:${householdId}:horizon`),
-      redis.lrange(`household:${householdId}:deadlines`, 0, -1),
+      redis.lrange(`household:${householdId}:vault`, 0, -1),
       redis.lrange(`household:${householdId}:briefed`, 0, -1),
       userId ? redis.get(`user:${userId}:preferences`) : Promise.resolve(null),
       redis.get(`household:${householdId}:firstRun`),
@@ -449,10 +449,24 @@ export default async function handler(req, res) {
       .filter(isInNearWindow)
       .filter((s) => !isBackgroundFiltered(s));
 
-    // DEADLINES — pull from :deadlines and classify into urgent / near pools.
-    // 1-3 days → urgent, 4-14 days → near, 15-90 days → horizon (handled below).
-    // Deduped against existing signal descriptions so we don't double-report.
-    const allDeadlines = (rawDeadlines || []).map(safeJson).filter(Boolean);
+    // DEADLINES — pulled from :vault (the new dedicated deadline storage).
+    // Vault items use renewalDate; adapt to the eta-based shape the rest of
+    // the file already expects, and stamp _isDeadline + type so the prompt
+    // formatter renders them correctly. Pool boundaries per the vault spec:
+    //   <14 days       → urgent
+    //   14-60 days     → near window
+    //   60-90 days     → horizon candidate (handled lower down)
+    // Items past, beyond 90 days, or marked handled are dropped here.
+    const allDeadlines = (rawDeadlines || [])
+      .map(safeJson)
+      .filter(Boolean)
+      .filter((v) => !v.handled)
+      .map((v) => ({
+        ...v,
+        eta: v.renewalDate || v.eta,
+        _isDeadline: true,
+        type: "deadline",
+      }));
     const existingSignalDescs = new Set(
       activeSignals
         .map((s) => (s.description || "").toLowerCase().trim())
@@ -480,16 +494,13 @@ export default async function handler(req, res) {
       const desc = (d.description || "").toLowerCase().trim();
       if (isSimilarToExistingSignal(desc)) continue;
       const days = (eta.getTime() - Date.now()) / DAY_MS;
-      // Tag with `_isDeadline: true` so the prompt formatter can render
-      // them with the [DEADLINE] prefix and a Category field.
-      const tagged = { ...d, _isDeadline: true, type: "deadline" };
-      if (days >= -1 && days <= 3) urgentDeadlines.push(tagged);
-      else if (days > 3 && days <= 14) {
-        // Near-window deadlines get the background-filter treatment too,
-        // since they are also subject to the "don't repeat last brief" rule.
-        if (!isBackgroundFiltered(tagged)) nearDeadlines.push(tagged);
+      if (days >= -1 && days < 14) urgentDeadlines.push(d);
+      else if (days >= 14 && days <= 60) {
+        // Near-window vault items get the background-filter treatment too —
+        // same "don't repeat last brief" rule applies.
+        if (!isBackgroundFiltered(d)) nearDeadlines.push(d);
       }
-      // 15-90 reserved for horizon; handled below.
+      // 60-90 days reserved for horizon; handled below.
     }
 
     // Combined pools used in the prompt assembly section below.
@@ -550,17 +561,18 @@ export default async function handler(req, res) {
     if (horizonFresh) {
       horizonSignal = storedHorizon.signal;
     } else {
-      const deadlines = (rawDeadlines || []).map(safeJson).filter(Boolean);
-      const candidates = deadlines.filter((d) => {
+      // Reuse the vault-adapted allDeadlines list rather than re-parsing
+      // rawDeadlines. Boundary moves to 60-90 days under the new partition
+      // (urgent < 14, near 14-60, horizon 60-90).
+      const candidates = allDeadlines.filter((d) => {
         if (briefedIds.has(String(d.id))) return false;
         const eta = parseDateLoose(d.eta);
         if (!eta) return false;
         const offsetDays = (eta.getTime() - Date.now()) / DAY_MS;
-        // 15-90 days: 4-14 day deadlines are now in the near pool above.
-        return offsetDays >= 15 && offsetDays <= 90;
+        return offsetDays >= 60 && offsetDays <= 90;
       });
       if (candidates.length > 0) {
-        // Most surprising — prefer the closest to the 15-day edge that hasn't been briefed.
+        // Most surprising — prefer the closest to the 60-day edge that hasn't been briefed.
         candidates.sort(
           (a, b) => parseDateLoose(a.eta).getTime() - parseDateLoose(b.eta).getTime()
         );

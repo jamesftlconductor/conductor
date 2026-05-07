@@ -411,7 +411,156 @@ Return only the JSON object.`,
   };
 }
 
-// ---------- Job 3: Horizon selection ----------
+// ---------- Job 3: Vault sweep ----------
+//
+// Dedicated Gmail sweep that targets deadline-bearing subjects, then asks
+// Claude one-by-one (per the spec) to extract a structured vault item per
+// email. Filters out items with no renewal date or one that's already past
+// by more than 30 days, then dedupes by description similarity before LPUSH
+// into household:{id}:vault. The horizon job (run after this) consumes
+// :vault rather than :deadlines.
+
+async function runVaultJob(userId, householdId) {
+  await patchJob(householdId, "vault", { state: "running", startedAt: Date.now() });
+
+  const accessToken = await getValidToken(userId);
+  const twelveMonthsAgo = Math.floor((Date.now() - 365 * DAY_MS) / 1000);
+
+  const query =
+    `after:${twelveMonthsAgo} subject:(insurance OR registration OR renewal OR expires OR ` +
+    `expiration OR warranty OR lease OR subscription OR license OR passport OR membership OR ` +
+    `"due date" OR "renew by" OR "expires on" OR "annual fee" OR "auto-renew")`;
+
+  const messageIds = await gmailSearch(accessToken, query, 100).catch(() => []);
+  await patchJob(householdId, "vault", { found: messageIds.length });
+
+  if (messageIds.length === 0) {
+    await patchJob(householdId, "vault", {
+      state: "complete",
+      finishedAt: Date.now(),
+      processed: 0,
+      kept: 0,
+      dropped: 0,
+    });
+    return { processed: 0, kept: 0 };
+  }
+
+  // Metadata fetch in parallel chunks of 15 (matches the email-job pattern;
+  // larger chunks risk Gmail per-second quota).
+  const headers = [];
+  for (let i = 0; i < messageIds.length; i += 15) {
+    const chunk = messageIds.slice(i, i + 15);
+    const chunkResults = await Promise.all(
+      chunk.map((id) => fetchEmailMetadata(accessToken, id).catch(() => null))
+    );
+    headers.push(...chunkResults);
+  }
+  const validHeaders = headers.filter(Boolean);
+
+  // Existing vault descriptions for dedup. Same lowercased-substring overlap
+  // pattern used in the email/deadlines path.
+  const existingRaw = await redis.lrange(`household:${householdId}:vault`, 0, -1);
+  const existingDescriptions = new Set(
+    existingRaw
+      .map(safeJson)
+      .filter(Boolean)
+      .map((v) => (v.description || "").toLowerCase().trim())
+      .filter(Boolean)
+  );
+  function isDuplicateDescription(desc) {
+    if (!desc) return true;
+    if (existingDescriptions.has(desc)) return true;
+    for (const ex of existingDescriptions) {
+      if (ex.length >= 6 && desc.length >= 6 && (ex.includes(desc) || desc.includes(ex))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  let processed = 0;
+  let kept = 0;
+  let dropped = 0;
+  const PARALLEL = 10;
+
+  for (let i = 0; i < validHeaders.length; i += PARALLEL) {
+    const batch = validHeaders.slice(i, i + PARALLEL);
+    const items = await Promise.all(
+      batch.map(async (e) => {
+        const text = await callClaude(
+          `Extract any deadline, renewal, or expiration from this email. Return ONLY a JSON object or null if nothing found:
+{
+  "category": "insurance" | "registration" | "subscription" | "lease" | "warranty" | "medical" | "financial" | "legal" | "membership" | "other",
+  "description": "what this is",
+  "provider": "company or organization name",
+  "renewalDate": "YYYY-MM-DD or null",
+  "amount": "dollar amount per year if known or null",
+  "consequence": "what happens if missed in 5 words or less",
+  "confidence": "high" | "medium" | "low"
+}
+Only return something if there is a clear deadline or renewal date. Return null if this is purely promotional.
+
+Email:
+Subject: ${e.subject}
+From: ${e.from}
+Date: ${e.date}
+Snippet: ${(e.snippet || "").substring(0, 400)}`,
+          300
+        ).catch(() => null);
+        return safeParseJsonText(text);
+      })
+    );
+
+    for (const item of items) {
+      processed++;
+      if (!item || typeof item !== "object" || !item.renewalDate) {
+        dropped++;
+        continue;
+      }
+      const renewalMs = Date.parse(item.renewalDate);
+      if (isNaN(renewalMs) || renewalMs < Date.now() - 30 * DAY_MS) {
+        dropped++;
+        continue;
+      }
+      const desc = (item.description || "").toLowerCase().trim();
+      if (isDuplicateDescription(desc)) {
+        dropped++;
+        continue;
+      }
+      existingDescriptions.add(desc);
+
+      await redis.lpush(
+        `household:${householdId}:vault`,
+        JSON.stringify({
+          id: `vault_${Date.now()}_${kept}`,
+          category: item.category || "other",
+          description: item.description,
+          provider: item.provider || null,
+          renewalDate: item.renewalDate,
+          amount: item.amount || null,
+          consequence: item.consequence || null,
+          confidence: item.confidence || "low",
+          source: "gmail",
+          foundAt: Date.now(),
+        })
+      );
+      kept++;
+    }
+
+    await patchJob(householdId, "vault", { processed, kept, dropped });
+  }
+
+  await patchJob(householdId, "vault", {
+    state: "complete",
+    finishedAt: Date.now(),
+    processed,
+    kept,
+    dropped,
+  });
+  return { processed, kept, dropped };
+}
+
+// ---------- Job 4: Horizon selection ----------
 
 const SURPRISING_KEYWORDS = [
   "insurance", "renewal", "lease", "registration",
@@ -421,10 +570,22 @@ const SURPRISING_KEYWORDS = [
 async function runHorizonJob(householdId) {
   await patchJob(householdId, "horizon", { state: "running", startedAt: Date.now() });
 
-  const rawDeadlines = await redis.lrange(`household:${householdId}:deadlines`, 0, -1);
-  const deadlines = rawDeadlines.map(safeJson).filter(Boolean);
+  // Switched from :deadlines to :vault in the vault flow. Vault items use
+  // renewalDate; map to the {description, eta, category} shape the rest of
+  // this code expects.
+  const rawVault = await redis.lrange(`household:${householdId}:vault`, 0, -1);
+  const vaultItems = rawVault
+    .map(safeJson)
+    .filter(Boolean)
+    .filter((v) => !v.handled)
+    .map((v) => ({
+      id: v.id,
+      description: v.description,
+      eta: v.renewalDate,
+      category: v.category,
+    }));
 
-  const candidates = deadlines.filter((d) => {
+  const candidates = vaultItems.filter((d) => {
     const ms = Date.parse(d.eta);
     if (isNaN(ms)) return false;
     const days = (ms - Date.now()) / DAY_MS;
@@ -510,6 +671,14 @@ export default async function handler(req, res) {
     await patchJob(householdId, "calendar", { state: "failed", error: err.message });
   }
 
+  let vaultResult = null;
+  try {
+    vaultResult = await runVaultJob(userId, householdId);
+  } catch (err) {
+    console.error("Vault job failed:", err);
+    await patchJob(householdId, "vault", { state: "failed", error: err.message });
+  }
+
   let horizonResult = null;
   try {
     horizonResult = await runHorizonJob(householdId);
@@ -527,6 +696,8 @@ export default async function handler(req, res) {
       signalsFound: emailResult?.signals || 0,
       patternsFound: (emailResult?.patterns || 0) + (calendarResult?.patterns || 0),
       calendarEventsProcessed: calendarResult?.classified || 0,
+      vaultProcessed: vaultResult?.processed || 0,
+      vaultKept: vaultResult?.kept || 0,
       horizonSignal: horizonResult,
     },
   });
