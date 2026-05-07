@@ -280,6 +280,7 @@ export default async function handler(req, res) {
       rawBriefedToday,
       rawMorningBriefed,
       householdNameMap,
+      rawFeedbackStats,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       redis.get(`household:${householdId}:calendar`),
@@ -289,6 +290,7 @@ export default async function handler(req, res) {
       redis.hgetall(`household:${householdId}:briefedToday`),
       redis.hgetall(`household:${householdId}:morningBriefed`),
       buildHouseholdNameMap(redis, householdId, userId),
+      redis.hgetall(`household:${householdId}:feedbackStats`),
     ]);
 
     const signals = (rawSignals || []).map(s => typeof s === "string" ? JSON.parse(s) : s);
@@ -536,6 +538,16 @@ ${lastChanceSummary || "None"}
 On the household calendar tomorrow:
 ${tomorrowSummary || "None"}
 
+FEEDBACK HISTORY: Takeoff thumbs up: ${
+        (rawFeedbackStats && rawFeedbackStats.takeoff_up) || 0
+      }, thumbs down: ${
+        (rawFeedbackStats && rawFeedbackStats.takeoff_down) || 0
+      }. Clearance thumbs up: ${
+        (rawFeedbackStats && rawFeedbackStats.clearance_up) || 0
+      }, thumbs down: ${
+        (rawFeedbackStats && rawFeedbackStats.clearance_down) || 0
+      }.
+
 Rules:
 - Write in natural, flowing prose — not a list
 - 3-5 sentences maximum
@@ -544,6 +556,7 @@ Rules:
 - Surface anything important tomorrow so it lands gently in advance
 - Skip signals with no useful information
 - Tone: reflective, closing the day, like a thought ${userName} was already having as the evening settles
+- Feedback tuning: the FEEDBACK HISTORY counts reflect how prior briefs landed. If clearance thumbs-down significantly outnumbers clearance thumbs-up, be more concise and specific — trim discretionary sentences. If thumbs-up is high or both counts are low, maintain current voice. Never reference the feedback in the output.
 - Ownership tags: every signal, deadline, and event is prefixed [YOURS], [NAME'S] (a household member), or [HOUSEHOLD]. When the tag is [YOURS], speak in second person — "your spray tan tonight." When it's [NAME'S], use that person's first name naturally — "Sarah's spray tan went well." When it's [HOUSEHOLD], use neutral framing. NEVER include the bracket tags in the brief output — they're routing metadata.
 - Never say "here is your brief" or use assistant language
 - Output plain text only. No markdown. No hashtags. No headers.

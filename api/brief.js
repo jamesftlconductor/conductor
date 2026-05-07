@@ -302,6 +302,7 @@ export default async function handler(req, res) {
       rawClearanceBriefed,
       rawCarriedForward,
       householdNameMap,
+      rawFeedbackStats,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       redis.get(`household:${householdId}:calendar`),
@@ -316,6 +317,7 @@ export default async function handler(req, res) {
       redis.smembers(`household:${householdId}:clearanceBriefed`),
       redis.smembers(`household:${householdId}:carriedForward`),
       buildHouseholdNameMap(redis, householdId, userId),
+      redis.hgetall(`household:${householdId}:feedbackStats`),
     ]);
 
     const allSignals = (rawSignals || []).map(safeJson).filter(Boolean);
@@ -647,6 +649,16 @@ export default async function handler(req, res) {
       horizonAwarenessSignal
         ? `- ${horizonAwarenessSignal.description || "Unknown"} | ETA: ${etaWithFriendly(horizonAwarenessSignal.eta)}`
         : "None",
+      ``,
+      `FEEDBACK HISTORY: Takeoff thumbs up: ${
+        (rawFeedbackStats && rawFeedbackStats.takeoff_up) || 0
+      }, thumbs down: ${
+        (rawFeedbackStats && rawFeedbackStats.takeoff_down) || 0
+      }. Clearance thumbs up: ${
+        (rawFeedbackStats && rawFeedbackStats.clearance_up) || 0
+      }, thumbs down: ${
+        (rawFeedbackStats && rawFeedbackStats.clearance_down) || 0
+      }.`,
     ].join("\n");
 
     const baseRules = `RULES:
@@ -659,6 +671,7 @@ export default async function handler(req, res) {
 - Carried forward: if CARRIED FORWARD FROM YESTERDAY is populated, weave in one understated sentence near the end (before the horizon line) — e.g. "Carrying forward from yesterday: the HVAC appointment is still unconfirmed." Never alarming, never repetitive of the main brief narrative. If multiple carry-forwards exist, name at most one or two; the rest are implied.
 - Horizon signal: one sentence at the end, tonal shift to future-aware, specific and surprising
 - Horizon awareness: if HORIZON AWARENESS is populated, surface it as one quiet sentence near the end (a "by the way..." not a lead). If both HORIZON SIGNAL and HORIZON AWARENESS are populated, prefer HORIZON AWARENESS — at most one horizon-style sentence per brief total.
+- Feedback tuning: the FEEDBACK HISTORY counts reflect how prior briefs landed. If thumbs-down significantly outnumbers thumbs-up for this brief type (takeoff or clearance, depending on which you're writing), be more concise and specific — trim discretionary sentences, lean harder into the most concrete signals. If thumbs-up is high or both counts are low, maintain current voice. Never reference the feedback in the brief output.
 - If multiple layers are silent, the brief is shorter — that is correct and good
 - A quiet brief is a gift — end with confidence not apology
 - Never say "here is your brief" or use assistant language
