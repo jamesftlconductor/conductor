@@ -62,6 +62,121 @@ async function writeMemoryEntry(householdId, signal, action, userId) {
   await redis.ltrim(key, 0, MEMORY_TRIM_TO - 1);
 }
 
+// Compass — longitudinal aggregation over the memory log + patterns list.
+// Richer cousin of ?type=patterns: adds first-seen / last-seen timestamps,
+// resolution speed in hours, most-active and quietest day-of-week.
+async function handleCompass(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for compass" });
+  }
+
+  const householdId = await resolveHouseholdId(req.query?.userId);
+  const [rawMemory, rawPatterns] = await Promise.all([
+    redis.lrange(`household:${householdId}:memory`, 0, -1),
+    redis.lrange(`household:${householdId}:patterns`, 0, -1),
+  ]);
+  const entries = rawMemory.map((x) => (typeof x === "string" ? JSON.parse(x) : x)).filter(Boolean);
+  const patterns = rawPatterns.map((x) => (typeof x === "string" ? JSON.parse(x) : x)).filter(Boolean);
+
+  const now = Date.now();
+  const DAY_MS_LOCAL = 24 * 60 * 60 * 1000;
+
+  // Aggregations in a single pass over memory.
+  const senderMap = new Map(); // sender -> { count, lastSeenMs }
+  const typeBreakdown = {};    // { [type]: { resolved, held, expired } }
+  const dayCounts = new Map(); // day-of-week -> count
+  const typeTotals = new Map();// type -> total count
+  let totalResolved = 0;
+  let earliestActionMs = Infinity;
+  let resolutionDaysSum = 0;
+  let resolutionDaysCount = 0;
+
+  // Initialise day buckets at zero so quietestDay can return a real day even
+  // when a slot has zero entries. Keeps Mon-Sun ordering for downstream.
+  const DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+  for (const d of DAYS) dayCounts.set(d, 0);
+
+  for (const e of entries) {
+    if (e.action === "resolved") totalResolved += 1;
+
+    const actionMs = e.actionAt ? Date.parse(e.actionAt) : NaN;
+    if (!isNaN(actionMs)) {
+      if (actionMs < earliestActionMs) earliestActionMs = actionMs;
+      const day = new Date(actionMs).toLocaleString("en-US", { weekday: "long" });
+      dayCounts.set(day, (dayCounts.get(day) || 0) + 1);
+    }
+
+    if (e.sender) {
+      const cur = senderMap.get(e.sender) || { count: 0, lastSeenMs: 0 };
+      cur.count += 1;
+      if (!isNaN(actionMs) && actionMs > cur.lastSeenMs) cur.lastSeenMs = actionMs;
+      senderMap.set(e.sender, cur);
+    }
+
+    if (e.type) {
+      if (!typeBreakdown[e.type]) typeBreakdown[e.type] = { resolved: 0, held: 0, expired: 0 };
+      if (e.action && typeBreakdown[e.type][e.action] !== undefined) {
+        typeBreakdown[e.type][e.action] += 1;
+      }
+      typeTotals.set(e.type, (typeTotals.get(e.type) || 0) + 1);
+    }
+
+    if (e.action === "resolved" && typeof e.daysInSystem === "number" && e.daysInSystem >= 0) {
+      resolutionDaysSum += e.daysInSystem;
+      resolutionDaysCount += 1;
+    }
+  }
+
+  const daysSinceFirst = isFinite(earliestActionMs)
+    ? Math.max(0, Math.round((now - earliestActionMs) / DAY_MS_LOCAL))
+    : 0;
+  const householdAge = daysSinceFirst; // alias — distinct conceptually, identical in practice
+
+  const topSenders = [...senderMap.entries()]
+    .map(([sender, v]) => ({
+      sender,
+      count: v.count,
+      lastSeen: v.lastSeenMs ? new Date(v.lastSeenMs).toISOString() : null,
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
+
+  const peakDays = DAYS.map((d) => ({ day: d, count: dayCounts.get(d) || 0 }))
+    .sort((a, b) => b.count - a.count);
+
+  const mostActiveCategoryEntry = [...typeTotals.entries()].sort((a, b) => b[1] - a[1])[0];
+  const mostActiveCategory = mostActiveCategoryEntry ? mostActiveCategoryEntry[0] : null;
+
+  // quietestDay — only defined when we have at least one memory entry
+  // (otherwise every day is equally zero, which isn't a meaningful answer).
+  const quietestDay = entries.length > 0
+    ? DAYS.slice().sort((a, b) => (dayCounts.get(a) || 0) - (dayCounts.get(b) || 0))[0]
+    : null;
+
+  // Average resolution time in hours, computed from daysInSystem on resolved
+  // entries. daysInSystem is integer-rounded; multiplying by 24 still gives
+  // a reasonable order-of-magnitude.
+  const averageResolutionTime = resolutionDaysCount > 0
+    ? +(resolutionDaysSum / resolutionDaysCount * 24).toFixed(1)
+    : null;
+
+  return res.status(200).json({
+    household: householdId,
+    sampleSize: entries.length,
+    patternsCount: patterns.length,
+    totalResolved,
+    daysSinceFirst,
+    householdAge,
+    topSenders,
+    typeBreakdown,
+    peakDays,
+    averageResolutionTime,
+    mostActiveCategory,
+    quietestDay,
+  });
+}
+
 // Vault — dedicated deadline storage. GET returns items not marked handled,
 // sorted by renewalDate ascending. POST handles three mobile actions:
 //   add    — LPUSH a user-supplied vault item
@@ -456,6 +571,12 @@ export default async function handler(req, res) {
     // the mobile vault screen.
     if (queryType === "vault" || bodyType === "vault") {
       return handleVault(req, res);
+    }
+
+    // Compass — longitudinal household intelligence over the memory log.
+    // Powers the Compass screen.
+    if (queryType === "compass" || bodyType === "compass") {
+      return handleCompass(req, res);
     }
 
     if (req.method === "GET") {
