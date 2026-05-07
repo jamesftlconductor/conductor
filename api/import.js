@@ -20,9 +20,20 @@ function contentFingerprint(signal) {
 }
 
 // Word-bounded so "office" / "officer" don't trip the "off" rule. The "% off"
-// branch is separate because the leading "%" isn't a word character.
-const PROMO_REGEX = /\b(?:sale|off|discount|promo|deal|offer|coupon|shop now|limited time|exclusive|unsubscribe)\b|%\s*off/i;
+// branch is separate because the leading "%" isn't a word character. Phrases
+// like "special buys" / "save up to" were added empirically after the patterns
+// endpoint surfaced Home Depot Pro promo emails escaping the original list.
+const PROMO_REGEX = /\b(?:sale|off|discount|promo|deal|offer|coupon|shop now|limited time|exclusive|unsubscribe|special buys?|save up to|promo code|shop today|now extended|free shipping|free delivery)\b|%\s*off/i;
 const PROMO_SENDER_PREFIXES = ["noreply", "no-reply", "marketing", "promotions"];
+
+// Substrings that, when present anywhere in the From header, mark the email
+// as a delivery-system bounce — those carry no real signal and Claude tends
+// to classify them as "service" with a "Delayed" status that defeats the
+// promo-sender rule's status-bearing override. Checked against the full
+// From header rather than the local-part because Mail Delivery Subsystem
+// often shows up as `mailer-daemon@googlemail.com` with the friendly name
+// in the display portion.
+const BOUNCE_FROM_SUBSTRINGS = ["mail delivery subsystem", "mailer-daemon", "postmaster"];
 
 function senderLocalPart(from) {
   const match = from.match(/<([^>]+)>/) || from.match(/(\S+@\S+)/);
@@ -30,9 +41,18 @@ function senderLocalPart(from) {
   return match[1].toLowerCase().split("@")[0];
 }
 
+function isBounceFrom(from) {
+  const lower = (from || "").toLowerCase();
+  return BOUNCE_FROM_SUBSTRINGS.some((p) => lower.includes(p));
+}
+
 // Runs after Claude parses the email but before we write the signal. Returns
 // a reason string when the signal should be discarded, or null to keep.
 function postParseDiscardReason(signal, from) {
+  // Delivery-system bounce — the cheapest, most specific signal that this
+  // email carries no real arrival. Checked first so it short-circuits the
+  // other gates.
+  if (isBounceFrom(from)) return "bounce-sender";
   // All-Unknown shell: Claude couldn't extract anything actionable. Storing
   // these clutters the ring with phantom signals.
   if (
