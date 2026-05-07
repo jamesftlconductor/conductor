@@ -261,9 +261,42 @@ ${signalList}`,
 
 // ---------- handler ----------
 
+// Side-channel: returns the most recent stored Takeoff and Clearance briefs.
+// Folded into brief.js to avoid a new function file. Both keys carry a 48h
+// TTL set on every brief generation; the response also returns yesterday's
+// calendar date so the modal can header it appropriately.
+async function handleYesterday(req, res) {
+  const { userId } = req.query;
+  let householdId = "RangerOaks925";
+  if (userId) {
+    const hid = await redis.get(`user:${userId}:household`);
+    if (hid) householdId = hid;
+  }
+  const [takeoff, clearance] = await Promise.all([
+    redis.get(`household:${householdId}:yesterdayTakeoff`),
+    redis.get(`household:${householdId}:yesterdayClearance`),
+  ]);
+  const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const date = yesterday.toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+  return res.status(200).json({
+    household: householdId,
+    takeoff: typeof takeoff === "string" ? takeoff : null,
+    clearance: typeof clearance === "string" ? clearance : null,
+    date,
+  });
+}
+
 export default async function handler(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  if (req.query?.type === "yesterday") {
+    return handleYesterday(req, res);
   }
 
   const { userId } = req.query;
@@ -675,6 +708,11 @@ export default async function handler(req, res) {
 - If multiple layers are silent, the brief is shorter — that is correct and good
 - A quiet brief is a gift — end with confidence not apology
 - Never say "here is your brief" or use assistant language
+- Never reference your own process, scanning, monitoring, or pipeline
+- Never say you are looking for signals, watching for signals, or running sweeps
+- Never use the words: alert, monitor, scan, detect, pipeline, sweep, system, tracking
+- Simply say what you know. Never explain how you know it.
+- When mentioning a future event more than 7 days out, end that sentence with one of these phrases naturally woven in: "worth watching", "Conductor has its eye on this", "it's on the radar", "watching for it", or "we'll flag it as it gets closer". Choose the phrase that fits most naturally. Never use the same phrase twice in one brief.
 - Plain text only, no markdown
 - Do not begin with date or header
 - Personalize to ${userName} — use "you" naturally
@@ -715,6 +753,14 @@ export default async function handler(req, res) {
 
     const data = await response.json();
     const brief = (data && data.content && data.content[0] && data.content[0].text) || "";
+
+    // Stash the most-recent generated brief at a stable key with a 48h TTL
+    // so the Yesterday's Programme modal can always recover it. Naming is
+    // product copy ("yesterday") rather than literal — the key holds the
+    // most recent run and gets overwritten on each subsequent generation.
+    if (brief) {
+      await redis.set(`household:${householdId}:yesterdayTakeoff`, brief, { ex: 48 * 60 * 60 });
+    }
 
     if (isFirstRun) {
       await redis.set(`household:${householdId}:firstRun`, "false");

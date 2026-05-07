@@ -559,6 +559,11 @@ Rules:
 - Feedback tuning: the FEEDBACK HISTORY counts reflect how prior briefs landed. If clearance thumbs-down significantly outnumbers clearance thumbs-up, be more concise and specific — trim discretionary sentences. If thumbs-up is high or both counts are low, maintain current voice. Never reference the feedback in the output.
 - Ownership tags: every signal, deadline, and event is prefixed [YOURS], [NAME'S] (a household member), or [HOUSEHOLD]. When the tag is [YOURS], speak in second person — "your spray tan tonight." When it's [NAME'S], use that person's first name naturally — "Sarah's spray tan went well." When it's [HOUSEHOLD], use neutral framing. NEVER include the bracket tags in the brief output — they're routing metadata.
 - Never say "here is your brief" or use assistant language
+- Never reference your own process, scanning, monitoring, or pipeline
+- Never say you are looking for signals, watching for signals, or running sweeps
+- Never use the words: alert, monitor, scan, detect, pipeline, sweep, system, tracking
+- Simply say what you know. Never explain how you know it.
+- When mentioning a future event more than 7 days out, end that sentence with one of these phrases naturally woven in: "worth watching", "Conductor has its eye on this", "it's on the radar", "watching for it", or "we'll flag it as it gets closer". Choose the phrase that fits most naturally. Never use the same phrase twice in one brief.
 - Output plain text only. No markdown. No hashtags. No headers.
 - Do not begin with a date or header. Start directly with the first sentence.
 - If nothing notable happened or is coming, say so confidently — a quiet day is a real outcome
@@ -571,6 +576,12 @@ Rules:
 
     const data = await response.json();
     const brief = data.content[0].text;
+
+    // Mirror of brief.js — stash the most-recent clearance at a 48h key so
+    // the Yesterday's Programme modal can recover it.
+    if (brief) {
+      await redis.set(`household:${householdId}:yesterdayClearance`, brief, { ex: 48 * 60 * 60 });
+    }
 
     const tagPool = [
       ...resolvedToday,
