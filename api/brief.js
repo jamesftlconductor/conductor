@@ -998,10 +998,26 @@ export default async function handler(req, res) {
     const conflictLines =
       conflicts.length > 0
         ? conflicts
-            .map(
-              (c) =>
-                `- ${c.type}: ${c.signal?.description || c.item?.description || "Unknown"} — ${c.reason || "timing conflict"}`
-            )
+            .map((c) => {
+              const desc =
+                c.signal?.description || c.item?.description || "Unknown";
+              const base = `- ${c.type}: ${desc} — ${c.reason || "timing conflict"}`;
+              // Vault items carry a `consequence` string ("membership
+              // lapses", "premium auto-charged to card on file") that
+              // calibrates how seriously the deadline reads. Surface it
+              // in the prompt so Claude can use the stakes to choose
+              // tone — without quoting the field verbatim.
+              if (c.item?.consequence) {
+                return `${base} (if missed: ${c.item.consequence})`;
+              }
+              // Travel conflicts gain a lot from naming what they
+              // collide with — otherwise Claude has to guess the
+              // counterpart from the rest of the prompt.
+              if (c.conflictingSignal?.description) {
+                return `${base} (collides with: ${c.conflictingSignal.description})`;
+              }
+              return base;
+            })
             .join("\n")
         : "None";
 
