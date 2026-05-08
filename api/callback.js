@@ -5,6 +5,32 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+// Builds a friendly household id like "SarahHome4821" from the user's
+// Google profile name (falling back to the email local-part if name is
+// missing). The 4-digit suffix randomizes per-call so two users with the
+// same first name don't collide on first auth.
+function buildHouseholdId(name, email) {
+  const fallback = (email || "user").split("@")[0].split(/[._-]/)[0] || "user";
+  const firstToken = (name || "").split(/\s+/)[0] || "";
+  const cleaned = (firstToken || fallback).replace(/[^a-zA-Z0-9]/g, "");
+  const base = cleaned || "user";
+  const capped = base.charAt(0).toUpperCase() + base.slice(1);
+  const digits = Math.floor(1000 + Math.random() * 9000);
+  return `${capped}Home${digits}`;
+}
+
+// Try a few candidates so the random suffix doesn't collide with an
+// already-claimed household. Five tries is overkill for a 4-digit space
+// at current scale but cheap insurance.
+async function reserveHouseholdId(name, email) {
+  for (let i = 0; i < 5; i++) {
+    const candidate = buildHouseholdId(name, email);
+    const taken = await redis.exists(`household:${candidate}:name`);
+    if (!taken) return candidate;
+  }
+  return `${buildHouseholdId(name, email)}_${Date.now().toString(36)}`;
+}
+
 export default async function handler(req, res) {
   const { code, error, state: stateRaw } = req.query;
 
@@ -112,8 +138,39 @@ export default async function handler(req, res) {
       }
     }
 
+    // Resolve the user's household. Three branches:
+    //  - just-joined-via-invite: invite block above already wrote
+    //    user:{id}:household and added them to :members
+    //  - returning user: pointer already exists, leave as-is
+    //  - first-time, no invite: auto-provision a private household so
+    //    their onboard pipeline has somewhere to write. Without this,
+    //    new sign-ups land on whatever default household existed (or
+    //    none) and their first Takeoff is empty or wrong.
+    let resolvedHouseholdId = joinedHouseholdId;
+    let mode = joinedHouseholdId ? "join" : null;
+    if (!resolvedHouseholdId) {
+      const existingHousehold = await redis.get(`user:${userId}:household`);
+      if (existingHousehold) {
+        resolvedHouseholdId = existingHousehold;
+        mode = "existing";
+      } else {
+        const newHouseholdId = await reserveHouseholdId(user.name, user.email);
+        await redis.set(`user:${userId}:household`, newHouseholdId);
+        // :members is a Redis SET everywhere else (SADD/SMEMBERS); using
+        // redis.set with a JSON string would break the invite-join SADD
+        // path, which already has a defensive WRONGTYPE recovery.
+        await redis.sadd(`household:${newHouseholdId}:members`, userId);
+        await redis.set(`household:${newHouseholdId}:firstRun`, "true");
+        await redis.set(`household:${newHouseholdId}:name`, newHouseholdId);
+        resolvedHouseholdId = newHouseholdId;
+        mode = "create";
+      }
+    }
+
     // Trigger the full onboarding sweep (email + calendar + horizon) via QStash.
-    // Replaces the old separate import + calendar fire-and-forgets.
+    // Runs for every sign-in path — invite-join, new-create, and returning
+    // — since /api/onboard reads user:{id}:household at execution time and
+    // is idempotent (dedup keys on contentFingerprints + importedMessages).
     const baseUrl = "https://conductor-ivory.vercel.app";
     fetch(`${baseUrl}/api/onboard`, {
       method: "POST",
@@ -121,14 +178,15 @@ export default async function handler(req, res) {
       body: JSON.stringify({ userId }),
     }).catch(err => console.error("Onboard trigger error:", err));
 
-    // Redirect back to app — append householdId when the user joined via
-    // invite so the success page can render the right copy.
+    // Redirect back to app — pass householdId + mode so the success page
+    // renders the right welcome copy ("joined", "welcome to", "welcome back").
     const successParams = new URLSearchParams({
       userId,
       email: user.email,
       name: user.name,
     });
-    if (joinedHouseholdId) successParams.set("householdId", joinedHouseholdId);
+    if (resolvedHouseholdId) successParams.set("householdId", resolvedHouseholdId);
+    if (mode) successParams.set("mode", mode);
     return res.redirect(`${baseUrl}/api/success?${successParams.toString()}`);
 
   } catch (error) {

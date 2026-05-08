@@ -1,3 +1,10 @@
+import { Redis } from "@upstash/redis";
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;",
@@ -9,18 +16,36 @@ function escapeHtml(value) {
 }
 
 export default async function handler(req, res) {
-  const { email, householdId } = req.query;
+  const { email, householdId, mode } = req.query;
 
-  const isJoin = typeof householdId === "string" && householdId.length > 0;
-  const heading = isJoin
-    ? `You've joined ${escapeHtml(householdId)}'s household.`
-    : "You're connected.";
-  const body = isJoin
-    ? "Conductor will start syncing your signals.<br>Your first Takeoff will be ready shortly."
-    : "Conductor is syncing your signals.<br>Your first Takeoff will be ready shortly.";
-  const status = isJoin
-    ? `✓ Joined ${escapeHtml(householdId)}`
-    : "✓ Gmail + Calendar connected";
+  // Prefer the human-readable household name when one was set during
+  // creation; fall back to the household id (for legacy households that
+  // pre-date :name) or a generic label.
+  let householdName = "";
+  if (typeof householdId === "string" && householdId.length > 0) {
+    const stored = await redis.get(`household:${householdId}:name`);
+    householdName = (typeof stored === "string" && stored.length > 0)
+      ? stored
+      : householdId;
+  }
+
+  const safeName = escapeHtml(householdName);
+  let heading;
+  let body;
+  let status;
+  if (mode === "join" && householdName) {
+    heading = `You've joined ${safeName}.`;
+    body = "Conductor will start syncing your signals.<br>Your first Takeoff will be ready shortly.";
+    status = `✓ Joined ${safeName}`;
+  } else if (householdName) {
+    heading = `Welcome to ${safeName}.`;
+    body = "Conductor is syncing your signals.<br>Your first Takeoff will be ready shortly.";
+    status = "✓ Gmail + Calendar connected";
+  } else {
+    heading = "You're connected.";
+    body = "Conductor is syncing your signals.<br>Your first Takeoff will be ready shortly.";
+    status = "✓ Gmail + Calendar connected";
+  }
 
   return res.status(200).send(`
     <!DOCTYPE html>
