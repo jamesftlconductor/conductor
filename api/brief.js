@@ -76,6 +76,169 @@ function computeRing(s) {
   return "outer";
 }
 
+// Cross-signal conflict detection — runs after pool computation, before
+// the steady-state Claude call. Surfaces situations where two signals
+// can't both be honored without intervention. Output drives a dedicated
+// CONFLICTS section in the prompt + special-cased rules in baseRules.
+//
+// We treat a calendar event as "work-blocked" when its classification
+// includes any of the work-context keywords. The spec calls this the
+// "workSummary pool", but no such Redis key exists — we derive it from
+// the household calendar at detection time.
+function detectConflicts({
+  activeSignals,
+  allDeadlines,
+  calendarEvents,
+  householdNameMap,
+  requestingUserId,
+}) {
+  const conflicts = [];
+  const memberIds = [
+    requestingUserId,
+    ...Array.from(householdNameMap?.keys() || []),
+  ].filter(Boolean);
+  // Without member ids we can't reason about who's blocked — skip the
+  // member-availability checks entirely. Deadline urgency still runs.
+  const events = Array.isArray(calendarEvents) ? calendarEvents : [];
+  const workEvents = events.filter((e) =>
+    eventClassifiedAs(e, ["work", "meeting", "call", "office"])
+  );
+
+  const memberWork = new Map(memberIds.map((id) => [id, []]));
+  for (const e of workEvents) {
+    const uid = e.userId;
+    if (!uid || !memberWork.has(uid)) continue;
+    memberWork.get(uid).push(e);
+  }
+
+  function memberBlockedInWindow(uid, startMs, endMs) {
+    const list = memberWork.get(uid) || [];
+    return list.some((e) => {
+      const s = parseDateLoose(e.start)?.getTime();
+      const eMs =
+        parseDateLoose(e.end)?.getTime() || (s ? s + HOUR_MS : null);
+      if (!s || !eMs) return false;
+      return s <= endMs && eMs >= startMs;
+    });
+  }
+
+  function startOfDayMs(date) {
+    return new Date(
+      date.getFullYear(),
+      date.getMonth(),
+      date.getDate()
+    ).getTime();
+  }
+
+  // 1. SERVICE — service signal today/tomorrow, every household member
+  //    blocked by a work event in a ±2h window around the ETA. Coarse
+  //    by design: most service appointments don't expose a duration
+  //    field, so we use a fixed window rather than try to infer one.
+  if (memberIds.length > 0) {
+    for (const s of activeSignals) {
+      if (s.type !== "service") continue;
+      const eta = parseDateLoose(s.eta);
+      if (!eta) continue;
+      const offset = dayOffsetFromToday(eta);
+      if (offset !== 0 && offset !== 1) continue;
+      const winStart = eta.getTime() - 2 * HOUR_MS;
+      const winEnd = eta.getTime() + 2 * HOUR_MS;
+      const allBlocked = memberIds.every((uid) =>
+        memberBlockedInWindow(uid, winStart, winEnd)
+      );
+      if (allBlocked) {
+        conflicts.push({
+          type: "service_conflict",
+          signal: s,
+          reason: "nobody available",
+          severity: "high",
+        });
+      }
+    }
+
+    // 2. DELIVERY — Out for Delivery today, every member blocked at
+    //    some point during the day (signature deliveries don't share
+    //    arrival windows with us; coarse-day overlap is the best we
+    //    can do).
+    for (const s of activeSignals) {
+      if (s.status !== "Out for Delivery") continue;
+      const eta = parseDateLoose(s.eta);
+      if (!eta) continue;
+      if (dayOffsetFromToday(eta) !== 0) continue;
+      const ds = startOfDayMs(eta);
+      const de = ds + 24 * HOUR_MS - 1;
+      const allBlocked = memberIds.every((uid) =>
+        memberBlockedInWindow(uid, ds, de)
+      );
+      if (allBlocked) {
+        conflicts.push({
+          type: "delivery_conflict",
+          signal: s,
+          reason: "nobody home for signature",
+          severity: "medium",
+        });
+      }
+    }
+  }
+
+  // 3. TRAVEL — travel signal within 48h that shares its day with a
+  //    service or signature-delivery signal. Doesn't depend on member
+  //    availability since travel is presence-blocking on its own.
+  for (const t of activeSignals) {
+    if (t.type !== "travel") continue;
+    const eta = parseDateLoose(t.eta);
+    if (!eta) continue;
+    const hoursOut = (eta.getTime() - Date.now()) / HOUR_MS;
+    if (hoursOut < -1 || hoursOut > 48) continue;
+    const ds = startOfDayMs(eta);
+    const de = ds + 24 * HOUR_MS - 1;
+    const conflicting = activeSignals.find((o) => {
+      if (String(o.id) === String(t.id)) return false;
+      const isPhysical = o.type === "service" || o.status === "Out for Delivery";
+      if (!isPhysical) return false;
+      const oe = parseDateLoose(o.eta);
+      if (!oe) return false;
+      const ot = oe.getTime();
+      return ot >= ds && ot <= de;
+    });
+    if (conflicting) {
+      conflicts.push({
+        type: "travel_conflict",
+        signal: t,
+        conflictingSignal: conflicting,
+        reason: "timing conflict",
+        severity: "high",
+      });
+    }
+  }
+
+  // 4. DEADLINE — vault item with renewalDate within 7 days and not
+  //    handled. Pure date-math; no member context required.
+  for (const v of allDeadlines) {
+    if (v.handled) continue; // upstream filter already drops these but be safe
+    const eta = parseDateLoose(v.eta);
+    if (!eta) continue;
+    const days = (eta.getTime() - Date.now()) / DAY_MS;
+    if (days < -1 || days > 7) continue;
+    const daysLeft = Math.max(0, Math.round(days));
+    conflicts.push({
+      type: "deadline_urgent",
+      item: v,
+      daysLeft,
+      reason: `${daysLeft} day${daysLeft === 1 ? "" : "s"} left`,
+      severity: "high",
+    });
+  }
+
+  // High before medium so the prompt's "lead with most severe" rule
+  // and the iteration order in the brief both prioritize correctly.
+  const severityRank = { high: 0, medium: 1, low: 2 };
+  conflicts.sort(
+    (a, b) => (severityRank[a.severity] ?? 9) - (severityRank[b.severity] ?? 9)
+  );
+  return conflicts;
+}
+
 // Returns Map<userId, firstName> for every household member except the
 // requesting user (whose first name comes from the existing userName
 // resolution path). Uses the same scan pattern as sync.js and notify.js so
@@ -812,8 +975,31 @@ export default async function handler(req, res) {
       });
     }
 
+    // Conflict detection runs only on the steady-state path — first-run
+    // is deliberately starved and reaches its own early-return above.
+    const conflicts = detectConflicts({
+      activeSignals,
+      allDeadlines,
+      calendarEvents: Array.isArray(calendarEvents) ? calendarEvents : [],
+      householdNameMap,
+      requestingUserId: userId,
+    });
+
+    const conflictLines =
+      conflicts.length > 0
+        ? conflicts
+            .map(
+              (c) =>
+                `- ${c.type}: ${c.signal?.description || c.item?.description || "Unknown"} — ${c.reason || "timing conflict"}`
+            )
+            .join("\n")
+        : "None";
+
     const layeredContext = [
       `Today is ${today}.`,
+      ``,
+      `CONFLICTS DETECTED (surface these naturally and specifically — these are the most important things to mention):`,
+      conflictLines,
       ``,
       `URGENT (surface first if present):`,
       urgentForPrompt.length > 0 ? urgentForPrompt.map(formatSignal).join("\n") : "None",
@@ -867,6 +1053,11 @@ export default async function handler(req, res) {
 - Maximum 5-6 sentences total
 - Synthesize all layers into flowing prose — never a list
 - Lead with urgent if present
+- A detected conflict should always appear in the brief if it is high severity
+- Medium severity conflicts appear if there is space in the brief
+- Never mention work meetings or schedules directly — say "the afternoon looks tight" not "you have meetings"
+- Always suggest a specific resolution when mentioning a conflict
+- If conflicts exist, lead with the most severe one. Be specific about what the conflict is and what action would resolve it. Never be alarmist — calm and actionable.
 - Health context: one sentence only if genuinely notable — silent if normal. If sleep.duration is under 6 hours, surface it in a calm, day-shaping way (e.g. "${userName} slept under six hours last night — worth keeping the day manageable"). If hrv.current is meaningfully below hrv.baseline7d (roughly 15% or more lower), surface it as a recovery cue (e.g. "Recovery looks low today — a lighter afternoon might serve you well"). Never quote specific numbers, percentages, or units — only contextual observations. If both sleep and HRV look normal (or data is missing), say nothing about health.
 - Childcare: mention only if it affects coordination today or tomorrow
 - Home requirements: flag naturally if service window conflicts with likely schedule
