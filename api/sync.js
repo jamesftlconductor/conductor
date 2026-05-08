@@ -56,13 +56,17 @@ export default async function handler(req, res) {
         }
       }
 
-      // runCalendarSync skips internally if the household synced in the last 23h.
-      // Use the first member's tokens to drive the sync (calendar is per-household).
-      const driver = members[0];
-      try {
-        await runCalendarSync(driver);
-      } catch (err) {
-        errors.push({ stage: "calendar", householdId, userId: driver, message: err.message });
+      // Multi-driver calendar sync — every member's tokens drive their
+      // own runCalendarSync, writing to a per-user calendar key
+      // (household:{id}:calendar:{userId}). The 23h cooldown is now
+      // per-user, so each member's call independently skips or runs.
+      // Consumers merge the per-user keys via api/calendar-loader.js.
+      for (const userId of members) {
+        try {
+          await runCalendarSync(userId);
+        } catch (err) {
+          errors.push({ stage: "calendar", householdId, userId, message: err.message });
+        }
       }
 
       try {

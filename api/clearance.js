@@ -1,4 +1,5 @@
 import { Redis } from "@upstash/redis";
+import { loadHouseholdCalendar } from "./calendar-loader.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -283,7 +284,10 @@ export default async function handler(req, res) {
       rawFeedbackStats,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
-      redis.get(`household:${householdId}:calendar`),
+      // Multi-driver: returns a merged event array (or [] when empty),
+      // not a JSON string. The downstream typeof check on rawCal still
+      // handles both shapes correctly.
+      loadHouseholdCalendar(redis, householdId),
       redis.lrange(`household:${householdId}:deadlines`, 0, -1),
       redis.get(`household:${householdId}:horizon`),
       redis.lrange(`household:${householdId}:briefed`, 0, -1),

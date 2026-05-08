@@ -523,10 +523,14 @@ Return only the JSON object.`,
     await patchJob(householdId, "calendar", { classified: classified.length });
   }
 
+  // Per-user calendar key — under multi-driver sync, each member writes
+  // their own slice and consumers merge via api/calendar-loader.js. The
+  // legacy single-key write is dropped; the loader still falls back to
+  // it for households whose sync hasn't run since the deploy.
   await redis.set(
-    `household:${householdId}:calendar`,
+    `household:${householdId}:calendar:${userId}`,
     JSON.stringify(classified),
-    { ex: 60 * 60 * 24 * 30 } // 30-day cache for the longer horizon
+    { ex: 60 * 60 * 24 * 30 }
   );
 
   await patchJob(householdId, "calendar", {

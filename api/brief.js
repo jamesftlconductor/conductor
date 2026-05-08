@@ -1,4 +1,5 @@
 import { Redis } from "@upstash/redis";
+import { loadHouseholdCalendar } from "./calendar-loader.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -511,7 +512,12 @@ export default async function handler(req, res) {
       rawFeedbackStats,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
-      redis.get(`household:${householdId}:calendar`),
+      // Multi-driver: merges per-user calendar slices, falls back to
+      // the legacy single key for households that haven't synced yet
+      // since the rollout. Returns a parsed array (not a JSON string),
+      // but downstream safeJson on an array is a no-op so the existing
+      // shape handling continues to work.
+      loadHouseholdCalendar(redis, householdId),
       userId ? redis.get(`user:${userId}:health`) : Promise.resolve(null),
       redis.get(`household:${householdId}:horizon`),
       redis.lrange(`household:${householdId}:vault`, 0, -1),

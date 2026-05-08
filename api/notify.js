@@ -1,4 +1,5 @@
 import { Redis } from "@upstash/redis";
+import { loadHouseholdCalendar } from "./calendar-loader.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -40,17 +41,17 @@ async function generateSummary(householdId, type) {
     : "Your evening brief is ready.";
 
   try {
-    const [rawSignals, rawCalendar] = await Promise.all([
+    // Multi-driver calendar: loadHouseholdCalendar merges per-user
+    // calendar slices and returns a parsed array directly.
+    const [rawSignals, calendar] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
-      redis.get(`household:${householdId}:calendar`),
+      loadHouseholdCalendar(redis, householdId),
     ]);
 
     const signals = (rawSignals || [])
       .map(safeJson)
       .filter(Boolean)
       .filter(s => !s.state || s.state === "incoming" || s.state === "active");
-
-    const calendar = Array.isArray(safeJson(rawCalendar)) ? safeJson(rawCalendar) : [];
 
     const topSignals = signals.slice(0, 10).map(s =>
       `- ${s.description || "Unknown"} | status:${s.status || "?"} | eta:${s.eta || "?"}`

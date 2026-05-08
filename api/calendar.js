@@ -34,9 +34,15 @@ export async function runCalendarSync(userId) {
   const hidEarly = await redis.get(`user:${userId}:household`);
   const householdEarly = hidEarly || userId;
 
-  // Skip if synced within the last 23 hours — prevents redundant Gmail/Calendar
-  // API hits + Claude classifications when the endpoint is called repeatedly.
-  const lastSyncRaw = await redis.get(`household:${householdEarly}:calendarLastSync`);
+  // Skip if THIS USER synced within the last 23 hours. Per-user cooldown
+  // (instead of per-household) — under multi-driver sync, members run
+  // their own runCalendarSync independently and shouldn't block each
+  // other on a shared stamp. Reads the legacy household-level stamp as
+  // a one-time fallback so post-deploy syncs don't all double-fire.
+  let lastSyncRaw = await redis.get(`user:${userId}:calendarLastSync`);
+  if (lastSyncRaw == null) {
+    lastSyncRaw = await redis.get(`household:${householdEarly}:calendarLastSync`);
+  }
   const lastSync = lastSyncRaw
     ? (typeof lastSyncRaw === "number" ? lastSyncRaw : parseInt(lastSyncRaw, 10))
     : 0;
@@ -46,6 +52,7 @@ export async function runCalendarSync(userId) {
       skipped: true,
       reason: "synced recently",
       household: householdEarly,
+      userId,
       lastSync,
     };
   }
@@ -185,15 +192,19 @@ Return only the JSON object.`,
     }
   }
 
-  // Store classified events
+  // Store classified events at the per-user calendar key. Each member
+  // writes their own slice; consumers merge via api/calendar-loader.js
+  // loadHouseholdCalendar(). The legacy household-level :calendar key
+  // is intentionally NOT touched — its 30-day TTL ages it out, and
+  // the loader prefers per-user keys whenever any exist.
   const householdId = householdEarly;
   await redis.set(
-    `household:${householdId}:calendar`,
+    `household:${householdId}:calendar:${userId}`,
     JSON.stringify(classified),
-    { ex: 60 * 60 * 24 }
+    { ex: 60 * 60 * 24 * 30 }
   );
-  // Stamp the sync time so subsequent calls within 23h skip the work.
-  await redis.set(`household:${householdId}:calendarLastSync`, Date.now());
+  // Stamp per-user so each member's 23h cooldown is independent.
+  await redis.set(`user:${userId}:calendarLastSync`, Date.now());
 
   const householdEvents = classified.filter(e => e.householdRelevant).length;
   const workEvents = classified.filter(e => e.type === "work").length;
