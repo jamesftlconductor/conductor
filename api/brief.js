@@ -1005,9 +1005,21 @@ export default async function handler(req, res) {
       conflicts.length > 0
         ? conflicts
             .map((c) => {
+              // Ownership tag drives second-person vs name-of-other-
+              // member vs neutral-household framing. Same routing the
+              // rest of the prompt uses (formatSignal et al.). Without
+              // this prefix, Claude anchors on the conflict's framing
+              // and defaults to "your X" even when the signal belongs
+              // to another household member — verified failure mode
+              // with Sarah's seeded travel_conflict before this fix.
+              // Vault items don't carry userId (household-level), so
+              // they fall through to HOUSEHOLD.
+              const owner = c.signal
+                ? ownershipTag(c.signal, userId, householdNameMap)
+                : "HOUSEHOLD";
               const desc =
                 c.signal?.description || c.item?.description || "Unknown";
-              const base = `- ${c.type}: ${desc} — ${c.reason || "timing conflict"}`;
+              const base = `- [${owner}] ${c.type}: ${desc} — ${c.reason || "timing conflict"}`;
               // Vault items carry a `consequence` string ("membership
               // lapses", "premium auto-charged to card on file") that
               // calibrates how seriously the deadline reads. Surface it
@@ -1018,9 +1030,17 @@ export default async function handler(req, res) {
               }
               // Travel conflicts gain a lot from naming what they
               // collide with — otherwise Claude has to guess the
-              // counterpart from the rest of the prompt.
+              // counterpart from the rest of the prompt. Tag the
+              // conflicting signal's owner too so multi-member
+              // collisions read correctly ("Sarah's flight collides
+              // with [HOUSEHOLD] Window cleaner appointment").
               if (c.conflictingSignal?.description) {
-                return `${base} (collides with: ${c.conflictingSignal.description})`;
+                const collOwner = ownershipTag(
+                  c.conflictingSignal,
+                  userId,
+                  householdNameMap
+                );
+                return `${base} (collides with: [${collOwner}] ${c.conflictingSignal.description})`;
               }
               return base;
             })
