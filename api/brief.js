@@ -100,12 +100,22 @@ function detectConflicts({
   // Without member ids we can't reason about who's blocked — skip the
   // member-availability checks entirely. Deadline urgency still runs.
   const events = Array.isArray(calendarEvents) ? calendarEvents : [];
-  const workEvents = events.filter((e) =>
+  // The calendar classifier (in onboard-worker.js Job 2 and calendar.js
+  // runCalendarSync) emits a structured `type` enum ("work"/"household"/
+  // "personal"/"travel"/"childcare") and a `workConflictCheck` boolean
+  // explicitly meaning "this blocks the person and could conflict with
+  // household events". Prefer those structured fields over substring
+  // search — they're authoritative. eventClassifiedAs is kept as a
+  // fallback for events that slipped through the classifier as
+  // type:"unknown" but still have a tell-tale title ("Team meeting").
+  const blockingEvents = events.filter((e) =>
+    e.workConflictCheck === true ||
+    e.type === "work" ||
     eventClassifiedAs(e, ["work", "meeting", "call", "office"])
   );
 
   const memberWork = new Map(memberIds.map((id) => [id, []]));
-  for (const e of workEvents) {
+  for (const e of blockingEvents) {
     const uid = e.userId;
     if (!uid || !memberWork.has(uid)) continue;
     memberWork.get(uid).push(e);
