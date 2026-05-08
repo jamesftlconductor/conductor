@@ -730,7 +730,7 @@ export default async function handler(req, res) {
         strictPool.length === 0 && calendarPool.length === 0 && vaultPool.length === 0;
 
       const noSignalsCopy =
-        "Your household is connected and Conductor is building your signal picture. Check back tomorrow morning when the first sweep has had time to settle. Conductor is watching quite a bit more — it will surface what matters as it becomes relevant.";
+        "Nothing pressing today — Conductor is getting acquainted with your household and will have more to say tomorrow morning. Enjoy the open day. Conductor is just getting started — today is yours.";
 
       let firstRunBrief;
       if (noSignals) {
@@ -748,8 +748,9 @@ export default async function handler(req, res) {
         const firstRunRules = `FIRST-RUN RULES:
 - This is the household's first brief. Be welcoming but not effusive.
 - Maximum 2-3 sentences total.
-- End with EXACTLY this sentence: "Conductor is watching quite a bit more — it will surface what matters as it becomes relevant."
+- End with EXACTLY this sentence: "Conductor is just getting started — today is yours."
 - Do not mention that this is the first brief.
+- Tone: warm but not effusive. Give the user permission to relax. Hint at depth without explaining it. Feel like a trusted presence on day one.
 - Plain text only, no markdown.
 - Do not begin with date or header.
 - Personalize to ${userName}.

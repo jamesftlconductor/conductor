@@ -170,7 +170,7 @@ export default async function handler(req, res) {
         const firstRunFlag = await redis.get(`household:${hid}:firstRun`);
         const isFirstRun = firstRunFlag === "true" || firstRunFlag === true;
         if (isFirstRun) {
-          body = "Your first Takeoff is ready. Conductor has been reading.";
+          body = "Good morning. Conductor is getting to know your household — today is a good day to settle in.";
         }
       }
       if (!body) body = await generateSummary(hid, type);
