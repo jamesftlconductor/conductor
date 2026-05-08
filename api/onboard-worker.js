@@ -67,6 +67,36 @@ async function patchJob(householdId, jobName, jobUpdate) {
   await redis.set(`household:${householdId}:onboardStatus`, JSON.stringify(current));
 }
 
+// Domains that are essentially always personal accounts. A primary
+// calendar on one of these is the user's home/social calendar, not
+// their work calendar. (Mirrored in api/calendar.js — the two paths
+// share calendar-import semantics. Keep in sync.)
+const CONSUMER_EMAIL_DOMAINS = new Set([
+  "gmail.com", "googlemail.com",
+  "yahoo.com", "yahoo.co.uk", "ymail.com",
+  "hotmail.com", "outlook.com", "live.com", "msn.com",
+  "icloud.com", "me.com", "mac.com",
+  "aol.com", "protonmail.com", "proton.me",
+]);
+
+// True when a Google calendarList entry is the user's work calendar.
+// Two heuristics, in priority order:
+//   1) Calendar summary contains "work" or "office" as a whole word
+//      (matches "Work", "Office", "Work — Engineering", etc.).
+//   2) Calendar is the user's primary AND the user's email is on a
+//      non-consumer domain — Workspace primary calendars are work
+//      calendars in practice. Falls back to false when email domain
+//      is unknown rather than guessing.
+function isWorkCalendar(cal, userEmail) {
+  const summary = (cal?.summary || "").toLowerCase();
+  if (/\b(work|office)\b/.test(summary)) return true;
+  if (cal?.primary === true && userEmail) {
+    const domain = userEmail.split("@")[1]?.toLowerCase();
+    if (domain && !CONSUMER_EMAIL_DOMAINS.has(domain)) return true;
+  }
+  return false;
+}
+
 async function callClaude(prompt, maxTokens = 1500) {
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -323,12 +353,36 @@ async function runCalendarJob(userId, householdId) {
   const twentyFourMonthsAgo = new Date(now - 24 * 30 * DAY_MS).toISOString();
   const twelveMonthsAhead = new Date(now + 12 * 30 * DAY_MS).toISOString();
 
+  // Resolve the user's email so the Workspace-primary heuristic in
+  // isWorkCalendar can fire. Best-effort — if the profile is missing
+  // we still classify by calendar name.
+  let userEmail = null;
+  try {
+    const profileRaw = await redis.get(`user:${userId}:profile`);
+    const profile = typeof profileRaw === "string" ? JSON.parse(profileRaw) : profileRaw;
+    userEmail = profile?.email || null;
+  } catch {
+    // ignored — userEmail stays null
+  }
+
   const calListRes = await fetch(
     "https://www.googleapis.com/calendar/v3/users/me/calendarList",
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
   const calList = await calListRes.json();
   const calendars = calList.items || [];
+
+  // Identify work calendars from metadata before any events are fetched.
+  // Events sourced from these calendars get pre-tagged as work below
+  // and skip the per-event LLM classification call entirely.
+  const workCalendarIds = new Set();
+  for (const cal of calendars) {
+    if (isWorkCalendar(cal, userEmail)) workCalendarIds.add(cal.id);
+  }
+  await patchJob(householdId, "calendar", {
+    calendarsTotal: calendars.length,
+    workCalendars: workCalendarIds.size,
+  });
 
   const allEvents = [];
   for (const cal of calendars) {
@@ -350,6 +404,10 @@ async function runCalendarJob(userId, householdId) {
           end: event.end?.dateTime || event.end?.date,
           calendar: cal.summary,
           calendarId: cal.id,
+          // Google's structured event-type signal — "outOfOffice" and
+          // "focusTime" are explicit availability blockers regardless
+          // of which calendar they came from.
+          eventType: event.eventType || "default",
           userId,
         });
       }
@@ -382,17 +440,52 @@ async function runCalendarJob(userId, householdId) {
     }
   }
 
-  // Classify upcoming events only — bounded for budget.
+  // Classify upcoming events only — bounded for budget. Bumped from 100
+  // to 200 so a busy work calendar comfortably covers two weeks; the
+  // pre-tagging pass below means most work events skip the LLM, so the
+  // Claude cost increase is sub-linear in practice.
   const upcoming = allEvents
     .filter((e) => {
       const start = Date.parse(e.start);
       return !isNaN(start) && start >= now;
     })
-    .slice(0, 100);
+    .slice(0, 200);
 
-  const classified = [];
-  for (let i = 0; i < upcoming.length; i += 10) {
-    const batch = upcoming.slice(i, i + 10);
+  // Partition: structurally-known work events vs ambiguous events that
+  // still need the LLM. An event is structurally work if either:
+  //  - It came from a work calendar (workCalendarIds, by metadata)
+  //  - It's a Google "outOfOffice" or "focusTime" event (the API's own
+  //    explicit availability marker)
+  // Pre-tagged events skip Claude entirely.
+  const preTagged = [];
+  const needsClassification = [];
+  for (const ev of upcoming) {
+    const fromWorkCal = workCalendarIds.has(ev.calendarId);
+    const structurallyBlocking =
+      ev.eventType === "outOfOffice" || ev.eventType === "focusTime";
+    if (fromWorkCal || structurallyBlocking) {
+      preTagged.push({
+        ...ev,
+        type: "work",
+        householdRelevant: false,
+        workConflictCheck: true,
+        tags: structurallyBlocking ? [ev.eventType] : ["work"],
+        classifiedBy: fromWorkCal ? "work-calendar" : "event-type",
+      });
+    } else {
+      needsClassification.push(ev);
+    }
+  }
+
+  const classified = [...preTagged];
+  await patchJob(householdId, "calendar", {
+    classified: classified.length,
+    preTagged: preTagged.length,
+    needsClassification: needsClassification.length,
+  });
+
+  for (let i = 0; i < needsClassification.length; i += 10) {
+    const batch = needsClassification.slice(i, i + 10);
     const results = await Promise.all(batch.map(async (event) => {
       try {
         const text = await callClaude(
@@ -413,9 +506,17 @@ Return only the JSON object.`,
         return {
           ...event,
           ...(cls || { type: "unknown", householdRelevant: false, workConflictCheck: false, tags: [] }),
+          classifiedBy: cls ? "llm" : "llm-fallback",
         };
       } catch {
-        return { ...event, type: "unknown", householdRelevant: false, workConflictCheck: false, tags: [] };
+        return {
+          ...event,
+          type: "unknown",
+          householdRelevant: false,
+          workConflictCheck: false,
+          tags: [],
+          classifiedBy: "llm-error",
+        };
       }
     }));
     classified.push(...results);
@@ -433,11 +534,15 @@ Return only the JSON object.`,
     finishedAt: Date.now(),
     patternsAdded,
     classified: classified.length,
+    preTagged: preTagged.length,
+    workCalendars: workCalendarIds.size,
   });
 
   return {
     events: allEvents.length,
     classified: classified.length,
+    preTagged: preTagged.length,
+    workCalendars: workCalendarIds.size,
     patterns: patternsAdded,
   };
 }

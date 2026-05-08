@@ -6,6 +6,27 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+// Mirrored from api/onboard-worker.js — keep in sync. Both paths share
+// calendar-import semantics; duplicating here avoids cross-importing
+// onboard-worker from a daily-sync endpoint.
+const CONSUMER_EMAIL_DOMAINS = new Set([
+  "gmail.com", "googlemail.com",
+  "yahoo.com", "yahoo.co.uk", "ymail.com",
+  "hotmail.com", "outlook.com", "live.com", "msn.com",
+  "icloud.com", "me.com", "mac.com",
+  "aol.com", "protonmail.com", "proton.me",
+]);
+
+function isWorkCalendar(cal, userEmail) {
+  const summary = (cal?.summary || "").toLowerCase();
+  if (/\b(work|office)\b/.test(summary)) return true;
+  if (cal?.primary === true && userEmail) {
+    const domain = userEmail.split("@")[1]?.toLowerCase();
+    if (domain && !CONSUMER_EMAIL_DOMAINS.has(domain)) return true;
+  }
+  return false;
+}
+
 export async function runCalendarSync(userId) {
   if (!userId) throw new Error("No userId provided");
 
@@ -31,6 +52,17 @@ export async function runCalendarSync(userId) {
 
   const accessToken = await getValidToken(userId);
 
+  // Resolve user email so the Workspace-primary heuristic in
+  // isWorkCalendar can fire. Best-effort.
+  let userEmail = null;
+  try {
+    const profileRaw = await redis.get(`user:${userId}:profile`);
+    const profile = typeof profileRaw === "string" ? JSON.parse(profileRaw) : profileRaw;
+    userEmail = profile?.email || null;
+  } catch {
+    // ignored
+  }
+
   const now = new Date();
   const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAhead = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -42,6 +74,12 @@ export async function runCalendarSync(userId) {
   );
   const calListData = await calListResponse.json();
   const calendars = calListData.items || [];
+
+  // Identify work calendars from metadata before fetching events.
+  const workCalendarIds = new Set();
+  for (const cal of calendars) {
+    if (isWorkCalendar(cal, userEmail)) workCalendarIds.add(cal.id);
+  }
 
   let allEvents = [];
 
@@ -66,6 +104,9 @@ export async function runCalendarSync(userId) {
           end: event.end?.dateTime || event.end?.date,
           calendar: calendar.summary,
           calendarId: calendar.id,
+          // Google's structured event-type signal — outOfOffice / focusTime
+          // are explicit availability blockers regardless of source calendar.
+          eventType: event.eventType || "default",
           userId,
         });
       }
@@ -74,10 +115,30 @@ export async function runCalendarSync(userId) {
     }
   }
 
-  // Classify events with Claude
+  // Pre-tag structurally-known work events so they skip the LLM call.
+  // Same logic as api/onboard-worker.js: events from a work calendar OR
+  // events that Google itself flagged as outOfOffice/focusTime.
   const classified = [];
+  const needsClassification = [];
+  for (const ev of allEvents) {
+    const fromWorkCal = workCalendarIds.has(ev.calendarId);
+    const structurallyBlocking =
+      ev.eventType === "outOfOffice" || ev.eventType === "focusTime";
+    if (fromWorkCal || structurallyBlocking) {
+      classified.push({
+        ...ev,
+        type: "work",
+        householdRelevant: false,
+        workConflictCheck: true,
+        tags: structurallyBlocking ? [ev.eventType] : ["work"],
+        classifiedBy: fromWorkCal ? "work-calendar" : "event-type",
+      });
+    } else {
+      needsClassification.push(ev);
+    }
+  }
 
-  for (const event of allEvents) {
+  for (const event of needsClassification) {
     try {
       const classifyResponse = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -110,11 +171,17 @@ Return only the JSON object.`,
       const clean = text.replace(/```json|```/g, "").trim();
       const classification = JSON.parse(clean);
 
-      classified.push({ ...event, ...classification });
+      classified.push({ ...event, ...classification, classifiedBy: "llm" });
       await new Promise(r => setTimeout(r, 100));
 
     } catch (err) {
-      classified.push({ ...event, type: "unknown", householdRelevant: false, workConflictCheck: false });
+      classified.push({
+        ...event,
+        type: "unknown",
+        householdRelevant: false,
+        workConflictCheck: false,
+        classifiedBy: "llm-error",
+      });
     }
   }
 
@@ -130,11 +197,16 @@ Return only the JSON object.`,
 
   const householdEvents = classified.filter(e => e.householdRelevant).length;
   const workEvents = classified.filter(e => e.type === "work").length;
+  const preTaggedWork = classified.filter(
+    e => e.classifiedBy === "work-calendar" || e.classifiedBy === "event-type"
+  ).length;
 
   return {
     total: classified.length,
     household: householdEvents,
     work: workEvents,
+    preTagged: preTaggedWork,
+    workCalendars: workCalendarIds.size,
   };
 }
 
