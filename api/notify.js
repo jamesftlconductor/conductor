@@ -162,7 +162,18 @@ export default async function handler(req, res) {
         continue;
       }
 
-      let body = await generateSummary(hid, type);
+      // First-run takeoff push gets a hardcoded body — same intent as the
+      // first-run brief, no Claude call needed. Don't flip firstRun here;
+      // brief.js owns that transition so the brief and push stay in sync.
+      let body;
+      if (type === "takeoff") {
+        const firstRunFlag = await redis.get(`household:${hid}:firstRun`);
+        const isFirstRun = firstRunFlag === "true" || firstRunFlag === true;
+        if (isFirstRun) {
+          body = "Your first Takeoff is ready. Conductor has been reading.";
+        }
+      }
+      if (!body) body = await generateSummary(hid, type);
 
       // Carry-forward suffix on Takeoff only — if anything was flagged in last
       // night's LAST CHANCE pool and is still active this morning (the morning

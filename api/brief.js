@@ -655,6 +655,162 @@ export default async function handler(req, res) {
       return `- ${owner} ${e.title || "Untitled"} | ${when}`;
     };
 
+    // ---------- first-run branch ----------
+    // The first brief Conductor ever writes for a household runs on a
+    // deliberately starved pipeline: skip the layered context, take at most
+    // two strict-filtered signals, fall back through calendar → vault →
+    // hardcoded copy. The goal is a calm, welcoming first impression that
+    // doesn't try to dazzle with an unfiltered firehose. Whatever path we
+    // take, firstRun is flipped to "false" so tomorrow uses the normal
+    // pipeline.
+    if (isFirstRun) {
+      // Strict signal filter: drop type:unknown and signals with neither
+      // status nor ETA (no information density at all). Sort by info-density
+      // score (eta + sender + description present), break ties by ETA
+      // proximity. Keep at most two.
+      const firstRunCandidates = activeSignals.filter((s) => {
+        if (s.type === "unknown") return false;
+        const statusUnknown = !s.status || s.status === "Unknown";
+        const etaMissing = s.eta == null || s.eta === "";
+        if (statusUnknown && etaMissing) return false;
+        return true;
+      });
+
+      const infoDensity = (s) =>
+        (s.eta ? 1 : 0) + (s.sender ? 1 : 0) + (s.description ? 1 : 0);
+
+      firstRunCandidates.sort((a, b) => {
+        const d = infoDensity(b) - infoDensity(a);
+        if (d !== 0) return d;
+        const ea = parseDateLoose(a.eta);
+        const eb = parseDateLoose(b.eta);
+        if (ea && eb) return ea.getTime() - eb.getTime();
+        if (ea) return -1;
+        if (eb) return 1;
+        return 0;
+      });
+
+      const strictPool = firstRunCandidates.slice(0, 2);
+
+      // Calendar fallback — only consulted when strictPool is empty.
+      // Window: next 30 days, with a one-day past-tolerance for events
+      // that just rolled over.
+      const calendarPool = strictPool.length > 0
+        ? []
+        : (Array.isArray(calendarEvents) ? calendarEvents : [])
+            .filter((e) => {
+              const start = parseDateLoose(e.start);
+              if (!start) return false;
+              const offsetDays = (start.getTime() - Date.now()) / DAY_MS;
+              return offsetDays >= -1 && offsetDays <= 30;
+            })
+            .sort(
+              (a, b) =>
+                parseDateLoose(a.start).getTime() - parseDateLoose(b.start).getTime()
+            )
+            .slice(0, 2);
+
+      // Vault fallback — only when both prior pools are empty. One item
+      // max; pick the soonest non-handled future renewal.
+      const vaultPool =
+        strictPool.length > 0 || calendarPool.length > 0
+          ? []
+          : allDeadlines
+              .filter((v) => {
+                const eta = parseDateLoose(v.eta);
+                return eta && eta.getTime() > Date.now() - DAY_MS;
+              })
+              .sort(
+                (a, b) =>
+                  parseDateLoose(a.eta).getTime() - parseDateLoose(b.eta).getTime()
+              )
+              .slice(0, 1);
+
+      const noSignals =
+        strictPool.length === 0 && calendarPool.length === 0 && vaultPool.length === 0;
+
+      const noSignalsCopy =
+        "Your household is connected and Conductor is building your signal picture. Check back tomorrow morning when the first sweep has had time to settle. Conductor is watching quite a bit more — it will surface what matters as it becomes relevant.";
+
+      let firstRunBrief;
+      if (noSignals) {
+        firstRunBrief = noSignalsCopy;
+      } else {
+        let contextBlock;
+        if (strictPool.length > 0) {
+          contextBlock = `SIGNALS:\n${strictPool.map(formatSignal).join("\n")}`;
+        } else if (calendarPool.length > 0) {
+          contextBlock = `UPCOMING EVENTS:\n${calendarPool.map(formatEvent).join("\n")}`;
+        } else {
+          contextBlock = `DEADLINE:\n${vaultPool.map(formatSignal).join("\n")}`;
+        }
+
+        const firstRunRules = `FIRST-RUN RULES:
+- This is the household's first brief. Be welcoming but not effusive.
+- Maximum 2-3 sentences total.
+- End with EXACTLY this sentence: "Conductor is watching quite a bit more — it will surface what matters as it becomes relevant."
+- Do not mention that this is the first brief.
+- Plain text only, no markdown.
+- Do not begin with date or header.
+- Personalize to ${userName}.
+- Ownership tags: every item is prefixed [YOURS], [NAME'S], or [HOUSEHOLD]. Use "you" for [YOURS], the named person for [NAME'S], household framing for [HOUSEHOLD]. NEVER include the bracket tags in the brief.
+- When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field. NEVER compute or infer a date.
+- If an item's ETA is "Unknown" or missing, do NOT invent or guess a date — even for holidays mentioned in the description.`;
+
+        const firstRunUserPrompt = `Today is ${today}.\n\n${contextBlock}\n\n${firstRunRules}`;
+        const firstRunSystemPrompt = `You are Conductor, a household intelligence layer. You write calm, trusted, personal morning briefs for ${userName}. Your voice is like a thought the reader was already having — never assistant-like, never listy, always prose.`;
+
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": process.env.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model: "claude-haiku-4-5-20251001",
+            max_tokens: 300,
+            system: firstRunSystemPrompt,
+            messages: [{ role: "user", content: firstRunUserPrompt }],
+          }),
+        });
+        const data = await response.json();
+        firstRunBrief = (data && data.content && data.content[0] && data.content[0].text) || "";
+        // Defensive: if the model returns empty text, ship the hardcoded
+        // copy so the user's first impression isn't a blank screen.
+        if (!firstRunBrief) firstRunBrief = noSignalsCopy;
+      }
+
+      // Persist the brief and flip the flag. Even on noSignals we flip —
+      // otherwise a household with no early signals stays stuck on the
+      // welcome copy forever instead of moving onto the normal pipeline.
+      if (firstRunBrief) {
+        await redis.set(`household:${householdId}:yesterdayTakeoff`, firstRunBrief, {
+          ex: 48 * 60 * 60,
+        });
+      }
+      await redis.set(`household:${householdId}:firstRun`, "false");
+
+      // Segment tagging best-effort. Calendar events aren't taggable
+      // signals, so when the brief came from the calendar fallback we
+      // ship a single text segment.
+      const taggableSignals =
+        strictPool.length > 0 ? strictPool : vaultPool.length > 0 ? vaultPool : [];
+      const segments = noSignals || taggableSignals.length === 0
+        ? [{ type: "text", content: firstRunBrief }]
+        : await tagBriefSegments(firstRunBrief, taggableSignals);
+
+      return res.status(200).json({
+        brief: firstRunBrief,
+        segments,
+        transparency: null,
+        household: householdId,
+        user: userName,
+        isFirstRun: true,
+        noSignals,
+      });
+    }
+
     const layeredContext = [
       `Today is ${today}.`,
       ``,
@@ -732,19 +888,9 @@ export default async function handler(req, res) {
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field (e.g., "Sunday, May 10"). NEVER compute, infer, or recalculate a day-of-week or date — the resolved string is authoritative. Ignore the "raw:" portion. Drop the year unless it differs from the current year.
 - If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date for it — even if the description mentions a holiday or named event. Either omit the date or use a phrase like "no confirmed date yet". Do NOT translate "Mother's Day", "the weekend", or similar phrases into specific calendar dates yourself.`;
 
-    const firstRunRules = `FIRST-RUN RULES (this is the very first brief Conductor has written for ${userName}):
-- Maximum 3 sentences
-- Surface only the single most urgent or impressive signal from the near window
-- Include the horizon signal if available
-- End with one sentence hinting at depth, exactly: "Conductor is watching quite a bit more — it will surface what matters as it becomes relevant."
-- Plain text only, no markdown
-- Do not begin with date or header
-- Personalize to ${userName}
-- Ownership tags: every item is prefixed [YOURS], [NAME'S], or [HOUSEHOLD]. Use "you" for [YOURS], the named person for [NAME'S], household framing for [HOUSEHOLD]. Never include the bracket tags in the brief.
-- When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field. NEVER compute or infer a date.
-- If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date — even for holidays mentioned in the description.`;
-
-    const userPrompt = `${layeredContext}\n\n${isFirstRun ? firstRunRules : baseRules}`;
+    // First-run is handled by an early-return branch above; this path is
+    // always the steady-state pipeline.
+    const userPrompt = `${layeredContext}\n\n${baseRules}`;
 
     const systemPrompt = `You are Conductor, a household intelligence layer. You write calm, trusted, personal morning briefs for ${userName}. Your voice is like a thought the reader was already having — never assistant-like, never listy, always prose.`;
 
@@ -772,10 +918,6 @@ export default async function handler(req, res) {
     // most recent run and gets overwritten on each subsequent generation.
     if (brief) {
       await redis.set(`household:${householdId}:yesterdayTakeoff`, brief, { ex: 48 * 60 * 60 });
-    }
-
-    if (isFirstRun) {
-      await redis.set(`household:${householdId}:firstRun`, "false");
     }
 
     // Tag clickable signal phrases — pass everything that could plausibly appear.
