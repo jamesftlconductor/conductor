@@ -587,6 +587,44 @@ export default async function handler(req, res) {
       return res.status(200).json({ household: householdId, signals });
     }
 
+    // Manual signal creation. Mobile's "+ Add Signal" sheet posts here
+    // with { userId, description, type, eta, sender, source }. State is
+    // server-set to "incoming" so the new dot lands on the radar via
+    // the same lifecycle as imported signals. Source defaults to
+    // "manual" but caller may override (e.g., a future quick-action
+    // surface might tag its own source).
+    if (req.method === "POST") {
+      const body = req.body || {};
+      const { userId, description, type, eta, sender, source, status } = body;
+
+      if (!userId) {
+        return res.status(400).json({ error: "userId is required" });
+      }
+      if (typeof description !== "string" || description.trim().length === 0) {
+        return res.status(400).json({ error: "description is required" });
+      }
+
+      const householdId = await resolveHouseholdId(userId);
+
+      const signal = {
+        id: Date.now(),
+        description: description.trim(),
+        type: typeof type === "string" && type.length > 0 ? type : "unknown",
+        eta: typeof eta === "string" && eta.trim().length > 0 ? eta.trim() : null,
+        sender: typeof sender === "string" && sender.trim().length > 0 ? sender.trim() : null,
+        status: typeof status === "string" && status.length > 0 ? status : null,
+        state: "incoming",
+        source: typeof source === "string" && source.length > 0 ? source : "manual",
+        userId,
+        lastUpdate: new Date().toLocaleString(),
+        createdAt: Date.now(),
+      };
+
+      await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
+
+      return res.status(201).json({ household: householdId, signal });
+    }
+
     if (req.method === "PATCH") {
       const body = req.body || {};
       const { id, state, userId, notedAt, description, eta, status } = body;
