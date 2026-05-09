@@ -501,7 +501,18 @@ function applyDefaultsAndExpiry(signal) {
 
   if (signal.state !== "resolved" && signal.state !== "expired" && signal.eta) {
     const etaMs = Date.parse(signal.eta);
-    if (!isNaN(etaMs) && etaMs < Date.now() - EXPIRY_MS) {
+    // V8 silently defaults year-less date strings ("Friday, May 15",
+    // "May 15", "Dec 3") to year 2001 — Date.parse returns a number,
+    // not NaN, so the naive past-check below would auto-expire any
+    // signal a user typed without an explicit year. Guard against this
+    // by treating any parsed date more than 5 years before now as
+    // "probably year-less, no usable ETA" rather than expired.
+    const SUSPICIOUSLY_OLD_MS = 5 * 365 * 24 * 60 * 60 * 1000;
+    if (
+      !isNaN(etaMs) &&
+      etaMs > Date.now() - SUSPICIOUSLY_OLD_MS &&
+      etaMs < Date.now() - EXPIRY_MS
+    ) {
       signal.state = "expired";
       signal.expiredAt = new Date().toISOString();
     }
