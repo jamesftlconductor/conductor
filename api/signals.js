@@ -588,13 +588,42 @@ export default async function handler(req, res) {
     }
 
     if (req.method === "PATCH") {
-      const { id, state, userId, notedAt } = req.body || {};
+      const body = req.body || {};
+      const { id, state, userId, notedAt, description, eta, status } = body;
 
       if (id === undefined || id === null) {
         return res.status(400).json({ error: "id is required" });
       }
-      if (!VALID_STATES.includes(state)) {
-        return res.status(400).json({ error: `state must be one of ${VALID_STATES.join(", ")}` });
+
+      // PATCH now accepts EITHER a state transition (existing lifecycle
+      // semantics) OR a field edit (description / eta / status), or both
+      // in one call. mobile FinaleSheet edit mode sends just the edit
+      // fields; resolve/hold flows send just state. State validation
+      // only fires when state is actually provided.
+      const stateProvided = state !== undefined;
+      const hasDescription = typeof description === "string";
+      const hasEta = "eta" in body; // allow null to clear
+      const hasStatus = typeof status === "string";
+      const isEdit = hasDescription || hasEta || hasStatus;
+
+      if (!stateProvided && !isEdit) {
+        return res.status(400).json({
+          error: "at least one of state, description, eta, or status is required",
+        });
+      }
+      if (stateProvided && !VALID_STATES.includes(state)) {
+        return res.status(400).json({
+          error: `state must be one of ${VALID_STATES.join(", ")}`,
+        });
+      }
+
+      // Apply edit fields onto a target signal record. lastUpdate is
+      // bumped here so any change — edit, state, or both — produces a
+      // fresh timestamp.
+      function applyEditFields(record) {
+        if (hasDescription) record.description = description;
+        if (hasEta) record.eta = eta;
+        if (hasStatus) record.status = status;
       }
 
       const householdId = await resolveHouseholdId(userId);
@@ -605,14 +634,20 @@ export default async function handler(req, res) {
       if (index !== -1) {
         // Primary path — id is in :signals.
         const previousLastUpdate = signals[index].lastUpdate;
-        signals[index].state = state;
+        applyEditFields(signals[index]);
+        if (stateProvided) {
+          signals[index].state = state;
+        }
         signals[index].lastUpdate = new Date().toLocaleString();
         if (typeof notedAt === "string" && notedAt.length > 0) {
           signals[index].notedAt = notedAt;
         }
         await redis.lset(key, index, JSON.stringify(signals[index]));
 
-        if (state === "resolved" || state === "active") {
+        // Memory log fires only on state lifecycle transitions, not on
+        // pure field edits. An edit isn't a "resolved" or "held" event;
+        // logging it would pollute the longitudinal feed and Compass.
+        if (stateProvided && (state === "resolved" || state === "active")) {
           const action = state === "resolved" ? "resolved" : "held";
           const memorySignal = { ...signals[index], lastUpdate: previousLastUpdate };
           await writeMemoryEntry(householdId, memorySignal, action, userId);
@@ -622,7 +657,7 @@ export default async function handler(req, res) {
 
       // Fallback path — id might belong to the :deadlines list, which is a
       // separate store but is exposed alongside signals on the Horizon
-      // screen. Same state/notedAt + memory-log semantics apply.
+      // screen. Same edit + state + memory-log semantics apply.
       const deadlinesKey = `household:${householdId}:deadlines`;
       const rawDeadlines = await redis.lrange(deadlinesKey, 0, -1);
       const deadlines = rawDeadlines.map(parseSignal);
@@ -632,14 +667,17 @@ export default async function handler(req, res) {
       }
 
       const previousLastUpdate = deadlines[index].lastUpdate;
-      deadlines[index].state = state;
+      applyEditFields(deadlines[index]);
+      if (stateProvided) {
+        deadlines[index].state = state;
+      }
       deadlines[index].lastUpdate = new Date().toLocaleString();
       if (typeof notedAt === "string" && notedAt.length > 0) {
         deadlines[index].notedAt = notedAt;
       }
       await redis.lset(deadlinesKey, index, JSON.stringify(deadlines[index]));
 
-      if (state === "resolved" || state === "active") {
+      if (stateProvided && (state === "resolved" || state === "active")) {
         const action = state === "resolved" ? "resolved" : "held";
         // Tag type as "deadline" for the memory entry so the patterns
         // endpoint can see it in the typeBreakdown bucket.
