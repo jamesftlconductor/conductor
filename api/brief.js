@@ -571,7 +571,7 @@ export default async function handler(req, res) {
       rawCarriedForward,
       householdNameMap,
       rawFeedbackStats,
-      weather,
+      fetchedWeather,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: merges per-user calendar slices, falls back to
@@ -597,6 +597,29 @@ export default async function handler(req, res) {
       // for now; will resolve per-household location later.
       fetchWeather(),
     ]);
+
+    // Test override: ?testWeatherCode=N&testWeatherTemp=N replaces the
+    // fetched weather with a synthetic value. Used to verify weather
+    // rule triggers (rain + outdoor service, heat + HVAC, etc.) without
+    // waiting for actual weather conditions. Both params required to
+    // activate — has no effect on normal traffic.
+    let weather = fetchedWeather;
+    {
+      const tCode = req.query?.testWeatherCode;
+      const tTemp = req.query?.testWeatherTemp;
+      if (tCode != null && tTemp != null) {
+        const code = parseInt(tCode, 10);
+        const tempF = parseInt(tTemp, 10);
+        if (!isNaN(code) && !isNaN(tempF)) {
+          weather = {
+            tempF,
+            weatherCode: code,
+            isRaining: code >= 51 && code <= 99,
+            summary: classifyWeather(code, tempF),
+          };
+        }
+      }
+    }
 
     const allSignals = (rawSignals || []).map(safeJson).filter(Boolean);
 
