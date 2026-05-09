@@ -24,13 +24,13 @@ async function generateTransparency(brief, pools) {
   const prompt = `You just generated this evening brief: ${brief}
 
 The signals you considered were:
-Resolved today: ${briefList(pools.resolvedToday)}
-Expired today: ${briefList(pools.expiredToday)}
+Rested today: ${briefList(pools.resolvedToday)}
+Lapsed today: ${briefList(pools.expiredToday)}
 Still in motion: ${briefList(pools.stillActive)}
 Delayed: ${briefList(pools.carryingForward)}
 Imminent deadlines: ${briefList(pools.urgentDeadlines)}
 Near deadlines: ${briefList(pools.nearDeadlines)}
-Last chance (still unresolved from today): ${briefList(pools.lastChance)}
+Last chance (still open from today): ${briefList(pools.lastChance)}
 Tomorrow's calendar: ${eventList(pools.tomorrow)}
 Horizon: ${pools.horizon ? `- ${pools.horizon.description || "Unknown"}` : "(none)"}
 
@@ -513,10 +513,10 @@ export default async function handler(req, res) {
           role: "user",
           content: `You are Conductor, a household intelligence layer. Write a calm, reflective evening brief for ${userName} as the day closes.
 
-Resolved or arrived today:
+Rested or arrived today:
 ${resolvedSummary || "None"}
 
-Expired today (didn't arrive as expected):
+Lapsed today (didn't arrive as expected):
 ${expiredSummary || "None"}
 
 Still in motion (future ETA):
@@ -534,9 +534,9 @@ ${nearDeadlineSummary || "None"}
 On the horizon (one surprising deadline 15-90 days out, optional final note):
 ${horizonSummary || "None"}
 
-Important: ignore promotional events, store launches, marketing emails, and account/loyalty notifications. Only narrate signals that represent real deliveries, services, reservations, or travel — things with a concrete arrival, commitment, or action. Deadlines (marked [DEADLINE]) are documents/renewals/registrations the user needs to handle — surface them naturally in the close-of-day reflection.
+Important: ignore promotional events, store launches, marketing emails, and account/loyalty signals. Only narrate signals that represent real deliveries, services, reservations, or travel — things with a concrete arrival, commitment, or action. Deadlines (marked [DEADLINE]) are documents/renewals/registrations the user needs to handle — surface them naturally in the close-of-day reflection.
 
-LAST CHANCE (end of brief, only if non-empty): One calm sentence acknowledging signals that are still unresolved from today. Not alarming. Something like: "Before you close out — [description] still needs attention if you haven't gotten to it." Maximum one sentence, only if there are genuinely unresolved signals.
+LAST CHANCE (end of brief, only if non-empty): One calm sentence acknowledging signals that are still open from today. Not alarming. Something like: "Before you close out — [description] still needs attention if you haven't gotten to it." Maximum one sentence, only if there are genuinely open signals.
 ${lastChanceSummary || "None"}
 
 On the household calendar tomorrow:
@@ -555,7 +555,7 @@ FEEDBACK HISTORY: Takeoff thumbs up: ${
 Rules:
 - Write in natural, flowing prose — not a list
 - 3-5 sentences maximum
-- Lead with what resolved or arrived today
+- Lead with what rested or arrived today
 - Note what's still in motion without alarm — these are simply continuing
 - Surface anything important tomorrow so it lands gently in advance
 - Skip signals with no useful information
