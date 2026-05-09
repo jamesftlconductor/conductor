@@ -9,7 +9,66 @@ const redis = new Redis({
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 
+// Fort Lauderdale for now; later we'll resolve per-household location.
+const WEATHER_LAT = 26.1224;
+const WEATHER_LON = -80.1373;
+const WEATHER_TIMEZONE = "America/New_York";
+const WEATHER_TIMEOUT_MS = 3000;
+
 // ---------- helpers ----------
+
+// Open-Meteo's WMO weather codes mapped to the small vocabulary that
+// drives the conditional usage rules in baseRules. We deliberately
+// don't surface every WMO subdivision — Claude only needs to know
+// "is this rain, snow, storm, or normal" to decide whether weather is
+// load-bearing for any signal.
+function classifyWeather(code, tempF) {
+  let condition;
+  if (code <= 1) condition = "Clear";
+  else if (code <= 3) condition = "Partly cloudy";
+  else if (code >= 45 && code <= 48) condition = "Foggy";
+  else if (code >= 51 && code <= 67) condition = "Rain";
+  else if (code >= 71 && code <= 77) condition = "Snow";
+  else if (code >= 80 && code <= 82) condition = "Showers";
+  else if (code >= 95 && code <= 99) condition = "Thunderstorm";
+  else condition = "Mixed";
+  return `${tempF}°F, ${condition}`;
+}
+
+// Best-effort fetch of current weather. Returns null on any failure
+// (network, timeout, malformed payload) so the brief still ships
+// without weather context. 3s timeout keeps the overall brief
+// latency bounded even when Open-Meteo is slow.
+async function fetchWeather() {
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), WEATHER_TIMEOUT_MS);
+    const url =
+      `https://api.open-meteo.com/v1/forecast` +
+      `?latitude=${WEATHER_LAT}&longitude=${WEATHER_LON}` +
+      `&current=temperature_2m,precipitation,weathercode` +
+      `&temperature_unit=fahrenheit` +
+      `&timezone=${encodeURIComponent(WEATHER_TIMEZONE)}`;
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const current = data?.current;
+    if (!current || typeof current.temperature_2m !== "number") return null;
+    const tempF = Math.round(current.temperature_2m);
+    const isRaining = (current.precipitation ?? 0) > 0;
+    const weatherCode = current.weathercode ?? 0;
+    return {
+      tempF,
+      isRaining,
+      weatherCode,
+      summary: classifyWeather(weatherCode, tempF),
+    };
+  } catch (err) {
+    console.error("Weather fetch failed:", err?.message || err);
+    return null;
+  }
+}
 
 function parseDateLoose(value) {
   if (!value) return null;
@@ -333,6 +392,7 @@ The signals you considered were:
 Urgent: ${briefList(pools.urgent)}
 Near window: ${briefList(pools.near)}
 Health context: ${pools.healthContext ? JSON.stringify(pools.healthContext) : "(not connected)"}
+Weather today: ${pools.weather || "(not available)"}
 Childcare: ${eventList(pools.childcare)}
 Home requirements: ${briefList(pools.homeRequirements)}
 Horizon: ${pools.horizon ? `- ${pools.horizon.description || "Unknown"}` : "(none)"}
@@ -348,7 +408,8 @@ Rules:
 - Plain text only, no markdown
 - Maximum 4 sentences total
 - Honest and specific — name actual signals
-- Calm, not defensive`;
+- Calm, not defensive
+- Weather should appear in your reasoning ONLY if a weather condition actually changed which signals you included, excluded, or framed differently. "The clear weather made it a good weekend" is NOT a reason — that's rationalization, not influence. If you would have made the same inclusion decisions regardless of weather, do not mention weather in your reasoning at all. Be honest about what actually drove your choices.`;
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -510,6 +571,7 @@ export default async function handler(req, res) {
       rawCarriedForward,
       householdNameMap,
       rawFeedbackStats,
+      weather,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: merges per-user calendar slices, falls back to
@@ -530,6 +592,10 @@ export default async function handler(req, res) {
       redis.smembers(`household:${householdId}:carriedForward`),
       buildHouseholdNameMap(redis, householdId, userId),
       redis.hgetall(`household:${householdId}:feedbackStats`),
+      // Best-effort. Returns null on any failure so the brief still
+      // ships without weather context. Hardcoded to Fort Lauderdale
+      // for now; will resolve per-household location later.
+      fetchWeather(),
     ]);
 
     const allSignals = (rawSignals || []).map(safeJson).filter(Boolean);
@@ -1059,6 +1125,9 @@ export default async function handler(req, res) {
       `HEALTH CONTEXT (one sentence if notable, silent if normal):`,
       healthContext ? JSON.stringify(healthContext) : "Not connected",
       ``,
+      `WEATHER TODAY (silent unless it changes what someone should do about a signal):`,
+      weather ? weather.summary : "Unknown",
+      ``,
       `CHILDCARE (mention if affects today or tomorrow):`,
       childcareEvents.length > 0 ? childcareEvents.map(formatEvent).join("\n") : "None",
       ``,
@@ -1111,6 +1180,7 @@ export default async function handler(req, res) {
 - Always suggest a specific resolution when mentioning a conflict
 - If conflicts exist, lead with the most severe one. Be specific about what the conflict is and what action would resolve it. Never be alarmist — calm and actionable.
 - Health context: one sentence only if genuinely notable — silent if normal. If sleep.duration is under 6 hours, surface it in a calm, day-shaping way (e.g. "${userName} slept under six hours last night — worth keeping the day manageable"). If hrv.current is meaningfully below hrv.baseline7d (roughly 15% or more lower), surface it as a recovery cue (e.g. "Recovery looks low today — a lighter afternoon might serve you well"). Never quote specific numbers, percentages, or units — only contextual observations. If both sleep and HRV look normal (or data is missing), say nothing about health.
+- Weather: use weather as context only when it changes what someone should do about a signal. (a) If WEATHER TODAY is rain/showers/thunderstorm AND any outdoor service appointment is scheduled today/tomorrow, mention timing may be affected. (b) If extreme heat (>90°F) AND an HVAC service is scheduled, mention this is good timing for the service. (c) If rain/storm AND any package delivery is arriving today, mention packages may need to be brought in promptly. (d) Otherwise — including all "normal" weather (clear, partly cloudy, mild temperatures) and any case where no signal would actually be affected — say absolutely nothing about weather. Do NOT mention weather as a closing flourish, do NOT use weather as an "everything's fine otherwise" transition, do NOT describe weather to round out a paragraph, do NOT include phrases like "the day is clear and warm" or "with the nice weather" or "given the calm forecast." A brief without any weather mention reads correctly when weather isn't load-bearing — the reader will not notice it's missing. Never lead with weather. Never quote the temperature or condition string verbatim — paraphrase ("the rain coming through this afternoon") rather than restate ("72°F, Rain"). When in doubt about whether weather is load-bearing, omit it.
 - Childcare: mention only if it affects coordination today or tomorrow
 - Home requirements: flag naturally if service window conflicts with likely schedule
 - Carried forward: if CARRIED FORWARD FROM YESTERDAY is populated, weave in one understated sentence near the end (before the horizon line) — e.g. "Carrying forward from yesterday: the HVAC appointment is still unconfirmed." Never alarming, never repetitive of the main brief narrative. If multiple carry-forwards exist, name at most one or two; the rest are implied.
@@ -1186,6 +1256,7 @@ export default async function handler(req, res) {
         urgent: urgentForPrompt,
         near: nearForPrompt,
         healthContext,
+        weather: weather ? weather.summary : null,
         childcare: childcareEvents,
         homeRequirements,
         horizon: horizonAwarenessSignal || horizonSignal,
