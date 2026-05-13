@@ -434,6 +434,72 @@ Rules:
   }
 }
 
+// Fourth Claude call alongside segment-tagging and transparency. Produces
+// "The Read" — 1-3 additional sentences of lower-urgency context that
+// didn't make the main brief but are worth knowing this week. Surfaced
+// on Ground via a collapsible section below the brief. Best-effort: any
+// failure returns null and the brief still ships without it. Claude
+// returns the literal string "NOTHING" when there's nothing additional
+// worth saying — also mapped to null.
+async function generateTheRead(brief, pools) {
+  if (!brief) return null;
+
+  const briefList = (arr) => {
+    if (!arr || arr.length === 0) return "(none)";
+    return arr.map((s) => `- ${s.description || "Unknown"}`).join("\n");
+  };
+  const eventList = (arr) => {
+    if (!arr || arr.length === 0) return "(none)";
+    return arr.map((e) => `- ${e.title || "Untitled"}`).join("\n");
+  };
+
+  const prompt = `You just wrote this brief: ${brief}
+
+The signal pool was:
+Urgent: ${briefList(pools.urgent)}
+Near window: ${briefList(pools.near)}
+Health context: ${pools.healthContext ? JSON.stringify(pools.healthContext) : "(not connected)"}
+Weather today: ${pools.weather || "(not available)"}
+Childcare: ${eventList(pools.childcare)}
+Home requirements: ${briefList(pools.homeRequirements)}
+Horizon: ${pools.horizon ? `- ${pools.horizon.description || "Unknown"}` : "(none)"}
+Carried forward: ${briefList(pools.carriedForward)}
+
+From the same signal pool, write 1-3 additional sentences that are worth knowing but didn't make the main brief. These should be:
+- Lower urgency than the brief
+- Interesting context or forward-looking awareness
+- Things the household might want to know this week but don't need to act on today
+- Same calm, trusted voice as the brief
+- Plain text only, no markdown
+
+If there is genuinely nothing additional worth saying, return exactly: NOTHING
+
+Do not repeat anything already in the brief.`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim();
+    if (!text || text === "NOTHING") return null;
+    return text;
+  } catch (err) {
+    console.error("The Read generation failed:", err);
+    return null;
+  }
+}
+
 async function tagBriefSegments(brief, signals) {
   const fallback = [{ type: "text", content: brief || "" }];
   if (!brief || !signals || signals.length === 0) return fallback;
@@ -1073,6 +1139,9 @@ export default async function handler(req, res) {
         brief: firstRunBrief,
         segments,
         transparency: null,
+        // First-run is deliberately starved; no overflow context to
+        // surface beyond the welcome brief itself.
+        theRead: null,
         household: householdId,
         user: userName,
         isFirstRun: true,
@@ -1269,22 +1338,24 @@ export default async function handler(req, res) {
       seen.add(key);
       return true;
     });
-    // Run segment tagging and transparency generation in parallel — both
-    // depend only on the brief text and existing pools, so there's no
-    // ordering constraint between them. Saves ~one Claude round-trip of
-    // latency vs sequential.
-    const [segments, transparency] = await Promise.all([
+    // Run segment tagging, transparency, and The Read generation in
+    // parallel — all three depend only on the brief text and existing
+    // pools, so there's no ordering constraint between them. Saves
+    // ~two Claude round-trips of latency vs sequential.
+    const poolsForClaude = {
+      urgent: urgentForPrompt,
+      near: nearForPrompt,
+      healthContext,
+      weather: weather ? weather.summary : null,
+      childcare: childcareEvents,
+      homeRequirements,
+      horizon: horizonAwarenessSignal || horizonSignal,
+      carriedForward: carriedForwardSignals,
+    };
+    const [segments, transparency, theRead] = await Promise.all([
       tagBriefSegments(brief, tagSignals),
-      generateTransparency(brief, {
-        urgent: urgentForPrompt,
-        near: nearForPrompt,
-        healthContext,
-        weather: weather ? weather.summary : null,
-        childcare: childcareEvents,
-        homeRequirements,
-        horizon: horizonAwarenessSignal || horizonSignal,
-        carriedForward: carriedForwardSignals,
-      }),
+      generateTransparency(brief, poolsForClaude),
+      generateTheRead(brief, poolsForClaude),
     ]);
 
     // Track which signals Claude actually narrated this run so the next brief
@@ -1341,6 +1412,7 @@ export default async function handler(req, res) {
       brief,
       segments,
       transparency,
+      theRead,
       household: householdId,
       user: userName,
       isFirstRun,
