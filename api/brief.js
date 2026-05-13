@@ -1194,7 +1194,7 @@ export default async function handler(req, res) {
     ].join("\n");
 
     const baseRules = `RULES:
-- Maximum 5-6 sentences total
+- CRITICAL RULE: Maximum 5 sentences. Count every sentence including the final one. If you reach 5 sentences, stop. Do not add a 6th sentence under any circumstances. A 4-sentence brief is better than a 6-sentence brief.
 - Synthesize all layers into flowing prose — never a list
 - Lead with urgent if present
 - A detected conflict should always appear in the brief if it is high severity
