@@ -631,6 +631,7 @@ export default async function handler(req, res) {
       householdNameMap,
       rawFeedbackStats,
       fetchedWeather,
+      rawCrew,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: merges per-user calendar slices, falls back to
@@ -655,6 +656,10 @@ export default async function handler(req, res) {
       // ships without weather context. Hardcoded to Fort Lauderdale
       // for now; will resolve per-household location later.
       fetchWeather(),
+      // Crew layer (children + pets). Single JSON-string key written
+      // by the onboard worker's Job 4. Filter for today/tomorrow
+      // events happens after parse, downstream.
+      redis.get(`household:${householdId}:crew`),
     ]);
 
     // Test override: ?testWeatherCode=N&testWeatherTemp=N replaces the
@@ -848,6 +853,43 @@ export default async function handler(req, res) {
     const homeRequirements = activeSignals
       .filter(isHomeRequirement)
       .filter((s) => !isBackgroundFiltered(s));
+
+    // CREW — children + pets layer. Read the JSON-string household:{id}:crew
+    // written by the onboard worker, then filter for upcomingEvents falling
+    // today or tomorrow. The prompt rule below tells Claude to mention these
+    // ONLY when something requires the household to act or be present —
+    // routine recurring activities don't make the brief.
+    const crewMembers = (() => {
+      if (!rawCrew) return [];
+      try {
+        const parsed = typeof rawCrew === "string" ? JSON.parse(rawCrew) : rawCrew;
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    })();
+    const crewToday = [];
+    for (const m of crewMembers) {
+      const relevantEvents = (m.upcomingEvents || []).filter((ev) => {
+        const ms = parseDateLoose(ev.date)?.getTime();
+        if (!ms) return false;
+        const offset = dayOffsetFromToday(new Date(ms));
+        return offset === 0 || offset === 1;
+      });
+      if (relevantEvents.length > 0) {
+        crewToday.push({ ...m, _events: relevantEvents });
+      }
+    }
+    function formatCrewLine(m) {
+      const label = m.memberType === "pet"
+        ? `${m.name || "pet"}${m.type ? ` (${m.type})` : ""}`
+        : `${m.name || "child"}${m.age ? `, age ${m.age}` : ""}`;
+      const evs = (m._events || []).map((e) => {
+        const friendly = friendlyDate(e.date);
+        return `${e.description}${friendly ? ` on ${friendly}` : ""}`;
+      }).join("; ");
+      return `- [${m.memberType.toUpperCase()}] ${label}: ${evs}`;
+    }
 
     // FLAGGED CATEGORIES — match against nearSignals + calendar events.
     // nearSignals is already background-filtered above, so flagged-category
@@ -1216,6 +1258,9 @@ export default async function handler(req, res) {
       `CHILDCARE (mention if affects today or tomorrow):`,
       childcareEvents.length > 0 ? childcareEvents.map(formatEvent).join("\n") : "None",
       ``,
+      `CREW (children and pets — mention only if relevant today or tomorrow, never daily routine):`,
+      crewToday.length > 0 ? crewToday.map(formatCrewLine).join("\n") : "None",
+      ``,
       `IN-PERSON HOME REQUIREMENTS (flag if nobody confirmed home):`,
       homeRequirements.length > 0
         ? homeRequirements
@@ -1267,6 +1312,7 @@ export default async function handler(req, res) {
 - Health context: one sentence only if genuinely notable — silent if normal. If sleep.duration is under 6 hours, surface it in a calm, day-shaping way (e.g. "${userName} slept under six hours last night — worth keeping the day manageable"). If hrv.current is meaningfully below hrv.baseline7d (roughly 15% or more lower), surface it as a recovery cue (e.g. "Recovery looks low today — a lighter afternoon might serve you well"). Never quote specific numbers, percentages, or units — only contextual observations. If both sleep and HRV look normal (or data is missing), say nothing about health.
 - Weather: use weather as context only when it changes what someone should do about a signal. (a) If WEATHER TODAY is rain/showers/thunderstorm AND any outdoor service appointment is scheduled today/tomorrow, mention timing may be affected. (b) If extreme heat (>90°F) AND an HVAC service is scheduled, mention this is good timing for the service. (c) If rain/storm AND any package delivery is arriving today, mention packages may need to be brought in promptly. (d) Otherwise — including all "normal" weather (clear, partly cloudy, mild temperatures) and any case where no signal would actually be affected — say absolutely nothing about weather. Do NOT mention weather as a closing flourish, do NOT use weather as an "everything's fine otherwise" transition, do NOT describe weather to round out a paragraph, do NOT include phrases like "the day is clear and warm" or "with the nice weather" or "given the calm forecast." A brief without any weather mention reads correctly when weather isn't load-bearing — the reader will not notice it's missing. Never lead with weather. Never quote the temperature or condition string verbatim — paraphrase ("the rain coming through this afternoon") rather than restate ("72°F, Rain"). When in doubt about whether weather is load-bearing, omit it.
 - Childcare: mention only if it affects coordination today or tomorrow
+- Crew (children and pets): Crew members surface in the brief only when something is happening today or tomorrow that requires the household to act or be present. Never mention routine pickups or recurring activities unless there is a conflict or timing consideration. A pet vet appointment today is as important as a child's activity.
 - Home requirements: flag naturally if service window conflicts with likely schedule
 - Carried forward: if CARRIED FORWARD FROM YESTERDAY is populated, weave in one understated sentence near the end (before the horizon line) — e.g. "Carrying forward from yesterday: the HVAC appointment is still unconfirmed." Never alarming, never repetitive of the main brief narrative. If multiple carry-forwards exist, name at most one or two; the rest are implied.
 - Horizon signal: one sentence at the end, tonal shift to future-aware, specific and surprising

@@ -182,6 +182,30 @@ async function handleCompass(req, res) {
 //   add    — LPUSH a user-supplied vault item
 //   handle — mark an existing item handled (hides it from active GETs)
 //   delete — remove an item from the list entirely
+// Crew — children + pets layer. The single household:{id}:crew key
+// holds a JSON-stringified array of member records written by the
+// onboard worker's Crew job. GET parses and returns it; missing key
+// returns an empty array so the mobile screen renders an empty state
+// rather than erroring.
+async function handleCrew(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for crew" });
+  }
+  const householdId = await resolveHouseholdId(req.query?.userId);
+  const raw = await redis.get(`household:${householdId}:crew`);
+  let crew = [];
+  if (raw != null) {
+    try {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      if (Array.isArray(parsed)) crew = parsed;
+    } catch {
+      // malformed payload — return empty rather than 500
+    }
+  }
+  return res.status(200).json({ household: householdId, crew });
+}
+
 async function handleVault(req, res) {
   const householdId = await resolveHouseholdId(req.query?.userId || req.body?.userId);
   const key = `household:${householdId}:vault`;
@@ -641,6 +665,11 @@ export default async function handler(req, res) {
     // the mobile vault screen.
     if (queryType === "vault" || bodyType === "vault") {
       return handleVault(req, res);
+    }
+
+    // Crew — household:{id}:crew JSON-string array of children + pets.
+    if (queryType === "crew" || bodyType === "crew") {
+      return handleCrew(req, res);
     }
 
     // Compass — longitudinal household intelligence over the memory log.

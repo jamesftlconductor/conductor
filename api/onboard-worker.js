@@ -700,7 +700,187 @@ Snippet: ${(e.snippet || "").substring(0, 400)}`,
   return { processed, kept, dropped };
 }
 
-// ---------- Job 4: Horizon selection ----------
+// ---------- Job 4: Crew sweep ----------
+//
+// Children + pets layer. Surveys the last 12 months of email for
+// activity registrations, school comms, vet/grooming appointments,
+// and parent-app notifications (ClassDojo, Brightwheel, Remind). Per-
+// batch Claude extraction returns structured child/pet records that
+// get merged across batches by member name, then merged again into
+// any existing :crew record so a single missed onboard doesn't lose
+// previously-found members.
+
+async function runCrewJob(userId, householdId) {
+  await patchJob(householdId, "crew", { state: "running", startedAt: Date.now() });
+
+  const accessToken = await getValidToken(userId);
+  const twelveMonthsAgo = Math.floor((Date.now() - 365 * DAY_MS) / 1000);
+
+  const query =
+    `after:${twelveMonthsAgo} subject:(soccer OR baseball OR basketball OR football OR ` +
+    `swim OR dance OR piano OR violin OR guitar OR lessons OR practice OR game OR ` +
+    `recital OR "school pickup" OR "drop off" OR dropoff OR pediatric OR ` +
+    `"vet appointment" OR veterinary OR grooming OR "dog park" OR ClassDojo OR ` +
+    `Brightwheel OR Remind OR "parent teacher" OR "field trip" OR "school calendar" OR ` +
+    `"activity fee" OR registration)`;
+
+  const messageIds = await gmailSearch(accessToken, query, 100).catch(() => []);
+  await patchJob(householdId, "crew", { found: messageIds.length });
+
+  if (messageIds.length === 0) {
+    await patchJob(householdId, "crew", {
+      state: "complete",
+      finishedAt: Date.now(),
+      processed: 0,
+      members: 0,
+    });
+    return { processed: 0, members: 0 };
+  }
+
+  // Same parallel-chunk-of-15 pattern as the email + vault jobs.
+  const headers = [];
+  for (let i = 0; i < messageIds.length; i += 15) {
+    const chunk = messageIds.slice(i, i + 15);
+    const chunkResults = await Promise.all(
+      chunk.map((id) => fetchEmailMetadata(accessToken, id).catch(() => null))
+    );
+    headers.push(...chunkResults);
+  }
+  const validHeaders = headers.filter(Boolean);
+
+  // Load any existing crew so a fresh run merges into rather than
+  // overwrites prior findings. Crew is stored as a single JSON string
+  // (not a list) so a get + JSON.parse is sufficient.
+  const existingRaw = await redis.get(`household:${householdId}:crew`);
+  const existing = safeJson(existingRaw);
+  const startingCrew = Array.isArray(existing) ? existing : [];
+
+  // Dedup map: key = "{memberType}:{lowercase name}". Unkeyed (no
+  // name) items go to a separate bucket and are only kept if they
+  // carry useful detail — otherwise they'd surface as phantom
+  // "Child" entries cluttering the screen.
+  const crewByKey = new Map();
+  const unkeyed = [];
+
+  function mergeArrays(a, b, dedupKey) {
+    const seen = new Set();
+    const result = [];
+    for (const item of [...(a || []), ...(b || [])]) {
+      if (!item || typeof item !== "object") continue;
+      const k = (item[dedupKey] || "").toLowerCase().trim();
+      if (!k || seen.has(k)) continue;
+      seen.add(k);
+      result.push(item);
+    }
+    return result;
+  }
+
+  function ingest(item) {
+    if (!item || !item.memberType) return;
+    if (item.memberType !== "child" && item.memberType !== "pet") return;
+    const name = typeof item.name === "string" ? item.name.trim() : "";
+    if (!name) {
+      const hasDetail =
+        (item.activities && item.activities.length > 0) ||
+        (item.upcomingEvents && item.upcomingEvents.length > 0) ||
+        item.school ||
+        item.vet;
+      if (hasDetail) unkeyed.push(item);
+      return;
+    }
+    const key = `${item.memberType}:${name.toLowerCase()}`;
+    const existing = crewByKey.get(key);
+    if (!existing) {
+      crewByKey.set(key, { ...item, name });
+      return;
+    }
+    // Merge: scalar fields prefer first-seen non-null; array fields
+    // concatenate with dedup by their natural key.
+    existing.age = existing.age ?? item.age;
+    existing.breed = existing.breed ?? item.breed;
+    existing.type = existing.type ?? item.type;
+    existing.school = existing.school ?? item.school;
+    existing.vet = existing.vet ?? item.vet;
+    existing.activities = mergeArrays(existing.activities, item.activities, "name");
+    existing.upcomingEvents = mergeArrays(existing.upcomingEvents, item.upcomingEvents, "description");
+  }
+
+  // Seed the dedup map with the existing :crew contents so this run
+  // merges into them.
+  for (const item of startingCrew) ingest(item);
+
+  let processed = 0;
+  const PARALLEL = 10;
+
+  for (let i = 0; i < validHeaders.length; i += PARALLEL) {
+    const batch = validHeaders.slice(i, i + PARALLEL);
+    const emailsList = batch
+      .map((e, idx) => `${idx + 1}. Subject: ${e.subject}\n   From: ${e.from}`)
+      .join("\n");
+
+    const prompt = `Analyze these emails and extract any information about children or pets in this household. Return a JSON array of found items or empty array:
+
+For children:
+{
+  "memberType": "child",
+  "name": string | null,
+  "age": number | null,
+  "activities": [{ "name": string, "schedule": string, "location": string }],
+  "school": { "name": string, "pickupTime": string } | null,
+  "upcomingEvents": [{ "description": string, "date": string }]
+}
+
+For pets:
+{
+  "memberType": "pet",
+  "name": string | null,
+  "type": "dog" | "cat" | "other",
+  "breed": string | null,
+  "vet": { "name": string, "phone": string } | null,
+  "upcomingEvents": [{ "description": string, "date": string }]
+}
+
+Only return items where you have high confidence. Return empty array if nothing found.
+Return ONLY the JSON array, nothing else.
+
+Emails:
+${emailsList}`;
+
+    try {
+      const text = await callClaude(prompt, 1500);
+      const items = safeParseJsonText(text);
+      if (Array.isArray(items)) {
+        for (const item of items) ingest(item);
+      }
+    } catch (err) {
+      console.warn("Crew batch failed:", err.message);
+    }
+
+    processed += batch.length;
+    await patchJob(householdId, "crew", {
+      processed,
+      members: crewByKey.size + unkeyed.length,
+    });
+  }
+
+  const crew = [...crewByKey.values(), ...unkeyed];
+
+  // Single-key string write; consumers parse JSON on read.
+  if (crew.length > 0) {
+    await redis.set(`household:${householdId}:crew`, JSON.stringify(crew));
+  }
+
+  await patchJob(householdId, "crew", {
+    state: "complete",
+    finishedAt: Date.now(),
+    processed,
+    members: crew.length,
+  });
+
+  return { processed, members: crew.length };
+}
+
+// ---------- Job 5: Horizon selection ----------
 
 const SURPRISING_KEYWORDS = [
   "insurance", "renewal", "lease", "registration",
@@ -819,6 +999,14 @@ export default async function handler(req, res) {
     await patchJob(householdId, "vault", { state: "failed", error: err.message });
   }
 
+  let crewResult = null;
+  try {
+    crewResult = await runCrewJob(userId, householdId);
+  } catch (err) {
+    console.error("Crew job failed:", err);
+    await patchJob(householdId, "crew", { state: "failed", error: err.message });
+  }
+
   let horizonResult = null;
   try {
     horizonResult = await runHorizonJob(householdId);
@@ -838,6 +1026,8 @@ export default async function handler(req, res) {
       calendarEventsProcessed: calendarResult?.classified || 0,
       vaultProcessed: vaultResult?.processed || 0,
       vaultKept: vaultResult?.kept || 0,
+      crewProcessed: crewResult?.processed || 0,
+      crewMembers: crewResult?.members || 0,
       horizonSignal: horizonResult,
     },
   });
