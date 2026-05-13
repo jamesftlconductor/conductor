@@ -494,9 +494,26 @@ async function handlePreferences(req, res) {
   return res.status(405).json({ error: "Method not allowed for preferences" });
 }
 
+// Type-aware expiry windows. Different signal types decay at different
+// rates — an appointment is dead the moment its time passes, but a
+// package can drift two days past ETA before we should give up. Falls
+// back to the original 24h EXPIRY_MS for types not explicitly listed.
+const EXPIRY_BY_TYPE = {
+  service: 0,             // appointments have no window — past = done
+  reservation: 0,
+  appointment: 0,
+  food: 4 * 60 * 60 * 1000,        // 4h grace — delivery windows close fast
+  grocery: 4 * 60 * 60 * 1000,
+  package: 48 * 60 * 60 * 1000,    // 48h grace; flagged as missed cue
+};
+
 function applyDefaultsAndExpiry(signal) {
   const original = JSON.stringify(signal);
   const wasNotExpired = signal.state !== "expired";
+  // Captured BEFORE the state defaulting below so a freshly-loaded
+  // signal with no explicit state still reads as "user hasn't touched
+  // it" for missed-cue flagging.
+  const wasIncoming = !signal.state || signal.state === "incoming";
   if (!signal.state) signal.state = "incoming";
 
   if (signal.state !== "resolved" && signal.state !== "expired" && signal.eta) {
@@ -508,13 +525,35 @@ function applyDefaultsAndExpiry(signal) {
     // by treating any parsed date more than 5 years before now as
     // "probably year-less, no usable ETA" rather than expired.
     const SUSPICIOUSLY_OLD_MS = 5 * 365 * 24 * 60 * 60 * 1000;
-    if (
-      !isNaN(etaMs) &&
-      etaMs > Date.now() - SUSPICIOUSLY_OLD_MS &&
-      etaMs < Date.now() - EXPIRY_MS
-    ) {
-      signal.state = "expired";
-      signal.expiredAt = new Date().toISOString();
+    if (!isNaN(etaMs) && etaMs > Date.now() - SUSPICIOUSLY_OLD_MS) {
+      const msPast = Date.now() - etaMs;
+      const type = signal.type;
+      const status = signal.status;
+      // Per-type window; types not in the map fall back to the legacy
+      // 24h rule so prior behavior is preserved for delivery/travel/
+      // deadline/unknown signals.
+      const window = EXPIRY_BY_TYPE[type] ?? EXPIRY_MS;
+
+      let shouldExpire = false;
+      if (type === "package") {
+        // Packages also require status != "Delivered" — a delivered
+        // package is fine to keep around in the resolved/active state
+        // it was already in (most arrive with status:Delivered, so
+        // they're a no-op here anyway).
+        shouldExpire = msPast > window && status !== "Delivered";
+      } else {
+        shouldExpire = msPast > window;
+      }
+
+      if (shouldExpire) {
+        signal.state = "expired";
+        signal.expiredAt = new Date().toISOString();
+        // Missed cue = user never Rested or Held the signal before it
+        // auto-expired. The Missed Cues screen reads from a separate
+        // LPUSH'd list (handled by loadSignals after the per-signal
+        // pass completes).
+        if (wasIncoming) signal.missedCue = true;
+      }
     }
   }
 
@@ -527,6 +566,11 @@ async function loadSignals(householdId) {
   const key = `household:${householdId}:signals`;
   const raw = await redis.lrange(key, 0, -1);
   const signals = raw.map(parseSignal);
+  // Signals that auto-expired AND were never touched by the user. We
+  // stash these in a separate list so the Missed Cues screen can show
+  // "what slipped past you" without re-scanning the full signals list
+  // for state:expired + state-was-incoming pairings.
+  const missedCues = [];
 
   for (let i = 0; i < signals.length; i++) {
     const { signal, changed, justExpired } = applyDefaultsAndExpiry(signals[i]);
@@ -538,7 +582,20 @@ async function loadSignals(householdId) {
       // applyDefaultsAndExpiry doesn't touch lastUpdate, so the signal still
       // carries its prior "in system since" anchor — pass it directly.
       await writeMemoryEntry(householdId, signal, "expired", null);
+      if (signal.missedCue) {
+        missedCues.push(signal);
+      }
     }
+  }
+
+  // Persist newly-flagged missed cues, capped at 100 entries via LTRIM
+  // so the list never grows unboundedly. Newest at the head (LPUSH).
+  if (missedCues.length > 0) {
+    const mcKey = `household:${householdId}:missedCues`;
+    for (const mc of missedCues) {
+      await redis.lpush(mcKey, JSON.stringify(mc));
+    }
+    await redis.ltrim(mcKey, 0, 99);
   }
 
   return { key, signals };

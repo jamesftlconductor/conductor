@@ -53,6 +53,24 @@ function postParseDiscardReason(signal, from) {
   // email carries no real arrival. Checked first so it short-circuits the
   // other gates.
   if (isBounceFrom(from)) return "bounce-sender";
+
+  // Description quality gate. Empty, "Unknown", or fewer-than-5-character
+  // descriptions can't drive useful prose; the radar dot would render but
+  // the brief would have nothing to say about it.
+  const desc = typeof signal.description === "string" ? signal.description.trim() : "";
+  if (!desc || desc === "Unknown" || desc.length < 5) {
+    return "low-description";
+  }
+
+  // Sender quality gate. A signal with no identifiable origin can't
+  // be ownership-tagged or surfaced in transparency reasoning. The
+  // earlier all-unknown gate only caught the worst combination; this
+  // tightens it to require any sender at all.
+  const sender = typeof signal.sender === "string" ? signal.sender.trim() : "";
+  if (!sender || sender === "Unknown") {
+    return "missing-sender";
+  }
+
   // All-Unknown shell: Claude couldn't extract anything actionable. Storing
   // these clutters the ring with phantom signals.
   if (
@@ -63,6 +81,16 @@ function postParseDiscardReason(signal, from) {
   ) {
     return "all-unknown";
   }
+
+  // Claude self-flagged the parse as low confidence AND the type came
+  // back unknown. Either alone is recoverable (low-confidence package
+  // with eta might still be worth surfacing; unknown-type with high
+  // confidence might be a categorization gap to investigate). The
+  // pair is overwhelmingly noise.
+  if (signal.confidence === "low" && signal.type === "unknown") {
+    return "low-confidence-unknown";
+  }
+
   // Promo language in the description — Claude correctly extracted the words
   // but the email is marketing, not a real arrival.
   if (PROMO_REGEX.test(signal.description || "")) return "promo-keyword";
@@ -76,6 +104,87 @@ function postParseDiscardReason(signal, from) {
     return "promo-sender";
   }
   return null;
+}
+
+// ---------- Semantic deduplication ----------
+
+// Word-overlap ratio against the shorter set, ignoring very common short
+// words. Deliberately simple — no Claude call, no embedding lookup, just
+// "do these two descriptions feel like the same thing." Returns a value
+// in [0, 1].
+const OVERLAP_STOPWORDS = new Set([
+  "the", "and", "for", "with", "from", "your", "this", "that",
+  "you", "are", "was", "will", "has", "have", "been", "ord",
+]);
+
+function descriptionOverlap(a, b) {
+  if (!a || !b) return 0;
+  const toWords = (s) =>
+    new Set(
+      s
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length >= 3 && !OVERLAP_STOPWORDS.has(w))
+    );
+  const wordsA = toWords(a);
+  const wordsB = toWords(b);
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let common = 0;
+  for (const w of wordsA) if (wordsB.has(w)) common++;
+  return common / Math.min(wordsA.size, wordsB.size);
+}
+
+// True when the new signal is plausibly the same as an existing one
+// according to either of two rules:
+//   1. Same type + same sender (case-insensitive, trimmed) + ETAs
+//      within 3 days of each other.
+//   2. Same type + description word overlap > 60% AND the existing
+//      signal is still in motion (incoming or active — not already
+//      resolved/expired/etc).
+function isSemanticDuplicate(newSig, existing) {
+  if (newSig.type !== existing.type) return false;
+
+  const newSender = (newSig.sender || "").toLowerCase().trim();
+  const exSender = (existing.sender || "").toLowerCase().trim();
+  if (newSender && exSender && newSender === exSender) {
+    const newEta = newSig.eta ? Date.parse(newSig.eta) : NaN;
+    const exEta = existing.eta ? Date.parse(existing.eta) : NaN;
+    if (!isNaN(newEta) && !isNaN(exEta)) {
+      const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+      if (Math.abs(newEta - exEta) <= THREE_DAYS_MS) return true;
+    }
+  }
+
+  if (existing.state === "incoming" || existing.state === "active" || !existing.state) {
+    const overlap = descriptionOverlap(newSig.description, existing.description);
+    if (overlap > 0.6) return true;
+  }
+
+  return false;
+}
+
+// "How much actionable detail does this carry" — used to break ties
+// between a new signal and an existing duplicate. The signal with more
+// non-null/non-Unknown fields wins; the loser is discarded.
+function infoDensity(s) {
+  let n = 0;
+  if (s.eta) n++;
+  if (s.status && s.status !== "Unknown") n++;
+  if (s.description && s.description.trim().length > 0) n++;
+  if (s.sender && s.sender !== "Unknown") n++;
+  if (s.trackingNumber) n++;
+  if (s.notes) n++;
+  return n;
+}
+
+function safeParseSignal(raw) {
+  if (raw == null) return null;
+  try {
+    return typeof raw === "string" ? JSON.parse(raw) : raw;
+  } catch {
+    return null;
+  }
 }
 
 export async function runImport(userId) {
@@ -172,7 +281,9 @@ export async function runImport(userId) {
   "status": "In Transit, Delivered, Out for Delivery, Delayed, or Unknown",
   "eta": "date or null",
   "sender": "who sent it",
-  "type": "package, food, grocery, service, reservation, travel, or unknown"
+  "type": "package, food, grocery, service, reservation, travel, or unknown",
+  "notes": "any additional context about timing, location, or special instructions (or null)",
+  "confidence": "high, medium, or low — how confident you are in the extracted data"
 }
 
 Subject: ${subject}
@@ -224,7 +335,53 @@ ${emailText.substring(0, 1000)}`,
       signal.userId = userId;
       signal.source = "import";
 
-      await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
+      // Semantic dedup against the last 50 stored signals. Picks up
+      // cases where the messageId differs and the content fingerprint
+      // differs (e.g., a follow-up email with a more specific ETA) but
+      // it's clearly the same underlying real-world signal. Newer +
+      // denser wins via LSET; otherwise the new one is dropped.
+      const signalsKey = `household:${householdId}:signals`;
+      const recentRaw = await redis.lrange(signalsKey, 0, 49);
+      const recent = recentRaw.map(safeParseSignal).filter(Boolean);
+      let dupIndex = -1;
+      let dupExisting = null;
+      for (let i = 0; i < recent.length; i++) {
+        if (isSemanticDuplicate(signal, recent[i])) {
+          dupIndex = i;
+          dupExisting = recent[i];
+          break;
+        }
+      }
+
+      if (dupIndex !== -1) {
+        const newDensity = infoDensity(signal);
+        const exDensity = infoDensity(dupExisting);
+        if (newDensity > exDensity) {
+          // New one is richer — replace the existing record in place.
+          // Carry forward state/notedAt/lastUpdate-on-other-fields from
+          // the existing signal where they exist, since those represent
+          // user intent we don't want to lose.
+          const merged = {
+            ...signal,
+            state: dupExisting.state || signal.state,
+            notedAt: dupExisting.notedAt || signal.notedAt,
+          };
+          await redis.lset(signalsKey, dupIndex, JSON.stringify(merged));
+          await redis.sadd(fingerprintSetKey, fp);
+          console.log(
+            `[import] semantic-dedup replace at index ${dupIndex} (density ${newDensity} > ${exDensity}): "${(signal.description || "").slice(0, 60)}"`
+          );
+          imported++;
+        } else {
+          console.log(
+            `[import] semantic-dedup discard (density ${newDensity} <= ${exDensity}): "${(signal.description || "").slice(0, 60)}"`
+          );
+        }
+        await new Promise(r => setTimeout(r, 1000));
+        continue;
+      }
+
+      await redis.lpush(signalsKey, JSON.stringify(signal));
       await redis.sadd(fingerprintSetKey, fp);
       imported++;
 
