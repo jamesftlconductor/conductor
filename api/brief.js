@@ -465,16 +465,7 @@ Home requirements: ${briefList(pools.homeRequirements)}
 Horizon: ${pools.horizon ? `- ${pools.horizon.description || "Unknown"}` : "(none)"}
 Carried forward: ${briefList(pools.carriedForward)}
 
-From the same signal pool, write 1-3 additional sentences that are worth knowing but didn't make the main brief. These should be:
-- Lower urgency than the brief
-- Interesting context or forward-looking awareness
-- Things the household might want to know this week but don't need to act on today
-- Same calm, trusted voice as the brief
-- Plain text only, no markdown
-
-If there is genuinely nothing additional worth saying, return exactly: NOTHING
-
-Do not repeat anything already in the brief.`;
+Always provide 1-2 sentences. If the brief already covered the most pressing items, write about what's quietly in the background — signals in motion that weren't urgent enough to lead with, things Conductor is watching, or forward-looking awareness for the week ahead. Never repeat anything specific from the brief. Never introduce new urgency. This is background awareness, not action items. Plain text only.`;
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -492,8 +483,10 @@ Do not repeat anything already in the brief.`;
     });
     const data = await response.json();
     const text = data?.content?.[0]?.text?.trim();
-    if (!text || text === "NOTHING") return null;
-    return text;
+    // No more NOTHING escape clause — the prompt now mandates 1-2
+    // sentences of background awareness regardless. Only an empty
+    // response (rare, indicates API failure mid-stream) returns null.
+    return text || null;
   } catch (err) {
     console.error("The Read generation failed:", err);
     return null;
