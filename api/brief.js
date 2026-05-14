@@ -502,6 +502,13 @@ async function tagBriefSegments(brief, signals) {
     .map((s) => `- id: ${s.id} | type: ${s.type || "unknown"} | description: ${s.description || "Unknown"}`)
     .join("\n");
 
+  // Build the set of legal signalIds up front so the post-parse pass
+  // can coerce any hallucinated/borrowed id back to a text segment.
+  // Crew events, calendar appointments, and other pool items that
+  // surface in the brief without being in this signal list would
+  // otherwise pick up an arbitrary id from the pool.
+  const validIds = new Set(signals.map((s) => String(s.id)));
+
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -521,7 +528,9 @@ async function tagBriefSegments(brief, signals) {
 
 signalType MUST be exactly one of: package, delivery, food, grocery, service, reservation, appointment, travel, deadline, unknown. Pick the closest match for the signal's nature. Use "unknown" if no value fits — never invent a different label.
 
-Split the brief exactly — every character must appear in exactly one segment. Signal phrases should be the natural language reference to that signal as it appears in the brief (e.g. 'hair styling items' not the full description). Only tag phrases that clearly refer to a specific signal. Return only the JSON array, nothing else.
+CRITICAL: signalId MUST be copied verbatim from the Signals list below — never invent, never reuse one signal's id for an unrelated phrase. If a phrase in the brief refers to something NOT in the Signals list (a calendar event, a crew member's activity, a weather note, a health metric), it MUST be a 'text' segment. When in doubt, prefer 'text'.
+
+Split the brief exactly — every character must appear in exactly one segment. Signal phrases should be the natural language reference to that signal as it appears in the brief (e.g. 'hair styling items' not the full description). Return only the JSON array, nothing else.
 
 Brief:
 ${brief}
@@ -547,7 +556,27 @@ ${signalList}`,
       .join("");
     if (rejoined !== brief && rejoined.trim() !== brief.trim()) return fallback;
 
-    return parsed;
+    // Validation pass: any signal segment whose signalId isn't in the
+    // input pool gets demoted to a text segment. Belt-and-braces on top
+    // of the prompt — the prompt instruction is the first line of
+    // defense, this guarantees correctness even when Claude drifts.
+    let coercedCount = 0;
+    const validated = parsed.map((seg) => {
+      if (
+        seg &&
+        seg.type === "signal" &&
+        (seg.signalId == null || !validIds.has(String(seg.signalId)))
+      ) {
+        coercedCount++;
+        return { type: "text", content: seg.content };
+      }
+      return seg;
+    });
+    if (coercedCount > 0) {
+      console.log(`[brief] segmenter coerced ${coercedCount} segment(s) with invalid signalId to text`);
+    }
+
+    return validated;
   } catch (err) {
     console.error("Segment tagging failed:", err);
     return fallback;
