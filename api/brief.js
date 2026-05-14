@@ -1043,10 +1043,26 @@ export default async function handler(req, res) {
       });
     };
 
+    const daysFromTodayPhrase = (value) => {
+      const d = parseDateLoose(value);
+      if (!d) return null;
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+      const target = new Date(d);
+      target.setHours(0, 0, 0, 0);
+      const n = Math.round((target.getTime() - startOfToday.getTime()) / DAY_MS);
+      if (n < 0) return null;
+      if (n === 0) return "today";
+      if (n === 1) return "tomorrow";
+      return `in ${n} days`;
+    };
+
     const etaWithFriendly = (raw) => {
       const friendly = friendlyDate(raw);
       if (!raw) return "Unknown";
-      return friendly ? `${friendly} (raw: ${raw})` : raw;
+      if (!friendly) return raw;
+      const phrase = daysFromTodayPhrase(raw);
+      return phrase ? `${friendly} (${phrase}) (raw: ${raw})` : `${friendly} (raw: ${raw})`;
     };
 
     const formatSignal = (s) => {
@@ -1380,7 +1396,7 @@ ${isSingleMember
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field (e.g., "Sunday, May 10"). NEVER compute, infer, or recalculate a day-of-week or date — the resolved string is authoritative. Ignore the "raw:" portion. Drop the year unless it differs from the current year.
 - If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date for it — even if the description mentions a holiday or named event. Either omit the date or use a phrase like "no confirmed date yet". Do NOT translate "Mother's Day", "the weekend", or similar phrases into specific calendar dates yourself.
 - When two future-dated items appear in the same brief, do NOT characterize the gap between them with a relative-duration phrase like "two weeks later", "a month later", "a few days after", or "soon after". The dates already convey the timing, and these phrases frequently miscount (May 20 → May 28 is eight days, not two weeks). Use "the following" or "and another" for sequential framing, or just let the dates stand on their own.
-- Do NOT compute or state any day-count, week-count, or other relative-time quantity for a signal — none. This blocks the entire category, not specific phrasings. Forbidden examples: "in five days", "five days away", "five days from now", "in a few days", "next week", "in about two weeks", "a week out", "a couple of weeks away". You consistently miscount these — May 14 to May 20 is six days, not five. The day-and-date phrase ("Wednesday, May 20") is the ONLY way to convey when something is due. Exception: "today" and "tomorrow" are safe because the ETA's friendly field surfaces those directly when applicable — do not compute them yourself otherwise.`;
+- The ETA friendly field includes an authoritative day-count phrase in parentheses like "(in 6 days)", "(today)", or "(tomorrow)". If you want to convey how soon something is, lift that phrase VERBATIM — do not paraphrase ("five days away", "a week out", "in less than a week") and do not recompute. NEVER state any other day-count, week-count, or relative duration: no "two weeks later", no "five days to renew", no "in about two weeks", no "soon after". The lifted parenthesized phrase and the day-and-date are the ONLY ways to convey timing. If you find yourself reaching for any other duration phrasing, drop it — the date alone is enough.`;
 
     // First-run is handled by an early-return branch above; this path is
     // always the steady-state pipeline.
