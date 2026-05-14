@@ -17,6 +17,12 @@ const qstash = process.env.QSTASH_TOKEN
 
 const WORKER_URL = "https://conductor-ivory.vercel.app/api/onboard-worker";
 
+// emails, calendar, vault, crew run in parallel as independent QStash
+// messages. horizon depends on vault's output (it reads :vault) and is
+// chained by the worker on vault completion — see onboard-worker.js.
+const PARALLEL_JOBS = ["emails", "calendar", "vault", "crew"];
+const ALL_JOBS = [...PARALLEL_JOBS, "horizon"];
+
 async function resolveHouseholdId(userId) {
   const hid = await redis.get(`user:${userId}:household`);
   return hid || userId;
@@ -28,6 +34,40 @@ function safeJson(v) {
   try { return JSON.parse(v); } catch { return null; }
 }
 
+// Reassembles the JSON shape the mobile app expects from the
+// hash-backed storage. Field keys are flat ("state", "startedAt",
+// "job:emails", ...) so each per-job HSET is atomic without racing
+// other jobs' writes.
+async function readStatus(householdId) {
+  let hash;
+  try {
+    hash = await redis.hgetall(`household:${householdId}:onboardStatus`);
+  } catch (err) {
+    // Pre-deploy keys were stored as JSON strings. HGETALL on a string
+    // surfaces as WRONGTYPE — fall back to GET + parse so the status
+    // poll keeps working until the next onboard rewrites the key as a
+    // hash (POST below DELs before HSET).
+    if (String(err?.message || "").includes("WRONGTYPE")) {
+      const raw = await redis.get(`household:${householdId}:onboardStatus`);
+      return safeJson(raw);
+    }
+    throw err;
+  }
+  if (!hash || Object.keys(hash).length === 0) return null;
+  const out = {
+    state: hash.state || "unknown",
+    jobs: {},
+  };
+  if (hash.startedAt) out.startedAt = parseInt(hash.startedAt, 10);
+  if (hash.finishedAt) out.finishedAt = parseInt(hash.finishedAt, 10);
+  if (hash.summary) out.summary = safeJson(hash.summary);
+  for (const name of ALL_JOBS) {
+    const raw = hash[`job:${name}`];
+    if (raw) out.jobs[name] = safeJson(raw);
+  }
+  return out;
+}
+
 export const config = { maxDuration: 30 };
 
 export default async function handler(req, res) {
@@ -36,7 +76,7 @@ export default async function handler(req, res) {
     const { userId } = req.query;
     if (!userId) return res.status(400).json({ error: "Missing userId" });
     const householdId = await resolveHouseholdId(userId);
-    const status = safeJson(await redis.get(`household:${householdId}:onboardStatus`));
+    const status = await readStatus(householdId);
     return res.status(200).json({ householdId, status });
   }
 
@@ -50,25 +90,33 @@ export default async function handler(req, res) {
   try {
     const householdId = await resolveHouseholdId(userId);
 
-    const initialStatus = {
+    // Wipe any prior status (which may be in the old JSON-string shape)
+    // and write fresh hash fields. All five jobs start as "pending"; the
+    // four parallel jobs flip to "running" when QStash delivers their
+    // message, horizon stays "pending" until vault enqueues it.
+    const statusKey = `household:${householdId}:onboardStatus`;
+    await redis.del(statusKey);
+    const initialFields = {
       state: "queued",
-      startedAt: Date.now(),
-      jobs: {
-        emails: { state: "pending" },
-        calendar: { state: "pending" },
-        horizon: { state: "pending" },
-      },
+      startedAt: String(Date.now()),
     };
-    await redis.set(`household:${householdId}:onboardStatus`, JSON.stringify(initialStatus));
+    for (const job of ALL_JOBS) {
+      initialFields[`job:${job}`] = JSON.stringify({ state: "pending" });
+    }
+    await redis.hset(statusKey, initialFields);
 
     let queueMode = "direct";
     if (qstash) {
       try {
-        await qstash.publishJSON({
-          url: WORKER_URL,
-          body: { userId, householdId },
-          retries: 1,
-        });
+        await Promise.all(
+          PARALLEL_JOBS.map((job) =>
+            qstash.publishJSON({
+              url: WORKER_URL,
+              body: { userId, householdId, job },
+              retries: 1,
+            })
+          )
+        );
         queueMode = "qstash";
       } catch (qErr) {
         console.error("QStash publish failed, falling back to direct fetch:", qErr.message);
@@ -77,13 +125,15 @@ export default async function handler(req, res) {
     }
 
     if (queueMode === "direct") {
-      // Fallback: direct fire-and-forget. The worker is a fresh invocation, so
-      // it gets its own 60s budget regardless of this function's response.
-      fetch(WORKER_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ userId, householdId }),
-      }).catch(() => {});
+      // Fallback: 4 parallel fire-and-forget invocations. Each worker
+      // invocation is a fresh function with its own 60s budget.
+      for (const job of PARALLEL_JOBS) {
+        fetch(WORKER_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ userId, householdId, job }),
+        }).catch(() => {});
+      }
     }
 
     return res.status(200).json({ status: "processing", householdId, queueMode });

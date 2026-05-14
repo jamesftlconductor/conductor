@@ -1,11 +1,20 @@
 import { Redis } from "@upstash/redis";
-import { Receiver } from "@upstash/qstash";
+import { Client, Receiver } from "@upstash/qstash";
 import { getValidToken } from "./refresh.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
+
+const qstash = process.env.QSTASH_TOKEN
+  ? new Client({
+      token: process.env.QSTASH_TOKEN,
+      ...(process.env.QSTASH_URL ? { baseUrl: process.env.QSTASH_URL } : {}),
+    })
+  : null;
+
+const WORKER_URL = "https://conductor-ivory.vercel.app/api/onboard-worker";
 
 // QStash signature verification — only enforced if signing keys are configured.
 const receiver =
@@ -23,6 +32,9 @@ export const config = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+const ALL_JOBS = ["emails", "calendar", "vault", "crew", "horizon"];
+const TERMINAL_STATES = new Set(["complete", "failed", "skipped"]);
 
 // ---------- helpers ----------
 
@@ -50,21 +62,95 @@ function safeParseJsonText(text) {
   try { return JSON.parse(cleaned); } catch { return null; }
 }
 
+// Status is stored as a Redis hash with flat fields: `state`, `startedAt`,
+// `finishedAt`, `summary`, plus one `job:<name>` field per job carrying that
+// job's serialised state. Each job only writes its own `job:<name>` field,
+// so concurrent per-job HSETs from parallel QStash invocations don't race
+// with each other.
+const statusKey = (hid) => `household:${hid}:onboardStatus`;
+
 async function patchStatus(householdId, partial) {
-  const current = safeJson(await redis.get(`household:${householdId}:onboardStatus`)) || { jobs: {} };
-  const updated = {
-    ...current,
-    ...partial,
-    jobs: { ...(current.jobs || {}), ...(partial.jobs || {}) },
-  };
-  await redis.set(`household:${householdId}:onboardStatus`, JSON.stringify(updated));
+  const update = {};
+  for (const [k, v] of Object.entries(partial)) {
+    if (k === "jobs") continue;
+    update[k] = typeof v === "object" ? JSON.stringify(v) : String(v);
+  }
+  if (Object.keys(update).length > 0) {
+    await redis.hset(statusKey(householdId), update);
+  }
+  if (partial.jobs) {
+    for (const [name, jobUpdate] of Object.entries(partial.jobs)) {
+      await patchJob(householdId, name, jobUpdate);
+    }
+  }
 }
 
 async function patchJob(householdId, jobName, jobUpdate) {
-  const current = safeJson(await redis.get(`household:${householdId}:onboardStatus`)) || { jobs: {} };
-  const job = current.jobs?.[jobName] || {};
-  current.jobs = { ...(current.jobs || {}), [jobName]: { ...job, ...jobUpdate } };
-  await redis.set(`household:${householdId}:onboardStatus`, JSON.stringify(current));
+  const field = `job:${jobName}`;
+  const current = safeJson(await redis.hget(statusKey(householdId), field)) || {};
+  const merged = { ...current, ...jobUpdate };
+  await redis.hset(statusKey(householdId), { [field]: JSON.stringify(merged) });
+}
+
+async function readJobStates(householdId) {
+  const hash = await redis.hgetall(statusKey(householdId));
+  if (!hash) return {};
+  const jobs = {};
+  for (const name of ALL_JOBS) {
+    const raw = hash[`job:${name}`];
+    jobs[name] = raw ? safeJson(raw) : null;
+  }
+  return { jobs, top: hash };
+}
+
+// Called after each job completes (or fails). If every job has reached a
+// terminal state, flip the top-level `state` to "complete" and write the
+// aggregate summary. Idempotent — multiple concurrent calls converge.
+async function maybeFinalize(householdId) {
+  const { jobs, top } = await readJobStates(householdId);
+  if (!jobs) return;
+  const allDone = ALL_JOBS.every((n) => jobs[n] && TERMINAL_STATES.has(jobs[n].state));
+  if (!allDone) return;
+  if (top.state === "complete") return;
+  await redis.hset(statusKey(householdId), {
+    state: "complete",
+    finishedAt: String(Date.now()),
+    summary: JSON.stringify({
+      emailsProcessed: jobs.emails?.processed || 0,
+      deadlinesFound: jobs.emails?.deadlines || 0,
+      signalsFound: jobs.emails?.signals || 0,
+      patternsFound: (jobs.emails?.patterns || 0) + (jobs.calendar?.patternsAdded || 0),
+      calendarEventsProcessed: jobs.calendar?.classified || 0,
+      vaultProcessed: jobs.vault?.processed || 0,
+      vaultKept: jobs.vault?.kept || 0,
+      crewProcessed: jobs.crew?.processed || 0,
+      crewMembers: jobs.crew?.members || 0,
+      horizonSignal: jobs.horizon?.selected || null,
+    }),
+  });
+}
+
+// Enqueue a single job. Mirrors the fan-out logic in api/onboard.js: prefer
+// QStash, fall back to direct fire-and-forget if QStash isn't configured or
+// publish fails. Used by the vault job to chain horizon on success.
+async function enqueueJob({ userId, householdId, job }) {
+  if (qstash) {
+    try {
+      await qstash.publishJSON({
+        url: WORKER_URL,
+        body: { userId, householdId, job },
+        retries: 1,
+      });
+      return;
+    } catch (qErr) {
+      console.error(`QStash publish for ${job} failed, falling back to direct fetch:`, qErr.message);
+    }
+  }
+  fetch(WORKER_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ userId, householdId, job }),
+  }).catch(() => {});
 }
 
 // Domains that are essentially always personal accounts. A primary
@@ -1269,6 +1355,11 @@ async function runHorizonJob(householdId) {
 
 // ---------- Handler ----------
 
+// Per-job dispatcher. /api/onboard fans out 4 parallel QStash messages
+// (emails, calendar, vault, crew). horizon is chained off vault here so
+// it runs after :vault is populated. Each invocation gets its own 60s
+// budget — the 5-jobs-in-60s squeeze of the prior monolithic handler is
+// gone.
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -1292,70 +1383,51 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Invalid body" });
   }
 
-  const { userId, householdId } = body;
+  const { userId, householdId, job } = body;
   if (!userId || !householdId) {
     return res.status(400).json({ error: "Missing userId or householdId" });
   }
-
-  await patchStatus(householdId, { state: "running" });
-
-  // Each job runs independently — failure of one doesn't stop the others.
-  let emailResult = null;
-  try {
-    emailResult = await runEmailJob(userId, householdId);
-  } catch (err) {
-    console.error("Email job failed:", err);
-    await patchJob(householdId, "emails", { state: "failed", error: err.message });
+  if (!job || !ALL_JOBS.includes(job)) {
+    return res.status(400).json({ error: "Missing or invalid job" });
   }
 
-  let calendarResult = null;
+  // Top-level state flips to "running" on the first per-job invocation.
+  // Idempotent — repeated HSET is fine.
+  await redis.hset(statusKey(householdId), { state: "running" });
+
+  let failed = false;
   try {
-    calendarResult = await runCalendarJob(userId, householdId);
+    if (job === "emails") await runEmailJob(userId, householdId);
+    else if (job === "calendar") await runCalendarJob(userId, householdId);
+    else if (job === "vault") await runVaultJob(userId, householdId);
+    else if (job === "crew") await runCrewJob(userId, householdId);
+    else if (job === "horizon") await runHorizonJob(householdId);
   } catch (err) {
-    console.error("Calendar job failed:", err);
-    await patchJob(householdId, "calendar", { state: "failed", error: err.message });
+    console.error(`${job} job failed:`, err);
+    await patchJob(householdId, job, {
+      state: "failed",
+      error: err.message,
+      finishedAt: Date.now(),
+    });
+    failed = true;
   }
 
-  let vaultResult = null;
-  try {
-    vaultResult = await runVaultJob(userId, householdId);
-  } catch (err) {
-    console.error("Vault job failed:", err);
-    await patchJob(householdId, "vault", { state: "failed", error: err.message });
+  // Chain horizon after vault: on success enqueue it, on failure mark it
+  // skipped so the overall onboard can still finalize. Horizon reads
+  // :vault, so it must not run if vault didn't populate.
+  if (job === "vault") {
+    if (failed) {
+      await patchJob(householdId, "horizon", {
+        state: "skipped",
+        reason: "vault failed",
+        finishedAt: Date.now(),
+      });
+    } else {
+      await enqueueJob({ userId, householdId, job: "horizon" });
+    }
   }
 
-  let crewResult = null;
-  try {
-    crewResult = await runCrewJob(userId, householdId);
-  } catch (err) {
-    console.error("Crew job failed:", err);
-    await patchJob(householdId, "crew", { state: "failed", error: err.message });
-  }
+  await maybeFinalize(householdId);
 
-  let horizonResult = null;
-  try {
-    horizonResult = await runHorizonJob(householdId);
-  } catch (err) {
-    console.error("Horizon job failed:", err);
-    await patchJob(householdId, "horizon", { state: "failed", error: err.message });
-  }
-
-  await patchStatus(householdId, {
-    state: "complete",
-    finishedAt: Date.now(),
-    summary: {
-      emailsProcessed: emailResult?.processed || 0,
-      deadlinesFound: emailResult?.deadlines || 0,
-      signalsFound: emailResult?.signals || 0,
-      patternsFound: (emailResult?.patterns || 0) + (calendarResult?.patterns || 0),
-      calendarEventsProcessed: calendarResult?.classified || 0,
-      vaultProcessed: vaultResult?.processed || 0,
-      vaultKept: vaultResult?.kept || 0,
-      crewProcessed: crewResult?.processed || 0,
-      crewMembers: crewResult?.members || 0,
-      horizonSignal: horizonResult,
-    },
-  });
-
-  return res.status(200).json({ ok: true });
+  return res.status(200).json({ ok: true, job });
 }
