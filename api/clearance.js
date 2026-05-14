@@ -198,7 +198,8 @@ async function buildHouseholdNameMap(redis, householdId, requestingUserId) {
   return map;
 }
 
-function ownershipTag(item, requestingUserId, nameMap) {
+function ownershipTag(item, requestingUserId, nameMap, isSingleMember = false) {
+  if (isSingleMember) return "YOURS";
   if (!item || !item.userId) return "HOUSEHOLD";
   if (item.userId === requestingUserId) return "YOURS";
   const firstName = nameMap.get(item.userId);
@@ -283,6 +284,7 @@ export default async function handler(req, res) {
       rawMorningBriefed,
       householdNameMap,
       rawFeedbackStats,
+      rawMembers,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: returns a merged event array (or [] when empty),
@@ -296,7 +298,11 @@ export default async function handler(req, res) {
       redis.hgetall(`household:${householdId}:morningBriefed`),
       buildHouseholdNameMap(redis, householdId, userId),
       redis.hgetall(`household:${householdId}:feedbackStats`),
+      // Single-member households collapse all ownership tags to YOURS;
+      // mirrors the brief.js path.
+      redis.smembers(`household:${householdId}:members`),
     ]);
+    const isSingleMember = (rawMembers || []).length <= 1;
 
     const signals = (rawSignals || []).map(s => typeof s === "string" ? JSON.parse(s) : s);
     const briefedIds = new Set((rawBriefed || []).map(s => String(s)));
@@ -473,7 +479,7 @@ export default async function handler(req, res) {
     // Resolve raw timestamps server-side so Claude never has to compute day-of-week
     // or date arithmetic. The model just lifts the friendly string into the prose.
     const fmt = s => {
-      const owner = `[${ownershipTag(s, userId, householdNameMap)}]`;
+      const owner = `[${ownershipTag(s, userId, householdNameMap, isSingleMember)}]`;
       if (s._isDeadline) {
         return `- ${owner} [DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
       }
@@ -493,7 +499,7 @@ export default async function handler(req, res) {
 
     const tomorrowSummary = tomorrowEvents
       .map(e => {
-        const owner = `[${ownershipTag(e, userId, householdNameMap)}]`;
+        const owner = `[${ownershipTag(e, userId, householdNameMap, isSingleMember)}]`;
         const friendly = friendlyDateTime(e.start);
         const when = friendly || (e.start ? `raw: ${e.start}` : "Unknown");
         return `- ${owner} ${e.title} | ${when}`;
@@ -562,7 +568,9 @@ Rules:
 - Skip signals with no useful information
 - Tone: reflective, closing the day, like a thought ${userName} was already having as the evening settles
 - Feedback tuning: the FEEDBACK HISTORY counts reflect how prior briefs landed. If clearance thumbs-down significantly outnumbers clearance thumbs-up, be more concise and specific — trim discretionary sentences. If thumbs-up is high or both counts are low, maintain current voice. Never reference the feedback in the output.
-- Ownership tags: every signal, deadline, and event is prefixed [YOURS], [NAME'S] (a household member), or [HOUSEHOLD]. When the tag is [YOURS], speak in second person — "your spray tan tonight." When it's [NAME'S], use that person's first name naturally — "Sarah's spray tan went well." When it's [HOUSEHOLD], use neutral framing. NEVER include the bracket tags in the brief output — they're routing metadata.
+${isSingleMember
+  ? `- This is a single-person household. Always use "you" and "your" throughout. Never refer to any other household member by name. All signals belong to you. The bracket tag will always be [YOURS] — never include the bracket tag in the brief output.`
+  : `- Ownership tags: every signal, deadline, and event is prefixed [YOURS], [NAME'S] (a household member), or [HOUSEHOLD]. When the tag is [YOURS], speak in second person — "your spray tan tonight." When it's [NAME'S], use that person's first name naturally — "Sarah's spray tan went well." When it's [HOUSEHOLD], use neutral framing. NEVER include the bracket tags in the brief output — they're routing metadata.`}
 - Never say "here is your brief" or use assistant language
 - Never reference your own process, scanning, monitoring, or pipeline
 - Never say you are looking for signals, watching for signals, or running sweeps
@@ -666,7 +674,7 @@ Rules:
       await redis.expire(clearanceBriefedKey, 14 * 60 * 60);
     }
 
-    return res.status(200).json({ brief, segments, transparency, household: householdId, user: userName });
+    return res.status(200).json({ brief, segments, transparency, household: householdId, user: userName, isSingleMember });
 
   } catch (error) {
     console.error("Clearance error:", error);

@@ -343,8 +343,10 @@ async function buildHouseholdNameMap(redis, householdId, requestingUserId) {
 // Returns the bracket tag for a signal/event/deadline based on its userId
 // field. The requesting user's own signals get YOURS; another household
 // member's get their first name; missing or unknown userIds fall back to
-// HOUSEHOLD so Claude can choose neutral framing.
-function ownershipTag(item, requestingUserId, nameMap) {
+// HOUSEHOLD so Claude can choose neutral framing. Single-member
+// households collapse every tag to YOURS since there is no one else.
+function ownershipTag(item, requestingUserId, nameMap, isSingleMember = false) {
+  if (isSingleMember) return "YOURS";
   if (!item || !item.userId) return "HOUSEHOLD";
   if (item.userId === requestingUserId) return "YOURS";
   const firstName = nameMap.get(item.userId);
@@ -662,6 +664,7 @@ export default async function handler(req, res) {
       rawFeedbackStats,
       fetchedWeather,
       rawCrew,
+      rawMembers,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: merges per-user calendar slices, falls back to
@@ -690,7 +693,13 @@ export default async function handler(req, res) {
       // by the onboard worker's Job 4. Filter for today/tomorrow
       // events happens after parse, downstream.
       redis.get(`household:${householdId}:crew`),
+      // Single-member households get a stripped-down ownership model:
+      // all signals tag as YOURS and the prompt strips the multi-owner
+      // narration rules. Avoids stilted "the household" framing when
+      // there is only one person to address.
+      redis.smembers(`household:${householdId}:members`),
     ]);
+    const isSingleMember = (rawMembers || []).length <= 1;
 
     // Test override: ?testWeatherCode=N&testWeatherTemp=N replaces the
     // fetched weather with a synthetic value. Used to verify weather
@@ -938,12 +947,12 @@ export default async function handler(req, res) {
             description: s.description,
             eta: s.eta,
             status: s.status,
-            owner: ownershipTag(s, userId, householdNameMap),
+            owner: ownershipTag(s, userId, householdNameMap, isSingleMember),
           })),
           events: matchingEvents.map((e) => ({
             title: e.title,
             start: e.start,
-            owner: ownershipTag(e, userId, householdNameMap),
+            owner: ownershipTag(e, userId, householdNameMap, isSingleMember),
           })),
         };
       }
@@ -1041,14 +1050,14 @@ export default async function handler(req, res) {
     };
 
     const formatSignal = (s) => {
-      const owner = `[${ownershipTag(s, userId, householdNameMap)}]`;
+      const owner = `[${ownershipTag(s, userId, householdNameMap, isSingleMember)}]`;
       if (s._isDeadline) {
         return `- ${owner} [DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
       }
       return `- ${owner} ${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}`;
     };
     const formatEvent = (e) => {
-      const owner = `[${ownershipTag(e, userId, householdNameMap)}]`;
+      const owner = `[${ownershipTag(e, userId, householdNameMap, isSingleMember)}]`;
       const friendly = friendlyDateTime(e.start);
       const when = friendly || (e.start ? `raw: ${e.start}` : "Unknown");
       return `- ${owner} ${e.title || "Untitled"} | ${when}`;
@@ -1153,7 +1162,9 @@ export default async function handler(req, res) {
 - Plain text only, no markdown.
 - Do not begin with date or header.
 - Personalize to ${userName}.
-- Ownership tags: every item is prefixed [YOURS], [NAME'S], or [HOUSEHOLD]. Use "you" for [YOURS], the named person for [NAME'S], household framing for [HOUSEHOLD]. NEVER include the bracket tags in the brief.
+${isSingleMember
+  ? `- This is a single-person household. Always use "you" and "your". Never refer to any other household member by name. All signals belong to you. Never include the bracket tag in the brief.`
+  : `- Ownership tags: every item is prefixed [YOURS], [NAME'S], or [HOUSEHOLD]. Use "you" for [YOURS], the named person for [NAME'S], household framing for [HOUSEHOLD]. NEVER include the bracket tags in the brief.`}
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field. NEVER compute or infer a date.
 - If an item's ETA is "Unknown" or missing, do NOT invent or guess a date — even for holidays mentioned in the description.`;
 
@@ -1210,6 +1221,7 @@ export default async function handler(req, res) {
         household: householdId,
         user: userName,
         isFirstRun: true,
+        isSingleMember,
         noSignals,
       });
     }
@@ -1237,8 +1249,10 @@ export default async function handler(req, res) {
               // with Sarah's seeded travel_conflict before this fix.
               // Vault items don't carry userId (household-level), so
               // they fall through to HOUSEHOLD.
-              const owner = c.signal
-                ? ownershipTag(c.signal, userId, householdNameMap)
+              const owner = isSingleMember
+                ? "YOURS"
+                : c.signal
+                ? ownershipTag(c.signal, userId, householdNameMap, isSingleMember)
                 : "HOUSEHOLD";
               const desc =
                 c.signal?.description || c.item?.description || "Unknown";
@@ -1261,7 +1275,8 @@ export default async function handler(req, res) {
                 const collOwner = ownershipTag(
                   c.conflictingSignal,
                   userId,
-                  householdNameMap
+                  householdNameMap,
+                  isSingleMember
                 );
                 return `${base} (collides with: [${collOwner}] ${c.conflictingSignal.description})`;
               }
@@ -1359,7 +1374,9 @@ export default async function handler(req, res) {
 - Plain text only, no markdown
 - Do not begin with date or header
 - Personalize to ${userName} — use "you" naturally
-- Ownership tags: every signal, deadline, and calendar event is prefixed with [YOURS], a household member's name in the form [NAME'S], or [HOUSEHOLD]. When the tag is [YOURS], speak in second person — "your spray tan tonight." When it's [SARAH'S] (or any other name), use that person's first name naturally — "Sarah has a spray tan tonight." When it's [HOUSEHOLD], use neutral household framing — "the vehicle registration renewal is due Wednesday." Flagged-categories signals carry an "owner" field with the same possible values; treat it identically. NEVER include the bracket tags or the literal word "owner" in the brief — they're routing metadata.
+${isSingleMember
+  ? `- This is a single-person household. Always use "you" and "your" throughout. Never refer to any other household member by name. All signals belong to you. The bracket tag will always be [YOURS] — never include the bracket tag in the brief.`
+  : `- Ownership tags: every signal, deadline, and calendar event is prefixed with [YOURS], a household member's name in the form [NAME'S], or [HOUSEHOLD]. When the tag is [YOURS], speak in second person — "your spray tan tonight." When it's [SARAH'S] (or any other name), use that person's first name naturally — "Sarah has a spray tan tonight." When it's [HOUSEHOLD], use neutral household framing — "the vehicle registration renewal is due Wednesday." Flagged-categories signals carry an "owner" field with the same possible values; treat it identically. NEVER include the bracket tags or the literal word "owner" in the brief — they're routing metadata.`}
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field (e.g., "Sunday, May 10"). NEVER compute, infer, or recalculate a day-of-week or date — the resolved string is authoritative. Ignore the "raw:" portion. Drop the year unless it differs from the current year.
 - If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date for it — even if the description mentions a holiday or named event. Either omit the date or use a phrase like "no confirmed date yet". Do NOT translate "Mother's Day", "the weekend", or similar phrases into specific calendar dates yourself.`;
 
@@ -1485,6 +1502,7 @@ export default async function handler(req, res) {
       household: householdId,
       user: userName,
       isFirstRun,
+      isSingleMember,
     });
   } catch (error) {
     console.error("Brief error:", error);
