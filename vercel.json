@@ -10,7 +10,7 @@
     },
     {
       "path": "/api/notify?type=takeoff",
-      "schedule": "0 12 * * *"
+      "schedule": "0 11 * * *"
     },
     {
       "path": "/api/notify?type=clearance",
