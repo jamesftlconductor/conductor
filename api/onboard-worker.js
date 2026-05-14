@@ -560,33 +560,167 @@ Return only the JSON object.`,
 // into household:{id}:vault. The horizon job (run after this) consumes
 // :vault rather than :deadlines.
 
-async function runVaultJob(userId, householdId) {
-  await patchJob(householdId, "vault", { state: "running", startedAt: Date.now() });
+// Five specialized passes replace the previous single broad sweep. Each
+// pass targets a vertical (insurance, subscriptions, prescriptions/medical,
+// warranties, registrations/legal) with its own Gmail query and a tailored
+// Claude prompt that asks for vertical-specific fields (subtype, policy
+// number, frequency, etc.) on top of the shared schema. Passes run in
+// parallel via Promise.all; cross-pass dedup runs after all returns.
+//
+// The narrow queries trade recall for precision: each pass surfaces a
+// smaller, more focused result set, and the prompts can be more confident
+// about the expected shape — fewer "is this a real renewal or just a
+// marketing email" judgment calls per pass.
 
-  const accessToken = await getValidToken(userId);
-  const twelveMonthsAgo = Math.floor((Date.now() - 365 * DAY_MS) / 1000);
+const VAULT_PASSES = [
+  {
+    key: "insurance",
+    query:
+      `subject:(insurance OR "policy renewal" OR "policy number" OR premium OR ` +
+      `"coverage" OR "State Farm" OR "Allstate" OR "Progressive" OR "Geico" OR ` +
+      `"Aetna" OR "Blue Cross" OR "United Health" OR "Cigna" OR "Delta Dental" OR ` +
+      `"MetLife" OR "coverage effective" OR "premium due" OR "policy anniversary")`,
+    instructions: `Extract insurance policy information. Return JSON or null:
+{ "category": "insurance", "subtype": "auto|home|health|dental|vision|life|renters|other", "description": "specific policy description", "provider": "company name", "renewalDate": "YYYY-MM-DD or null", "amount": "annual premium if known or null", "policyNumber": "if visible or null", "consequence": "what lapses if missed", "confidence": "high|medium|low" }
+Only return if renewal date is in the future or within 60 days past. Return null if purely promotional.`,
+  },
+  {
+    key: "subscriptions",
+    query:
+      `subject:("subscription renewal" OR "your subscription" OR "annual plan" OR ` +
+      `"monthly plan" OR "auto-renews" OR "billing date" OR "next charge" OR ` +
+      `"membership renewal" OR "Amazon Prime" OR "Netflix" OR "Spotify" OR "Hulu" OR ` +
+      `"Apple" OR "Disney" OR "membership fee" OR "annual fee")`,
+    instructions: `Extract subscription or membership renewal. Return JSON or null:
+{ "category": "subscription", "subtype": "streaming|software|membership|service|other", "description": "what this subscription is for", "provider": "company name", "renewalDate": "YYYY-MM-DD or null", "amount": "monthly or annual cost if known or null", "frequency": "monthly|annual|other", "consequence": "service stops or auto-charges", "confidence": "high|medium|low" }
+Only return if this is a real subscription with a renewal date, not a promotional offer. Return null if promotional.`,
+  },
+  {
+    key: "medical",
+    query:
+      `subject:(prescription OR "refill" OR "days supply" OR pharmacy OR ` +
+      `"medication ready" OR "prescription ready" OR "your prescription" OR CVS OR ` +
+      `Walgreens OR "Rite Aid" OR "health benefits" OR FSA OR HSA OR ` +
+      `"open enrollment" OR "benefits expire" OR "use it or lose it")`,
+    instructions: `Extract prescription or medical benefit information. Return JSON or null:
+{ "category": "medical", "subtype": "prescription|FSA|HSA|benefits|appointment|other", "description": "medication name or benefit type", "provider": "pharmacy or insurer name", "renewalDate": "YYYY-MM-DD — next refill date or benefit expiry or null", "amount": "cost if known or null", "consequence": "runs out or expires or lapses", "confidence": "high|medium|low" }
+Return null if purely promotional or no actionable date.`,
+  },
+  {
+    key: "warranties",
+    query:
+      `subject:(warranty OR "AppleCare" OR "extended warranty" OR "protection plan" OR ` +
+      `"service contract" OR "warranty registration" OR "warranty expires" OR ` +
+      `"coverage plan" OR "product protection")`,
+    instructions: `Extract warranty or service contract information. Return JSON or null:
+{ "category": "warranty", "subtype": "electronics|appliance|vehicle|home|other", "description": "what is covered", "provider": "warranty provider name", "renewalDate": "YYYY-MM-DD — expiry date or null", "amount": "cost if known or null", "consequence": "no coverage if expires", "confidence": "high|medium|low" }
+Return null if no expiry date found or purely promotional.`,
+  },
+  {
+    key: "registrations",
+    query:
+      `subject:(registration OR "license renewal" OR "passport" OR ` +
+      `"vehicle registration" OR "drivers license" OR "business license" OR "permit" OR ` +
+      `"lease renewal" OR "lease expires" OR "lease ends" OR "domain renewal" OR ` +
+      `"expires" OR "expiration notice")`,
+    instructions: `Extract registration, license, or legal document expiration. Return JSON or null:
+{ "category": "registration", "subtype": "vehicle|drivers_license|passport|lease|domain|business|other", "description": "what needs renewing", "provider": "issuing authority or company", "renewalDate": "YYYY-MM-DD or null", "amount": "fee if known or null", "consequence": "lapses or illegal or service stops", "confidence": "high|medium|low" }
+Return null if no clear expiry date or purely informational.`,
+  },
+];
 
-  const query =
-    `after:${twelveMonthsAgo} subject:(insurance OR registration OR renewal OR expires OR ` +
-    `expiration OR warranty OR lease OR subscription OR license OR passport OR membership OR ` +
-    `"due date" OR "renew by" OR "expires on" OR "annual fee" OR "auto-renew")`;
+// "How rich is this item" for tie-breaking when descriptions match
+// within Rule B's 7-day window. Confidence is broken out separately
+// (Rule A uses it directly).
+function vaultInfoDensity(item) {
+  let n = 0;
+  if (item.description) n++;
+  if (item.provider) n++;
+  if (item.renewalDate) n++;
+  if (item.amount) n++;
+  if (item.consequence) n++;
+  if (item.policyNumber) n++;
+  if (item.frequency) n++;
+  if (item.subtype) n++;
+  return n;
+}
 
-  const messageIds = await gmailSearch(accessToken, query, 100).catch(() => []);
-  await patchJob(householdId, "vault", { found: messageIds.length });
+function vaultConfidenceRank(c) {
+  if (c === "high") return 3;
+  if (c === "medium") return 2;
+  if (c === "low") return 1;
+  return 0;
+}
 
-  if (messageIds.length === 0) {
-    await patchJob(householdId, "vault", {
-      state: "complete",
-      finishedAt: Date.now(),
-      processed: 0,
-      kept: 0,
-      dropped: 0,
-    });
-    return { processed: 0, kept: 0 };
+// Cross-pass dedup. Two rules per spec:
+//   A. Same provider + subtype + renewalDate within 30 days → keep higher
+//      confidence.
+//   B. Same description + renewalDate within 7 days → keep richer (info
+//      density count).
+// Greedy: walk the input list once; for each item, check it against
+// already-kept items. On match, decide which to keep based on the matching
+// rule; the loser is discarded.
+function dedupVaultItemsAcrossPasses(items) {
+  const kept = [];
+  const SEVEN_DAYS_MS = 7 * DAY_MS;
+  const THIRTY_DAYS_MS = 30 * DAY_MS;
+  for (const item of items) {
+    let dupIndex = -1;
+    let dupRule = null;
+    for (let i = 0; i < kept.length; i++) {
+      const ex = kept[i];
+      const itemMs = item.renewalDate ? Date.parse(item.renewalDate) : NaN;
+      const exMs = ex.renewalDate ? Date.parse(ex.renewalDate) : NaN;
+      const datesParseable = !isNaN(itemMs) && !isNaN(exMs);
+
+      // Rule A — provider + subtype + 30-day window
+      const newProvider = (item.provider || "").toLowerCase().trim();
+      const exProvider = (ex.provider || "").toLowerCase().trim();
+      if (
+        newProvider && exProvider && newProvider === exProvider &&
+        item.subtype && ex.subtype && item.subtype === ex.subtype &&
+        datesParseable && Math.abs(itemMs - exMs) <= THIRTY_DAYS_MS
+      ) {
+        dupIndex = i;
+        dupRule = "A";
+        break;
+      }
+
+      // Rule B — same description (case-insensitive) + 7-day window
+      const newDesc = (item.description || "").toLowerCase().trim();
+      const exDesc = (ex.description || "").toLowerCase().trim();
+      if (
+        newDesc && exDesc && newDesc === exDesc &&
+        datesParseable && Math.abs(itemMs - exMs) <= SEVEN_DAYS_MS
+      ) {
+        dupIndex = i;
+        dupRule = "B";
+        break;
+      }
+    }
+
+    if (dupIndex === -1) {
+      kept.push(item);
+    } else {
+      const existing = kept[dupIndex];
+      const newWins = dupRule === "A"
+        ? vaultConfidenceRank(item.confidence) > vaultConfidenceRank(existing.confidence)
+        : vaultInfoDensity(item) > vaultInfoDensity(existing);
+      if (newWins) kept[dupIndex] = item;
+    }
   }
+  return kept;
+}
 
-  // Metadata fetch in parallel chunks of 15 (matches the email-job pattern;
-  // larger chunks risk Gmail per-second quota).
+// Runs one of the five vault passes. Each pass: gmailSearch → metadata fetch
+// → per-email Claude calls in batches of 10. Returns the parsed items array
+// (filtered for parseability + renewalDate present, but NOT yet cross-pass
+// or against-existing dedup'd — that happens in runVaultJob).
+async function runVaultPass(accessToken, pass, afterEpoch) {
+  const query = `after:${afterEpoch} ${pass.query}`;
+  const messageIds = await gmailSearch(accessToken, query, 50).catch(() => []);
+  if (messageIds.length === 0) return { items: [], scanned: 0 };
+
   const headers = [];
   for (let i = 0; i < messageIds.length; i += 15) {
     const chunk = messageIds.slice(i, i + 15);
@@ -597,8 +731,72 @@ async function runVaultJob(userId, householdId) {
   }
   const validHeaders = headers.filter(Boolean);
 
-  // Existing vault descriptions for dedup. Same lowercased-substring overlap
-  // pattern used in the email/deadlines path.
+  const items = [];
+  const PARALLEL = 10;
+  for (let i = 0; i < validHeaders.length; i += PARALLEL) {
+    const batch = validHeaders.slice(i, i + PARALLEL);
+    const parsed = await Promise.all(
+      batch.map(async (e) => {
+        const promptText = `${pass.instructions}
+
+Email:
+Subject: ${e.subject}
+From: ${e.from}
+Date: ${e.date}
+Snippet: ${(e.snippet || "").substring(0, 400)}`;
+        const text = await callClaude(promptText, 300).catch(() => null);
+        return safeParseJsonText(text);
+      })
+    );
+    for (const item of parsed) {
+      if (!item || typeof item !== "object") continue;
+      if (!item.renewalDate) continue;
+      const ms = Date.parse(item.renewalDate);
+      // Match the most permissive prompt's window (insurance: 60 days
+      // past). Items past that are universally stale enough to drop
+      // server-side regardless of which pass surfaced them.
+      if (isNaN(ms) || ms < Date.now() - 60 * DAY_MS) continue;
+      items.push(item);
+    }
+  }
+  return { items, scanned: validHeaders.length };
+}
+
+async function runVaultJob(userId, householdId) {
+  await patchJob(householdId, "vault", { state: "running", startedAt: Date.now() });
+
+  const accessToken = await getValidToken(userId);
+  const twelveMonthsAgo = Math.floor((Date.now() - 365 * DAY_MS) / 1000);
+
+  // Fire all five passes in parallel. Per-pass errors fall through to []
+  // so one bad query doesn't blow up the whole job.
+  const passResults = await Promise.all(
+    VAULT_PASSES.map((pass) =>
+      runVaultPass(accessToken, pass, twelveMonthsAgo).catch((err) => {
+        console.warn(`Vault pass ${pass.key} failed:`, err.message);
+        return { items: [], scanned: 0 };
+      })
+    )
+  );
+
+  // Per-pass visibility for the onboard-status dashboard.
+  const passCounts = VAULT_PASSES.map((p, i) => ({
+    key: p.key,
+    scanned: passResults[i].scanned,
+    extracted: passResults[i].items.length,
+  }));
+  await patchJob(householdId, "vault", { passCounts });
+
+  // Cross-pass dedup before checking against the existing vault. Items
+  // that overlap between passes (e.g., a State Farm policy renewal email
+  // that hits both INSURANCE and REGISTRATIONS subject filters) collapse
+  // to one record here.
+  const allItems = passResults.flatMap((r) => r.items);
+  const crossDedup = dedupVaultItemsAcrossPasses(allItems);
+
+  // Against-existing dedup: same lowercased-substring overlap pattern
+  // used previously. Catches re-imports of the same renewal email across
+  // onboard runs.
   const existingRaw = await redis.lrange(`household:${householdId}:vault`, 0, -1);
   const existingDescriptions = new Set(
     existingRaw
@@ -618,81 +816,40 @@ async function runVaultJob(userId, householdId) {
     return false;
   }
 
-  let processed = 0;
   let kept = 0;
-  let dropped = 0;
-  const PARALLEL = 10;
+  for (const item of crossDedup) {
+    const desc = (item.description || "").toLowerCase().trim();
+    if (isDuplicateDescription(desc)) continue;
+    existingDescriptions.add(desc);
 
-  for (let i = 0; i < validHeaders.length; i += PARALLEL) {
-    const batch = validHeaders.slice(i, i + PARALLEL);
-    const items = await Promise.all(
-      batch.map(async (e) => {
-        const text = await callClaude(
-          `Extract any deadline, renewal, or expiration from this email. Return ONLY a JSON object or null if nothing found:
-{
-  "category": "insurance" | "registration" | "subscription" | "lease" | "warranty" | "medical" | "financial" | "legal" | "membership" | "other",
-  "description": "what this is",
-  "provider": "company or organization name",
-  "renewalDate": "YYYY-MM-DD or null",
-  "amount": "dollar amount per year if known or null",
-  "consequence": "what happens if missed in 5 words or less",
-  "confidence": "high" | "medium" | "low"
-}
-Only return something if there is a clear deadline or renewal date. Return null if this is purely promotional.
-
-Email:
-Subject: ${e.subject}
-From: ${e.from}
-Date: ${e.date}
-Snippet: ${(e.snippet || "").substring(0, 400)}`,
-          300
-        ).catch(() => null);
-        return safeParseJsonText(text);
+    await redis.lpush(
+      `household:${householdId}:vault`,
+      JSON.stringify({
+        id: `vault_${Date.now()}_${kept}`,
+        category: item.category || "other",
+        subtype: item.subtype || null,
+        description: item.description,
+        provider: item.provider || null,
+        renewalDate: item.renewalDate,
+        amount: item.amount || null,
+        policyNumber: item.policyNumber || null,
+        frequency: item.frequency || null,
+        consequence: item.consequence || null,
+        confidence: item.confidence || "low",
+        source: "gmail",
+        foundAt: Date.now(),
       })
     );
-
-    for (const item of items) {
-      processed++;
-      if (!item || typeof item !== "object" || !item.renewalDate) {
-        dropped++;
-        continue;
-      }
-      const renewalMs = Date.parse(item.renewalDate);
-      if (isNaN(renewalMs) || renewalMs < Date.now() - 30 * DAY_MS) {
-        dropped++;
-        continue;
-      }
-      const desc = (item.description || "").toLowerCase().trim();
-      if (isDuplicateDescription(desc)) {
-        dropped++;
-        continue;
-      }
-      existingDescriptions.add(desc);
-
-      await redis.lpush(
-        `household:${householdId}:vault`,
-        JSON.stringify({
-          id: `vault_${Date.now()}_${kept}`,
-          category: item.category || "other",
-          description: item.description,
-          provider: item.provider || null,
-          renewalDate: item.renewalDate,
-          amount: item.amount || null,
-          consequence: item.consequence || null,
-          confidence: item.confidence || "low",
-          source: "gmail",
-          foundAt: Date.now(),
-        })
-      );
-      kept++;
-    }
-
-    await patchJob(householdId, "vault", { processed, kept, dropped });
+    kept++;
   }
+
+  const processed = allItems.length;
+  const dropped = processed - kept;
 
   await patchJob(householdId, "vault", {
     state: "complete",
     finishedAt: Date.now(),
+    passCounts,
     processed,
     kept,
     dropped,
