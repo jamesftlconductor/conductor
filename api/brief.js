@@ -1051,10 +1051,14 @@ export default async function handler(req, res) {
       const target = new Date(d);
       target.setHours(0, 0, 0, 0);
       const n = Math.round((target.getTime() - startOfToday.getTime()) / DAY_MS);
-      if (n < 0) return null;
       if (n === 0) return "today";
       if (n === 1) return "tomorrow";
-      return `in ${n} days`;
+      if (n > 0) return `in ${n} days`;
+      // Past dates: surface explicitly so Claude doesn't frame them as
+      // upcoming. -1 reads naturally as "yesterday" rather than
+      // "already passed 1 day ago".
+      if (n === -1) return "yesterday";
+      return `already passed ${-n} days ago`;
     };
 
     const etaWithFriendly = (raw) => {
@@ -1396,7 +1400,8 @@ ${isSingleMember
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field (e.g., "Sunday, May 10"). NEVER compute, infer, or recalculate a day-of-week or date — the resolved string is authoritative. Ignore the "raw:" portion. Drop the year unless it differs from the current year.
 - If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date for it — even if the description mentions a holiday or named event. Either omit the date or use a phrase like "no confirmed date yet". Do NOT translate "Mother's Day", "the weekend", or similar phrases into specific calendar dates yourself.
 - When two future-dated items appear in the same brief, do NOT characterize the gap between them with a relative-duration phrase like "two weeks later", "a month later", "a few days after", or "soon after". The dates already convey the timing, and these phrases frequently miscount (May 20 → May 28 is eight days, not two weeks). Use "the following" or "and another" for sequential framing, or just let the dates stand on their own.
-- The ETA friendly field includes an authoritative day-count phrase in parentheses like "(in 6 days)", "(today)", or "(tomorrow)". If you want to convey how soon something is, lift that phrase VERBATIM — do not paraphrase ("five days away", "a week out", "in less than a week") and do not recompute. NEVER state any other day-count, week-count, or relative duration: no "two weeks later", no "five days to renew", no "in about two weeks", no "soon after". The lifted parenthesized phrase and the day-and-date are the ONLY ways to convey timing. If you find yourself reaching for any other duration phrasing, drop it — the date alone is enough.`;
+- The ETA friendly field includes an authoritative day-count phrase in parentheses like "(in 6 days)", "(today)", or "(tomorrow)". If you want to convey how soon something is, lift that phrase VERBATIM — do not paraphrase ("five days away", "a week out", "in less than a week") and do not recompute. NEVER state any other day-count, week-count, or relative duration: no "two weeks later", no "five days to renew", no "in about two weeks", no "soon after". The lifted parenthesized phrase and the day-and-date are the ONLY ways to convey timing. If you find yourself reaching for any other duration phrasing, drop it — the date alone is enough.
+- The parenthesized phrase also surfaces past dates as "(yesterday)" or "(already passed N days ago)". Treat these signals as already-happened, NOT upcoming. Never write "looking ahead to..." or "her trip is set for..." or "watch for it as the date approaches" about a past-dated item — those framings are reserved for genuinely future dates. A past-dated signal usually means it's still open or unresolved (e.g., a delivery that never arrived, an appointment that wasn't marked done); if it warrants mention, frame it as a stale-or-outstanding item ("the spray tan from last Thursday hasn't been confirmed resolved", or simply omit). If a past-dated item has no actionable open thread, omit it entirely — do not pad the brief with retrospective recaps.`;
 
     // First-run is handled by an early-return branch above; this path is
     // always the steady-state pipeline.

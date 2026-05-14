@@ -249,10 +249,29 @@ function friendlyDateTime(value) {
   });
 }
 
+const DAY_MS_LOCAL = 24 * 60 * 60 * 1000;
+
+function daysFromTodayPhrase(value) {
+  const d = parseDateLoose(value);
+  if (!d) return null;
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const target = new Date(d);
+  target.setHours(0, 0, 0, 0);
+  const n = Math.round((target.getTime() - startOfToday.getTime()) / DAY_MS_LOCAL);
+  if (n === 0) return "today";
+  if (n === 1) return "tomorrow";
+  if (n > 0) return `in ${n} days`;
+  if (n === -1) return "yesterday";
+  return `already passed ${-n} days ago`;
+}
+
 function etaWithFriendly(raw) {
   if (!raw) return "Unknown";
   const friendly = friendlyDate(raw);
-  return friendly ? `${friendly} (raw: ${raw})` : raw;
+  if (!friendly) return raw;
+  const phrase = daysFromTodayPhrase(raw);
+  return phrase ? `${friendly} (${phrase}) (raw: ${raw})` : `${friendly} (raw: ${raw})`;
 }
 
 export default async function handler(req, res) {
@@ -582,7 +601,9 @@ ${isSingleMember
 - If nothing notable happened or is coming, say so confidently — a quiet day is a real outcome
 - End with something that closes the day — calm, done, ready for tomorrow
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field (e.g., "Sunday, May 10"). NEVER compute, infer, or recalculate a day-of-week or date — the resolved string is authoritative. Ignore the "raw:" portion. Drop the year unless it differs from the current year.
-- If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date for it — even if the description mentions a holiday or named event. Either omit the date or use a phrase like "no confirmed date yet". Do NOT translate "Mother's Day", "the weekend", or similar phrases into specific calendar dates yourself.`,
+- If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date for it — even if the description mentions a holiday or named event. Either omit the date or use a phrase like "no confirmed date yet". Do NOT translate "Mother's Day", "the weekend", or similar phrases into specific calendar dates yourself.
+- The ETA friendly field includes an authoritative parenthesized phrase: "(today)", "(tomorrow)", "(in N days)", "(yesterday)", or "(already passed N days ago)". If you want to convey timing, lift that phrase VERBATIM — do not paraphrase or recompute. Never invent your own day-counts ("five days away", "a week out", "in a few days"); the lifted phrase and the day-and-date are the ONLY ways to convey when something is/was.
+- CRITICAL — past-dated signals: when the parenthesized phrase reads "(yesterday)" or "(already passed N days ago)", that signal is in the past. Never frame it as upcoming. Do NOT write "looking ahead to her trip on Friday, May 1", "her spray tan booked for Thursday, May 7", "watch for it as the date approaches", or similar forward-looking phrasing for past-dated items. A past-dated item usually means it's still open or unresolved (a delivery that never came, an appointment unconfirmed); if it warrants mention, frame it as stale/outstanding ("the spray tan from last Thursday still hasn't been confirmed"). If there's no actionable open thread, omit it entirely — do not pad the brief with retrospective recaps of past dates.`,
         }],
       }),
     });
