@@ -132,6 +132,99 @@ async function fetchEmailMetadata(accessToken, messageId) {
   };
 }
 
+// Strip HTML tags + common entities so a marketing-email body
+// (24KB+ of <meta>/<style>/Outlook conditionals) collapses to its
+// readable text. Without this, the body prefix is all CSS/HTML chrome
+// and Claude gets no usable content in the first 3000 chars.
+function htmlToText(html) {
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&[a-z]+;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Full-body variant for the vault sweep. Walks the MIME tree for
+// text/plain first; falls back to text/html + HTML-strip if that's
+// all the sender provides. Returns both `snippet` (Gmail's
+// content-aware preview, often gold) and `body` (full readable
+// text) so the prompt can use both.
+async function fetchEmailFullBody(accessToken, messageId) {
+  const res = await fetch(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  const data = await res.json();
+  const headers = data.payload?.headers || [];
+  const get = (name) => headers.find((h) => h.name === name)?.value || "";
+
+  // Try text/plain first across both top-level parts and one level of
+  // nesting (multipart/alternative wrappers). Mark the source so we
+  // know whether to strip HTML below.
+  let body = "";
+  let bodyIsHtml = false;
+  const parts = data.payload?.parts || [];
+  for (const part of parts) {
+    if (part.mimeType === "text/plain" && part.body?.data) {
+      body = Buffer.from(part.body.data, "base64").toString("utf-8");
+      break;
+    }
+  }
+  if (!body) {
+    for (const part of parts) {
+      for (const nested of (part.parts || [])) {
+        if (nested.mimeType === "text/plain" && nested.body?.data) {
+          body = Buffer.from(nested.body.data, "base64").toString("utf-8");
+          break;
+        }
+      }
+      if (body) break;
+    }
+  }
+  // Fall back to text/html (top-level or nested) if no text/plain.
+  if (!body) {
+    for (const part of parts) {
+      if (part.mimeType === "text/html" && part.body?.data) {
+        body = Buffer.from(part.body.data, "base64").toString("utf-8");
+        bodyIsHtml = true;
+        break;
+      }
+      for (const nested of (part.parts || [])) {
+        if (nested.mimeType === "text/html" && nested.body?.data) {
+          body = Buffer.from(nested.body.data, "base64").toString("utf-8");
+          bodyIsHtml = true;
+          break;
+        }
+      }
+      if (body) break;
+    }
+  }
+  // Single-body payload (rare, e.g. plain-text-only senders).
+  if (!body && data.payload?.body?.data) {
+    body = Buffer.from(data.payload.body.data, "base64").toString("utf-8");
+    if ((data.payload.mimeType || "").includes("html")) bodyIsHtml = true;
+  }
+  if (bodyIsHtml) body = htmlToText(body);
+
+  return {
+    id: messageId,
+    subject: get("Subject"),
+    from: get("From"),
+    date: get("Date"),
+    snippet: data.snippet || "",
+    body,
+  };
+}
+
 // ---------- Job 1: Email history (12 months back) ----------
 
 async function gmailSearch(accessToken, query, maxResults) {
@@ -731,7 +824,7 @@ async function runVaultPass(accessToken, pass, afterEpoch) {
   for (let i = 0; i < messageIds.length; i += 15) {
     const chunk = messageIds.slice(i, i + 15);
     const chunkResults = await Promise.all(
-      chunk.map((id) => fetchEmailMetadata(accessToken, id).catch(() => null))
+      chunk.map((id) => fetchEmailFullBody(accessToken, id).catch(() => null))
     );
     headers.push(...chunkResults);
   }
@@ -744,13 +837,21 @@ async function runVaultPass(accessToken, pass, afterEpoch) {
     const batch = validHeaders.slice(i, i + PARALLEL);
     const parsed = await Promise.all(
       batch.map(async (e) => {
+        // Snippet first (Gmail's content-aware preview — often carries
+        // the policy/provider name in clean form), then the readable
+        // body. Body is capped to keep Claude input bounded; 2500
+        // chars is enough to capture the renewal details block in
+        // typical commercial mail.
+        const bodyExcerpt = (e.body || "").substring(0, 2500);
         const promptText = `${pass.instructions}
 
 Email:
 Subject: ${e.subject}
 From: ${e.from}
 Date: ${e.date}
-Snippet: ${(e.snippet || "").substring(0, 400)}`;
+Snippet: ${e.snippet || ""}
+Body:
+${bodyExcerpt}`;
         const text = await callClaude(promptText, 300).catch(() => null);
         return safeParseJsonText(text);
       })
