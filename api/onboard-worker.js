@@ -305,19 +305,23 @@ async function runEmailJob(userId, householdId) {
   // Same dedup pattern for vault — the deadline branch below now writes to
   // :vault rather than :deadlines (single source of truth). Built once
   // outside the per-batch loop so we only pay the lrange cost once.
+  // Word-overlap dedup against existing vault items, mirroring the
+  // Job 3 fix. Uses vaultDescriptionOverlap > 0.5 within a 30-day
+  // renewalDate window so we catch "Health Tech Nerds subscription
+  // renewal" vs "Health Tech Nerds Membership - Monthly subscription
+  // renewal" while still permitting separate annual renewals of the
+  // same item from year to year.
   const existingVaultRaw = await redis.lrange(`household:${householdId}:vault`, 0, -1);
-  const existingVaultDescs = new Set(
-    existingVaultRaw
-      .map((s) => safeJson(s))
-      .filter(Boolean)
-      .map((v) => (v.description || "").toLowerCase().trim())
-      .filter(Boolean)
-  );
-  function isDuplicateVaultDesc(desc) {
+  const existingVaultItems = existingVaultRaw.map(safeJson).filter(Boolean);
+  const VAULT_DEDUP_WINDOW_MS = 30 * DAY_MS;
+  function isDuplicateVaultItem(desc, dateStr) {
     if (!desc) return true;
-    if (existingVaultDescs.has(desc)) return true;
-    for (const ex of existingVaultDescs) {
-      if (ex.length >= 6 && desc.length >= 6 && (ex.includes(desc) || desc.includes(ex))) return true;
+    const itemMs = dateStr ? Date.parse(dateStr) : NaN;
+    if (isNaN(itemMs)) return false;
+    for (const ex of existingVaultItems) {
+      const exMs = ex.renewalDate ? Date.parse(ex.renewalDate) : NaN;
+      if (isNaN(exMs) || Math.abs(itemMs - exMs) > VAULT_DEDUP_WINDOW_MS) continue;
+      if (vaultDescriptionOverlap(desc, ex.description) > 0.5) return true;
     }
     return false;
   }
@@ -370,8 +374,8 @@ ${formatted}`,
         // here in case it slips through (typo, ambiguous email, etc.).
         const etaMs = item.date ? Date.parse(item.date) : NaN;
         if (!isNaN(etaMs) && etaMs < Date.now()) continue;
-        if (isDuplicateVaultDesc(desc)) continue;
-        existingVaultDescs.add(desc);
+        if (isDuplicateVaultItem(desc, item.date)) continue;
+        existingVaultItems.push({ description: item.description, renewalDate: item.date });
 
         // Write to :vault (not :deadlines) so brief.js's deadline pool sees
         // these. The dedicated vault sweep (Job 3) is strict and tends to
@@ -728,6 +732,44 @@ Return null if no clear expiry date or purely informational.`,
   },
 ];
 
+// Jaccard-against-shorter word overlap, mirrors api/import.js's
+// descriptionOverlap. Used by both cross-pass Rule B and the
+// against-existing dedup so we catch cases like "Health Tech Nerds
+// subscription renewal" vs "Health Tech Nerds Membership - Monthly
+// subscription renewal" — exact match misses them; substring-includes
+// misses them too because of the middle phrase; word overlap is 1.0.
+// Generic English stopwords PLUS vault-structural words. The structural
+// set — "insurance", "policy", "renewal", "subscription" etc. — appears
+// in nearly every vault description and would inflate overlap when
+// comparing distinct items (e.g. "HO3 Home insurance policy renewal" vs
+// "Personal Flood insurance policy renewal" share 3 of 5 words without
+// these). Removing them isolates the distinguishing tokens.
+const VAULT_OVERLAP_STOPWORDS = new Set([
+  "the", "and", "for", "with", "from", "your", "this", "that",
+  "you", "are", "was", "will", "has", "have", "been",
+  "insurance", "policy", "renewal", "renews", "subscription",
+  "membership", "registration", "warranty", "expiration", "expires",
+  "service", "plan", "notice", "reminder",
+]);
+
+function vaultDescriptionOverlap(a, b) {
+  if (!a || !b) return 0;
+  const toWords = (s) =>
+    new Set(
+      s
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length >= 3 && !VAULT_OVERLAP_STOPWORDS.has(w))
+    );
+  const wordsA = toWords(a);
+  const wordsB = toWords(b);
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let common = 0;
+  for (const w of wordsA) if (wordsB.has(w)) common++;
+  return common / Math.min(wordsA.size, wordsB.size);
+}
+
 // "How rich is this item" for tie-breaking when descriptions match
 // within Rule B's 7-day window. Confidence is broken out separately
 // (Rule A uses it directly).
@@ -754,8 +796,8 @@ function vaultConfidenceRank(c) {
 // Cross-pass dedup. Two rules per spec:
 //   A. Same provider + subtype + renewalDate within 30 days → keep higher
 //      confidence.
-//   B. Same description + renewalDate within 7 days → keep richer (info
-//      density count).
+//   B. Description word-overlap > 0.5 + renewalDate within 7 days → keep
+//      richer (info density count).
 // Greedy: walk the input list once; for each item, check it against
 // already-kept items. On match, decide which to keep based on the matching
 // rule; the loser is discarded.
@@ -785,12 +827,10 @@ function dedupVaultItemsAcrossPasses(items) {
         break;
       }
 
-      // Rule B — same description (case-insensitive) + 7-day window
-      const newDesc = (item.description || "").toLowerCase().trim();
-      const exDesc = (ex.description || "").toLowerCase().trim();
+      // Rule B — description word-overlap > 0.5 + 7-day window
       if (
-        newDesc && exDesc && newDesc === exDesc &&
-        datesParseable && Math.abs(itemMs - exMs) <= SEVEN_DAYS_MS
+        datesParseable && Math.abs(itemMs - exMs) <= SEVEN_DAYS_MS &&
+        vaultDescriptionOverlap(item.description, ex.description) > 0.5
       ) {
         dupIndex = i;
         dupRule = "B";
@@ -923,33 +963,32 @@ async function runVaultJob(userId, householdId) {
   const allItems = passResults.flatMap((r) => r.items);
   const crossDedup = dedupVaultItemsAcrossPasses(allItems);
 
-  // Against-existing dedup: same lowercased-substring overlap pattern
-  // used previously. Catches re-imports of the same renewal email across
-  // onboard runs.
+  // Against-existing dedup: word-overlap > 0.5 + renewalDate within
+  // 30 days. Catches re-imports of the same renewal across onboard runs
+  // even when descriptions diverge slightly (e.g. "Health Tech Nerds
+  // subscription renewal" vs "Health Tech Nerds Membership - Monthly
+  // subscription renewal"). 30-day window protects against deduping
+  // across years for repeating annual renewals.
   const existingRaw = await redis.lrange(`household:${householdId}:vault`, 0, -1);
-  const existingDescriptions = new Set(
-    existingRaw
-      .map(safeJson)
-      .filter(Boolean)
-      .map((v) => (v.description || "").toLowerCase().trim())
-      .filter(Boolean)
-  );
-  function isDuplicateDescription(desc) {
+  const THIRTY_DAYS_MS = 30 * DAY_MS;
+  const existingItems = existingRaw.map(safeJson).filter(Boolean);
+  function isDuplicateItem(item) {
+    const desc = item.description || "";
     if (!desc) return true;
-    if (existingDescriptions.has(desc)) return true;
-    for (const ex of existingDescriptions) {
-      if (ex.length >= 6 && desc.length >= 6 && (ex.includes(desc) || desc.includes(ex))) {
-        return true;
-      }
+    const itemMs = item.renewalDate ? Date.parse(item.renewalDate) : NaN;
+    if (isNaN(itemMs)) return false;
+    for (const ex of existingItems) {
+      const exMs = ex.renewalDate ? Date.parse(ex.renewalDate) : NaN;
+      if (isNaN(exMs) || Math.abs(itemMs - exMs) > THIRTY_DAYS_MS) continue;
+      if (vaultDescriptionOverlap(desc, ex.description) > 0.5) return true;
     }
     return false;
   }
 
   let kept = 0;
   for (const item of crossDedup) {
-    const desc = (item.description || "").toLowerCase().trim();
-    if (isDuplicateDescription(desc)) continue;
-    existingDescriptions.add(desc);
+    if (isDuplicateItem(item)) continue;
+    existingItems.push(item);
 
     await redis.lpush(
       `household:${householdId}:vault`,
