@@ -732,6 +732,7 @@ async function runVaultPass(accessToken, pass, afterEpoch) {
   const validHeaders = headers.filter(Boolean);
 
   const items = [];
+  const tally = { claudeEmpty: 0, noRenewalDate: 0, dateUnparseable: 0, dateTooOld: 0, kept: 0 };
   const PARALLEL = 10;
   for (let i = 0; i < validHeaders.length; i += PARALLEL) {
     const batch = validHeaders.slice(i, i + PARALLEL);
@@ -748,17 +749,38 @@ Snippet: ${(e.snippet || "").substring(0, 400)}`;
         return safeParseJsonText(text);
       })
     );
-    for (const item of parsed) {
-      if (!item || typeof item !== "object") continue;
-      if (!item.renewalDate) continue;
+    for (let j = 0; j < parsed.length; j++) {
+      const item = parsed[j];
+      const subj = (batch[j].subject || "").substring(0, 60);
+      if (!item || typeof item !== "object") {
+        tally.claudeEmpty++;
+        console.log(`[vault:${pass.key}] drop claudeEmpty: "${subj}"`);
+        continue;
+      }
+      if (!item.renewalDate) {
+        tally.noRenewalDate++;
+        console.log(`[vault:${pass.key}] drop noRenewalDate: "${subj}"`);
+        continue;
+      }
       const ms = Date.parse(item.renewalDate);
       // Match the most permissive prompt's window (insurance: 60 days
       // past). Items past that are universally stale enough to drop
       // server-side regardless of which pass surfaced them.
-      if (isNaN(ms) || ms < Date.now() - 60 * DAY_MS) continue;
+      if (isNaN(ms)) {
+        tally.dateUnparseable++;
+        console.log(`[vault:${pass.key}] drop dateUnparseable (renewalDate=${item.renewalDate}): "${subj}"`);
+        continue;
+      }
+      if (ms < Date.now() - 60 * DAY_MS) {
+        tally.dateTooOld++;
+        console.log(`[vault:${pass.key}] drop dateTooOld (renewalDate=${item.renewalDate}): "${subj}"`);
+        continue;
+      }
+      tally.kept++;
       items.push(item);
     }
   }
+  console.log(`[vault:${pass.key}] complete scanned=${validHeaders.length} claudeEmpty=${tally.claudeEmpty} noRenewalDate=${tally.noRenewalDate} dateUnparseable=${tally.dateUnparseable} dateTooOld=${tally.dateTooOld} kept=${tally.kept}`);
   return { items, scanned: validHeaders.length };
 }
 
