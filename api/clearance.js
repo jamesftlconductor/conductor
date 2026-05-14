@@ -44,7 +44,8 @@ Rules:
 - Plain text only, no markdown
 - Maximum 4 sentences total
 - Honest and specific — name actual signals
-- Calm, not defensive`;
+- Calm, not defensive
+- Never assert what the user said, noted, mentioned, told you, indicated, expressed, confirmed, asked, or wrote. Describe only the signals present in the pool and how you weighed them. If you want to convey a user state, frame it as your own inference: "I inferred X" or "this reads like X" — never "you noted X".`;
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
