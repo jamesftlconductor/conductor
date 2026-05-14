@@ -46,6 +46,25 @@ function isBounceFrom(from) {
   return BOUNCE_FROM_SUBSTRINGS.some((p) => lower.includes(p));
 }
 
+// Numeric 1-10 quality score, computed from field presence after Claude
+// extracts the signal. Replaces the earlier string-confidence + all-or-
+// nothing field gates with a single tunable threshold. Stored on the
+// signal so dedup can use it as a tie-breaker.
+function signalConfidenceScore(signal) {
+  let score = 0;
+  const desc = typeof signal.description === "string" ? signal.description.trim() : "";
+  if (desc && desc !== "Unknown") score += 2;
+  const sender = typeof signal.sender === "string" ? signal.sender.trim() : "";
+  if (sender && sender !== "Unknown") score += 2;
+  const etaParsed = signal.eta ? Date.parse(signal.eta) : NaN;
+  if (!isNaN(etaParsed)) score += 2;
+  if (signal.status && signal.status !== "Unknown") score += 1;
+  if (signal.type && signal.type !== "unknown") score += 1;
+  if (signal.trackingNumber) score += 1;
+  if (desc.length > 20) score += 1;
+  return score;
+}
+
 // Runs after Claude parses the email but before we write the signal. Returns
 // a reason string when the signal should be discarded, or null to keep.
 function postParseDiscardReason(signal, from) {
@@ -53,43 +72,6 @@ function postParseDiscardReason(signal, from) {
   // email carries no real arrival. Checked first so it short-circuits the
   // other gates.
   if (isBounceFrom(from)) return "bounce-sender";
-
-  // Description quality gate. Empty, "Unknown", or fewer-than-5-character
-  // descriptions can't drive useful prose; the radar dot would render but
-  // the brief would have nothing to say about it.
-  const desc = typeof signal.description === "string" ? signal.description.trim() : "";
-  if (!desc || desc === "Unknown" || desc.length < 5) {
-    return "low-description";
-  }
-
-  // Sender quality gate. A signal with no identifiable origin can't
-  // be ownership-tagged or surfaced in transparency reasoning. The
-  // earlier all-unknown gate only caught the worst combination; this
-  // tightens it to require any sender at all.
-  const sender = typeof signal.sender === "string" ? signal.sender.trim() : "";
-  if (!sender || sender === "Unknown") {
-    return "missing-sender";
-  }
-
-  // All-Unknown shell: Claude couldn't extract anything actionable. Storing
-  // these clutters the ring with phantom signals.
-  if (
-    signal.type === "unknown" &&
-    signal.status === "Unknown" &&
-    !signal.eta &&
-    !signal.trackingNumber
-  ) {
-    return "all-unknown";
-  }
-
-  // Claude self-flagged the parse as low confidence AND the type came
-  // back unknown. Either alone is recoverable (low-confidence package
-  // with eta might still be worth surfacing; unknown-type with high
-  // confidence might be a categorization gap to investigate). The
-  // pair is overwhelmingly noise.
-  if (signal.confidence === "low" && signal.type === "unknown") {
-    return "low-confidence-unknown";
-  }
 
   // Promo language in the description — Claude correctly extracted the words
   // but the email is marketing, not a real arrival.
@@ -103,6 +85,15 @@ function postParseDiscardReason(signal, from) {
   ) {
     return "promo-sender";
   }
+
+  // Numeric quality gate. Replaces the previous low-description /
+  // missing-sender / all-unknown / low-confidence-unknown checks with a
+  // single threshold against the 1-10 score. 4 is the floor where the
+  // signal has enough structure to drive a brief sentence.
+  if (typeof signal.confidence === "number" && signal.confidence < 4) {
+    return `low-confidence-score-${signal.confidence}`;
+  }
+
   return null;
 }
 
@@ -135,47 +126,55 @@ function descriptionOverlap(a, b) {
   return common / Math.min(wordsA.size, wordsB.size);
 }
 
+// Strip common business-entity suffixes so "Amazon Inc", "Amazon, Inc.",
+// and "Amazon" all compare equal. Used as the fuzzy sender match in
+// dedup rule A.
+const COMPANY_SUFFIXES = new Set([
+  "inc", "incorporated", "llc", "co", "company",
+  "corp", "corporation", "ltd", "limited",
+]);
+
+function normalizeSender(s) {
+  if (!s) return "";
+  return s
+    .toLowerCase()
+    .replace(/[.,]/g, "")
+    .split(/\s+/)
+    .filter((w) => w.length > 0 && !COMPANY_SUFFIXES.has(w))
+    .join(" ")
+    .trim();
+}
+
 // True when the new signal is plausibly the same as an existing one
 // according to either of two rules:
-//   1. Same type + same sender (case-insensitive, trimmed) + ETAs
-//      within 3 days of each other.
-//   2. Same type + description word overlap > 60% AND the existing
-//      signal is still in motion (incoming or active — not already
-//      resolved/expired/etc).
+//   A. Same type + fuzzy sender match (suffix-stripped, case-insensitive)
+//      + ETAs within 5 days of each other.
+//   B. Same type + description word overlap > 50% AND both signals are
+//      still in motion (incoming or active).
 function isSemanticDuplicate(newSig, existing) {
   if (newSig.type !== existing.type) return false;
 
-  const newSender = (newSig.sender || "").toLowerCase().trim();
-  const exSender = (existing.sender || "").toLowerCase().trim();
+  const newSender = normalizeSender(newSig.sender);
+  const exSender = normalizeSender(existing.sender);
   if (newSender && exSender && newSender === exSender) {
     const newEta = newSig.eta ? Date.parse(newSig.eta) : NaN;
     const exEta = existing.eta ? Date.parse(existing.eta) : NaN;
     if (!isNaN(newEta) && !isNaN(exEta)) {
-      const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
-      if (Math.abs(newEta - exEta) <= THREE_DAYS_MS) return true;
+      const FIVE_DAYS_MS = 5 * 24 * 60 * 60 * 1000;
+      if (Math.abs(newEta - exEta) <= FIVE_DAYS_MS) return true;
     }
   }
 
-  if (existing.state === "incoming" || existing.state === "active" || !existing.state) {
+  const newInMotion =
+    !newSig.state || newSig.state === "incoming" || newSig.state === "active";
+  const exInMotion =
+    !existing.state || existing.state === "incoming" || existing.state === "active";
+  if (newInMotion && exInMotion) {
     const overlap = descriptionOverlap(newSig.description, existing.description);
-    if (overlap > 0.6) return true;
+    if (overlap > 0.5) return true;
   }
 
   return false;
-}
-
-// "How much actionable detail does this carry" — used to break ties
-// between a new signal and an existing duplicate. The signal with more
-// non-null/non-Unknown fields wins; the loser is discarded.
-function infoDensity(s) {
-  let n = 0;
-  if (s.eta) n++;
-  if (s.status && s.status !== "Unknown") n++;
-  if (s.description && s.description.trim().length > 0) n++;
-  if (s.sender && s.sender !== "Unknown") n++;
-  if (s.trackingNumber) n++;
-  if (s.notes) n++;
-  return n;
 }
 
 function safeParseSignal(raw) {
@@ -302,6 +301,11 @@ ${emailText.substring(0, 1000)}`,
       const clean = text.replace(/```json|```/g, "").trim();
       const signal = JSON.parse(clean);
 
+      // Overwrite Claude's string confidence with the numeric 1-10 score
+      // before the gate runs so the same field can drive both filtering
+      // and dedup tie-breaking.
+      signal.confidence = signalConfidenceScore(signal);
+
       // Mark as imported once parsing succeeds — covers both the lpush path
       // below and the stale-eta skip, so neither gets re-processed.
       await redis.sadd(importedSetKey, message.id);
@@ -335,13 +339,13 @@ ${emailText.substring(0, 1000)}`,
       signal.userId = userId;
       signal.source = "import";
 
-      // Semantic dedup against the last 50 stored signals. Picks up
+      // Semantic dedup against the last 100 stored signals. Picks up
       // cases where the messageId differs and the content fingerprint
       // differs (e.g., a follow-up email with a more specific ETA) but
-      // it's clearly the same underlying real-world signal. Newer +
-      // denser wins via LSET; otherwise the new one is dropped.
+      // it's clearly the same underlying real-world signal. Higher
+      // confidence wins via LSET; existing equal-or-higher drops the new.
       const signalsKey = `household:${householdId}:signals`;
-      const recentRaw = await redis.lrange(signalsKey, 0, 49);
+      const recentRaw = await redis.lrange(signalsKey, 0, 99);
       const recent = recentRaw.map(safeParseSignal).filter(Boolean);
       let dupIndex = -1;
       let dupExisting = null;
@@ -354,27 +358,33 @@ ${emailText.substring(0, 1000)}`,
       }
 
       if (dupIndex !== -1) {
-        const newDensity = infoDensity(signal);
-        const exDensity = infoDensity(dupExisting);
-        if (newDensity > exDensity) {
+        // Existing signals stored before this change have no numeric
+        // confidence — recompute it on the fly so the comparison is
+        // apples-to-apples.
+        const exConfidence =
+          typeof dupExisting.confidence === "number"
+            ? dupExisting.confidence
+            : signalConfidenceScore(dupExisting);
+        if (signal.confidence > exConfidence) {
           // New one is richer — replace the existing record in place.
-          // Carry forward state/notedAt/lastUpdate-on-other-fields from
-          // the existing signal where they exist, since those represent
-          // user intent we don't want to lose.
+          // Carry forward state/notedAt from the existing signal where
+          // they exist, since those represent user intent we don't want
+          // to lose.
           const merged = {
             ...signal,
+            id: dupExisting.id,
             state: dupExisting.state || signal.state,
             notedAt: dupExisting.notedAt || signal.notedAt,
           };
           await redis.lset(signalsKey, dupIndex, JSON.stringify(merged));
           await redis.sadd(fingerprintSetKey, fp);
           console.log(
-            `[import] semantic-dedup replace at index ${dupIndex} (density ${newDensity} > ${exDensity}): "${(signal.description || "").slice(0, 60)}"`
+            `[import] Merged signal ${signal.id} into ${dupExisting.id} (confidence ${signal.confidence} > ${exConfidence}, replaced): "${(signal.description || "").slice(0, 60)}"`
           );
           imported++;
         } else {
           console.log(
-            `[import] semantic-dedup discard (density ${newDensity} <= ${exDensity}): "${(signal.description || "").slice(0, 60)}"`
+            `[import] Merged signal ${signal.id} into ${dupExisting.id} (confidence ${signal.confidence} <= ${exConfidence}, kept existing): "${(signal.description || "").slice(0, 60)}"`
           );
         }
         await new Promise(r => setTimeout(r, 1000));
