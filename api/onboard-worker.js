@@ -572,14 +572,20 @@ Return only the JSON object.`,
 // about the expected shape — fewer "is this a real renewal or just a
 // marketing email" judgment calls per pass.
 
+// Vault queries require BOTH a category keyword AND a renewal/action
+// verb in the subject — single-clause queries (e.g. bare "Netflix" or
+// "State Farm") match every email those senders deliver, drowning
+// Claude in 100% noise. Two subject:() clauses are implicit-AND'd by
+// Gmail. Verified 2026-05-14: previous queries scanned 74 emails and
+// extracted 0; every drop was claudeEmpty because Claude correctly
+// rejected marketing/account-update mail the brand-only filters caught.
 const VAULT_PASSES = [
   {
     key: "insurance",
     query:
-      `subject:(insurance OR "policy renewal" OR "policy number" OR premium OR ` +
-      `"coverage" OR "State Farm" OR "Allstate" OR "Progressive" OR "Geico" OR ` +
-      `"Aetna" OR "Blue Cross" OR "United Health" OR "Cigna" OR "Delta Dental" OR ` +
-      `"MetLife" OR "coverage effective" OR "premium due" OR "policy anniversary")`,
+      `subject:(insurance OR policy OR coverage OR premium OR deductible) ` +
+      `subject:(renewal OR renews OR renewed OR expires OR expiring OR "due" OR ` +
+      `"anniversary" OR "effective date")`,
     instructions: `Extract insurance policy information. Return JSON or null:
 { "category": "insurance", "subtype": "auto|home|health|dental|vision|life|renters|other", "description": "specific policy description", "provider": "company name", "renewalDate": "YYYY-MM-DD or null", "amount": "annual premium if known or null", "policyNumber": "if visible or null", "consequence": "what lapses if missed", "confidence": "high|medium|low" }
 Only return if renewal date is in the future or within 60 days past. Return null if purely promotional.`,
@@ -587,10 +593,10 @@ Only return if renewal date is in the future or within 60 days past. Return null
   {
     key: "subscriptions",
     query:
-      `subject:("subscription renewal" OR "your subscription" OR "annual plan" OR ` +
-      `"monthly plan" OR "auto-renews" OR "billing date" OR "next charge" OR ` +
-      `"membership renewal" OR "Amazon Prime" OR "Netflix" OR "Spotify" OR "Hulu" OR ` +
-      `"Apple" OR "Disney" OR "membership fee" OR "annual fee")`,
+      `subject:(subscription OR membership OR "annual plan" OR "monthly plan") ` +
+      `subject:(renewal OR renews OR "auto-renew" OR "auto-renews" OR ` +
+      `"billing date" OR "next charge" OR "membership fee" OR "annual fee" OR ` +
+      `expires OR expiring OR "auto-renewal")`,
     instructions: `Extract subscription or membership renewal. Return JSON or null:
 { "category": "subscription", "subtype": "streaming|software|membership|service|other", "description": "what this subscription is for", "provider": "company name", "renewalDate": "YYYY-MM-DD or null", "amount": "monthly or annual cost if known or null", "frequency": "monthly|annual|other", "consequence": "service stops or auto-charges", "confidence": "high|medium|low" }
 Only return if this is a real subscription with a renewal date, not a promotional offer. Return null if promotional.`,
@@ -598,10 +604,9 @@ Only return if this is a real subscription with a renewal date, not a promotiona
   {
     key: "medical",
     query:
-      `subject:(prescription OR "refill" OR "days supply" OR pharmacy OR ` +
-      `"medication ready" OR "prescription ready" OR "your prescription" OR CVS OR ` +
-      `Walgreens OR "Rite Aid" OR "health benefits" OR FSA OR HSA OR ` +
-      `"open enrollment" OR "benefits expire" OR "use it or lose it")`,
+      `subject:(prescription OR pharmacy OR FSA OR HSA OR "health benefits" OR medication) ` +
+      `subject:(refill OR ready OR expires OR expiring OR "use it or lose it" OR ` +
+      `"days supply" OR "open enrollment" OR renewal OR renews)`,
     instructions: `Extract prescription or medical benefit information. Return JSON or null:
 { "category": "medical", "subtype": "prescription|FSA|HSA|benefits|appointment|other", "description": "medication name or benefit type", "provider": "pharmacy or insurer name", "renewalDate": "YYYY-MM-DD — next refill date or benefit expiry or null", "amount": "cost if known or null", "consequence": "runs out or expires or lapses", "confidence": "high|medium|low" }
 Return null if purely promotional or no actionable date.`,
@@ -609,9 +614,10 @@ Return null if purely promotional or no actionable date.`,
   {
     key: "warranties",
     query:
-      `subject:(warranty OR "AppleCare" OR "extended warranty" OR "protection plan" OR ` +
-      `"service contract" OR "warranty registration" OR "warranty expires" OR ` +
-      `"coverage plan" OR "product protection")`,
+      `subject:(warranty OR AppleCare OR "protection plan" OR "service contract" OR ` +
+      `"coverage plan" OR "product protection") ` +
+      `subject:(expires OR expiring OR renewal OR renews OR ends OR "ending soon" OR ` +
+      `"about to expire" OR registration)`,
     instructions: `Extract warranty or service contract information. Return JSON or null:
 { "category": "warranty", "subtype": "electronics|appliance|vehicle|home|other", "description": "what is covered", "provider": "warranty provider name", "renewalDate": "YYYY-MM-DD — expiry date or null", "amount": "cost if known or null", "consequence": "no coverage if expires", "confidence": "high|medium|low" }
 Return null if no expiry date found or purely promotional.`,
@@ -619,10 +625,10 @@ Return null if no expiry date found or purely promotional.`,
   {
     key: "registrations",
     query:
-      `subject:(registration OR "license renewal" OR "passport" OR ` +
-      `"vehicle registration" OR "drivers license" OR "business license" OR "permit" OR ` +
-      `"lease renewal" OR "lease expires" OR "lease ends" OR "domain renewal" OR ` +
-      `"expires" OR "expiration notice")`,
+      `subject:(registration OR license OR passport OR lease OR domain OR permit OR ` +
+      `tag OR "drivers license" OR "vehicle registration" OR "business license") ` +
+      `subject:(renewal OR renews OR expires OR expiring OR ends OR "expiration notice" OR ` +
+      `"renewal reminder" OR "renewal notice")`,
     instructions: `Extract registration, license, or legal document expiration. Return JSON or null:
 { "category": "registration", "subtype": "vehicle|drivers_license|passport|lease|domain|business|other", "description": "what needs renewing", "provider": "issuing authority or company", "renewalDate": "YYYY-MM-DD or null", "amount": "fee if known or null", "consequence": "lapses or illegal or service stops", "confidence": "high|medium|low" }
 Return null if no clear expiry date or purely informational.`,
