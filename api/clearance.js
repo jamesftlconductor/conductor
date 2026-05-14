@@ -261,7 +261,15 @@ function daysFromTodayPhrase(value) {
   const n = Math.round((target.getTime() - startOfToday.getTime()) / DAY_MS_LOCAL);
   if (n === 0) return "today";
   if (n === 1) return "tomorrow";
-  if (n > 0) return `in ${n} days`;
+  if (n > 0) {
+    // Clean multiples of 7 emit a weeks-form so the model lifts
+    // "in 2 weeks" rather than paraphrasing "in 14 days" itself.
+    if (n >= 7 && n % 7 === 0) {
+      const weeks = n / 7;
+      return weeks === 1 ? "in 1 week" : `in ${weeks} weeks`;
+    }
+    return `in ${n} days`;
+  }
   if (n === -1) return "yesterday";
   return `already passed ${-n} days ago`;
 }
@@ -602,7 +610,7 @@ ${isSingleMember
 - End with something that closes the day — calm, done, ready for tomorrow
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field (e.g., "Sunday, May 10"). NEVER compute, infer, or recalculate a day-of-week or date — the resolved string is authoritative. Ignore the "raw:" portion. Drop the year unless it differs from the current year.
 - If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date for it — even if the description mentions a holiday or named event. Either omit the date or use a phrase like "no confirmed date yet". Do NOT translate "Mother's Day", "the weekend", or similar phrases into specific calendar dates yourself.
-- The ETA friendly field includes an authoritative parenthesized phrase: "(today)", "(tomorrow)", "(in N days)", "(yesterday)", or "(already passed N days ago)". If you want to convey timing, lift that phrase VERBATIM. The ONLY two acceptable timing forms are: (1) the lifted parenthesized phrase verbatim, and (2) the day-and-date ("Wednesday, May 20"). Any other quantified duration is forbidden — this is a PATTERN rule, not a list-of-examples rule. The forbidden pattern is "<number-or-quantifier> <time-unit> <preposition>" where number-or-quantifier is anything like "5", "five", "a", "a couple of", "several", "a few", "about two", time-unit is days/weeks/months/years (singular OR plural), and preposition is away/out/left/remaining/from now/to <verb>/until <date>/later/before. Non-exhaustive examples that are ALL forbidden: "in 5 days" (if not lifted), "five days away", "5 days out", "five days left", "two weeks later", "two weeks out", "two weeks away", "in two weeks", "a week out", "a couple of weeks away", "in about three weeks", "a few days from now", "next week", "soon", "shortly". If you find yourself constructing any duration phrase that isn't the lifted parenthesized phrase, stop and use the date alone instead.
+- The ETA friendly field includes an authoritative parenthesized phrase: "(today)", "(tomorrow)", "(in N days)", "(in N weeks)" (when N is a clean multiple of 7), "(yesterday)", or "(already passed N days ago)". The server picks the unit — never substitute one unit for another (do NOT convert "(in 14 days)" to "in 2 weeks" or "(in 5 days)" to "a few days"). If you want to convey timing, lift that phrase VERBATIM. The ONLY two acceptable timing forms are: (1) the lifted parenthesized phrase verbatim, and (2) the day-and-date ("Wednesday, May 20"). Any other quantified duration is forbidden — this is a PATTERN rule, not a list-of-examples rule. The forbidden pattern is "<number-or-quantifier> <time-unit> <preposition>" where number-or-quantifier is anything like "5", "five", "a", "a couple of", "several", "a few", "about two", time-unit is days/weeks/months/years (singular OR plural), and preposition is away/out/left/remaining/from now/to <verb>/until <date>/later/before. Non-exhaustive examples that are ALL forbidden: "five days away", "5 days out", "five days left", "two weeks later", "two weeks out", "two weeks away", "a week out", "a couple of weeks away", "in about three weeks", "a few days from now", "next week", "soon", "shortly". If you find yourself constructing any duration phrase that isn't the lifted parenthesized phrase, stop and use the date alone instead.
 - CRITICAL — past-dated signals: when the parenthesized phrase reads "(yesterday)" or "(already passed N days ago)", that signal is in the past. Never frame it as upcoming. Do NOT write "looking ahead to her trip on Friday, May 1", "her spray tan booked for Thursday, May 7", "watch for it as the date approaches", or similar forward-looking phrasing for past-dated items. A past-dated item usually means it's still open or unresolved (a delivery that never came, an appointment unconfirmed); if it warrants mention, frame it as stale/outstanding ("the spray tan from last Thursday still hasn't been confirmed"). If there's no actionable open thread, omit it entirely — do not pad the brief with retrospective recaps of past dates.`,
         }],
       }),
