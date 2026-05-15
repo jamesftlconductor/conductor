@@ -122,49 +122,63 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // First-run takeoff push uses hardcoded copy — there's no brief yet
-      // on day one to lift a first sentence from. Don't flip firstRun
-      // here; brief.js owns that transition so the brief and push stay
-      // in sync when the user opens the app.
-      let body;
+      // Shared-body override: first-run takeoff uses hardcoded copy for
+      // every user in the household — there's no brief yet on day one to
+      // lift a first sentence from. Don't flip firstRun here; brief.js
+      // owns that transition so the brief and push stay in sync when
+      // the user opens the app.
+      let sharedBody = null;
       if (type === "takeoff") {
         const firstRunFlag = await redis.get(`household:${hid}:firstRun`);
         const isFirstRun = firstRunFlag === "true" || firstRunFlag === true;
         if (isFirstRun) {
-          body = "Your first Takeoff is ready. Conductor has been reading.";
+          sharedBody = "Your first Takeoff is ready. Conductor has been reading.";
         }
       }
 
-      if (!body) {
-        try {
-          const briefUserId = tokensByUser[0].userId;
-          const briefText = await fetchBriefText(briefUserId, type);
-          body = firstSentence(briefText) || fallback;
-        } catch (err) {
-          console.error(`Brief fetch failed for ${hid}:`, err);
-          body = fallback;
-        }
-      }
-
-      // Carry-forward suffix on Takeoff only — if anything was flagged in last
-      // night's LAST CHANCE pool and is still active this morning (the morning
-      // brief stamps it on the carriedForward set), nudge the user.
+      // Carry-forward suffix on Takeoff only — if anything was flagged in
+      // last night's LAST CHANCE pool and is still active this morning
+      // (the morning brief stamps it on the carriedForward set), nudge
+      // the user. Applied per-user after each user's body is computed
+      // so a long first sentence doesn't push the suffix off the 100-
+      // char limit.
+      let carrySuffix = "";
       if (type === "takeoff") {
         const carriedCount = await redis.scard(`household:${hid}:carriedForward`);
-        if (carriedCount > 0) {
-          const suffix = " Something from yesterday is still open.";
-          // Reserve room for the suffix; total stays ≤100 chars. If the base
-          // body alone barely fits, trim it before appending so the suffix
-          // isn't itself truncated mid-sentence.
-          const budget = 100 - suffix.length;
+        if (carriedCount > 0) carrySuffix = " Something from yesterday is still open.";
+      }
+
+      // Per-user brief fetch in parallel. Each /api/brief call also
+      // populates user:{userId}:currentTakeoff (or :currentClearance),
+      // so when the user later opens the app, brief.js serves the
+      // cached response and the push body matches the app brief
+      // verbatim. firstRun households short-circuit on sharedBody.
+      const bodies = await Promise.all(
+        tokensByUser.map(async ({ userId }) => {
+          if (sharedBody) return sharedBody;
+          try {
+            const briefText = await fetchBriefText(userId, type);
+            return firstSentence(briefText) || fallback;
+          } catch (err) {
+            console.error(`Brief fetch failed for ${userId}:`, err);
+            return fallback;
+          }
+        })
+      );
+
+      for (let i = 0; i < tokensByUser.length; i++) {
+        const { userId, token } = tokensByUser[i];
+        let body = bodies[i];
+        if (carrySuffix) {
+          // Reserve room for the suffix; total stays ≤100 chars. If the
+          // base body alone barely fits, trim it before appending so
+          // the suffix isn't itself truncated mid-sentence.
+          const budget = 100 - carrySuffix.length;
           if (body.length > budget) {
             body = body.slice(0, Math.max(0, budget - 3)).trimEnd() + "...";
           }
-          body = body + suffix;
+          body = body + carrySuffix;
         }
-      }
-
-      for (const { userId, token } of tokensByUser) {
         const push = await sendExpoPush(token, title, body);
         if (push.ok) {
           await redis.set(`user:${userId}:lastNotification`, Date.now());

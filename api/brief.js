@@ -646,6 +646,22 @@ export default async function handler(req, res) {
       if (profile && profile.name) userName = profile.name.split(" ")[0];
     }
 
+    // Cache: notify.js calls /api/brief to extract the push-body first
+    // sentence, and the user then opens the app a few minutes later
+    // expecting the same brief. To avoid two Claude generations that
+    // diverge in wording, the steady-state success path writes the
+    // response to user:{userId}:currentTakeoff with a 6-hour TTL; the
+    // next /api/brief call for the same user inside that window
+    // returns the cached response verbatim. firstRun branch is
+    // deliberately not cached (one-shot welcome flow).
+    const CURRENT_TAKEOFF_TTL_S = 6 * 60 * 60;
+    if (userId) {
+      const cached = safeJson(await redis.get(`user:${userId}:currentTakeoff`));
+      if (cached && typeof cached.brief === "string") {
+        return res.status(200).json(cached);
+      }
+    }
+
     // Pull all sources in parallel
     const [
       rawSignals,
@@ -1527,7 +1543,7 @@ ${isSingleMember
       await redis.expire(briefedThisWeekKey, 6 * 24 * 60 * 60);
     }
 
-    return res.status(200).json({
+    const briefResponse = {
       brief,
       segments,
       transparency,
@@ -1536,7 +1552,20 @@ ${isSingleMember
       user: userName,
       isFirstRun,
       isSingleMember,
-    });
+    };
+
+    // Cache the per-user response so a subsequent /api/brief call for
+    // the same user within the TTL window returns the same prose —
+    // keeps the push body and the app brief in sync.
+    if (userId) {
+      await redis.set(
+        `user:${userId}:currentTakeoff`,
+        JSON.stringify(briefResponse),
+        { ex: CURRENT_TAKEOFF_TTL_S }
+      );
+    }
+
+    return res.status(200).json(briefResponse);
   } catch (error) {
     console.error("Brief error:", error);
     return res.status(500).json({ error: "Failed to generate brief" });

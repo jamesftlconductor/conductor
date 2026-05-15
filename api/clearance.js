@@ -301,6 +301,20 @@ export default async function handler(req, res) {
       if (hid) householdId = hid;
     }
 
+    // Cache: notify.js calls /api/clearance to extract the push-body
+    // first sentence; the user may then open the app within minutes
+    // expecting the same brief. The success path writes the response
+    // to user:{userId}:currentClearance with a 6-hour TTL so the next
+    // call for the same user returns the cached response verbatim,
+    // keeping push body and app brief in sync.
+    const CURRENT_CLEARANCE_TTL_S = 6 * 60 * 60;
+    if (userId) {
+      const cached = safeJson(await redis.get(`user:${userId}:currentClearance`));
+      if (cached && typeof cached.brief === "string") {
+        return res.status(200).json(cached);
+      }
+    }
+
     const [
       rawSignals,
       rawCal,
@@ -703,7 +717,17 @@ ${isSingleMember
       await redis.expire(clearanceBriefedKey, 14 * 60 * 60);
     }
 
-    return res.status(200).json({ brief, segments, transparency, household: householdId, user: userName, isSingleMember });
+    const clearanceResponse = { brief, segments, transparency, household: householdId, user: userName, isSingleMember };
+
+    if (userId) {
+      await redis.set(
+        `user:${userId}:currentClearance`,
+        JSON.stringify(clearanceResponse),
+        { ex: CURRENT_CLEARANCE_TTL_S }
+      );
+    }
+
+    return res.status(200).json(clearanceResponse);
 
   } catch (error) {
     console.error("Clearance error:", error);
