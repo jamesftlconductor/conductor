@@ -188,22 +188,112 @@ async function handleCompass(req, res) {
 // returns an empty array so the mobile screen renders an empty state
 // rather than erroring.
 async function handleCrew(req, res) {
-  if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
-    return res.status(405).json({ error: "Method not allowed for crew" });
-  }
-  const householdId = await resolveHouseholdId(req.query?.userId);
-  const raw = await redis.get(`household:${householdId}:crew`);
-  let crew = [];
-  if (raw != null) {
-    try {
-      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-      if (Array.isArray(parsed)) crew = parsed;
-    } catch {
-      // malformed payload — return empty rather than 500
+  if (req.method === "GET") {
+    const householdId = await resolveHouseholdId(req.query?.userId);
+    const raw = await redis.get(`household:${householdId}:crew`);
+    let crew = [];
+    if (raw != null) {
+      try {
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+        if (Array.isArray(parsed)) crew = parsed;
+      } catch {
+        // malformed payload — return empty rather than 500
+      }
     }
+    return res.status(200).json({ household: householdId, crew });
   }
-  return res.status(200).json({ household: householdId, crew });
+
+  if (req.method === "POST") {
+    // Edit modal: update birthday/anniversary on an existing crew
+    // member. Two routing paths mirror the onboard worker's birthday
+    // pass:
+    //   A) household-member edit (targetUserId provided) → write to
+    //      user:{targetUserId}:profile so the brief picks it up via the
+    //      profile loop, AND mirror onto the crew member record for
+    //      consistency with the Crew screen UI
+    //   B) child/pet/extended edit (memberType + name) → update the
+    //      crew member record directly
+    const { userId, targetUserId, memberType, name, birthday, anniversary } = req.body || {};
+    if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+    // Light input validation. Either targetUserId (path A) OR
+    // memberType+name (path B) must be present so we know who to edit.
+    if (!targetUserId && !(memberType && name)) {
+      return res.status(400).json({
+        error: "Provide targetUserId (for a household member) or memberType+name (for a child/pet/extended record)",
+      });
+    }
+    if (birthday !== undefined && birthday !== null && !/^\d{2}-\d{2}$/.test(birthday)) {
+      return res.status(400).json({ error: "birthday must be MM-DD format or null" });
+    }
+    if (anniversary !== undefined && anniversary !== null && !/^\d{2}-\d{2}$/.test(anniversary)) {
+      return res.status(400).json({ error: "anniversary must be MM-DD format or null" });
+    }
+
+    const householdId = await resolveHouseholdId(userId);
+
+    // Path A: household member — write profile, then mirror in crew
+    if (targetUserId) {
+      try {
+        const rawProfile = await redis.get(`user:${targetUserId}:profile`);
+        const profile =
+          typeof rawProfile === "string" ? JSON.parse(rawProfile) : (rawProfile || {});
+        if (birthday !== undefined) profile.birthday = birthday;
+        if (anniversary !== undefined) profile.anniversary = anniversary;
+        await redis.set(`user:${targetUserId}:profile`, JSON.stringify(profile));
+      } catch (err) {
+        return res.status(500).json({ error: "Profile update failed", message: err.message });
+      }
+    }
+
+    // Mirror into the crew member record (both for household members
+    // and for child/pet/extended records). Single source of truth from
+    // the Crew screen's perspective.
+    const crewKey = `household:${householdId}:crew`;
+    const rawCrew = await redis.get(crewKey);
+    const crew = (() => {
+      if (!rawCrew) return [];
+      try {
+        const parsed = typeof rawCrew === "string" ? JSON.parse(rawCrew) : rawCrew;
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    })();
+
+    let updatedIndex = -1;
+    for (let i = 0; i < crew.length; i++) {
+      const m = crew[i];
+      if (!m) continue;
+      if (targetUserId) {
+        if (m.memberType === "member" && m.userId === targetUserId) {
+          updatedIndex = i;
+          break;
+        }
+      } else if (memberType && name) {
+        if (
+          m.memberType === memberType &&
+          (m.name || "").toLowerCase().trim() === name.toLowerCase().trim()
+        ) {
+          updatedIndex = i;
+          break;
+        }
+      }
+    }
+
+    if (updatedIndex >= 0) {
+      if (birthday !== undefined) crew[updatedIndex].birthday = birthday;
+      if (anniversary !== undefined) crew[updatedIndex].anniversary = anniversary;
+      await redis.set(crewKey, JSON.stringify(crew));
+    } else {
+      return res.status(404).json({ error: "Crew member not found" });
+    }
+
+    return res.status(200).json({ ok: true, householdId, member: crew[updatedIndex] });
+  }
+
+  res.setHeader("Allow", "GET, POST");
+  return res.status(405).json({ error: "Method not allowed for crew" });
 }
 
 async function handleVault(req, res) {

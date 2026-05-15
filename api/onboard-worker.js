@@ -1197,12 +1197,18 @@ async function runCrewJob(userId, householdId) {
 
   function ingest(item) {
     if (!item || !item.memberType) return;
-    if (item.memberType !== "child" && item.memberType !== "pet") return;
+    // Extended-family members (co-parents and similar) join the same
+    // crew list with their own memberType so the mobile UI and brief
+    // can distinguish them. Members (memberType: "member") are written
+    // separately by api/callback.js and are not produced by this sweep.
+    const allowedTypes = new Set(["child", "pet", "extended"]);
+    if (!allowedTypes.has(item.memberType)) return;
     const name = typeof item.name === "string" ? item.name.trim() : "";
     if (!name) {
       const hasDetail =
         (item.activities && item.activities.length > 0) ||
         (item.upcomingEvents && item.upcomingEvents.length > 0) ||
+        (item.associatedChildren && item.associatedChildren.length > 0) ||
         item.school ||
         item.vet;
       if (hasDetail) unkeyed.push(item);
@@ -1221,8 +1227,17 @@ async function runCrewJob(userId, householdId) {
     existing.type = existing.type ?? item.type;
     existing.school = existing.school ?? item.school;
     existing.vet = existing.vet ?? item.vet;
+    existing.relationship = existing.relationship ?? item.relationship;
     existing.activities = mergeArrays(existing.activities, item.activities, "name");
     existing.upcomingEvents = mergeArrays(existing.upcomingEvents, item.upcomingEvents, "description");
+    // associatedChildren is a flat string array — merge as a deduped Set.
+    if (Array.isArray(item.associatedChildren)) {
+      const merged = new Set([
+        ...(existing.associatedChildren || []),
+        ...item.associatedChildren,
+      ]);
+      existing.associatedChildren = Array.from(merged);
+    }
   }
 
   // Seed the dedup map with the existing :crew contents so this run
@@ -1260,9 +1275,24 @@ For pets:
   "upcomingEvents": [{ "description": string, "date": string }]
 }
 
+For extended-family / co-parent (only when patterns below appear):
+{
+  "memberType": "extended",
+  "name": string,
+  "relationship": "co-parent" | "other",
+  "associatedChildren": [string] (names of children this person co-parents),
+  "evidence": string (brief reason this was inferred)
+}
+
 Look for any indication of children or pets. Even indirect signals count — a school newsletter, a vet bill receipt, a sports registration confirmation, a daycare invoice. Extract whatever you can find even if incomplete. A child's first name alone is worth capturing.
 
-Return a crew member if you have at least a name OR a recurring activity. Return empty array only if you genuinely find no children/pets references.
+Look for co-parent patterns in school / activity / pediatric emails:
+- The "To:" or "Cc:" fields contain multiple adult recipients beyond the account owner
+- Phrases like "per our custody agreement", "your co-parent", "both parents", "shared custody", "guardian", "the other parent"
+- Forwarded school updates from another adult's email
+When detected, return an "extended" record with the co-parent's name (or best inference) AND the children's names that connect them, so the brief can later mention coordinating pickup/handoff when those children have events.
+
+Return a crew member if you have at least a name OR a recurring activity. Return empty array only if you genuinely find no children/pets/co-parent references.
 Return ONLY the JSON array, nothing else.
 
 Emails:

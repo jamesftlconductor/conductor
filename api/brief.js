@@ -1173,7 +1173,31 @@ export default async function handler(req, res) {
         const friendly = friendlyDate(e.date);
         return `${e.description}${friendly ? ` on ${friendly}` : ""}`;
       }).join("; ");
-      return `- [${m.memberType.toUpperCase()}] ${label}: ${evs}`;
+      // Co-parent annotation: if this is a child and one of the crew's
+      // "extended" entries lists them in associatedChildren, surface the
+      // co-parent's name so the prompt rule can decide whether to weave
+      // a "coordinate pickup with X" line into the brief.
+      let coParentNote = "";
+      if (m.memberType === "child" && m.name) {
+        const childLower = m.name.toLowerCase();
+        const coParents = (crewMembers || [])
+          .filter(
+            (other) =>
+              other &&
+              other.memberType === "extended" &&
+              other.relationship === "co-parent" &&
+              Array.isArray(other.associatedChildren) &&
+              other.associatedChildren.some(
+                (c) => typeof c === "string" && c.toLowerCase() === childLower
+              )
+          )
+          .map((other) => other.name)
+          .filter(Boolean);
+        if (coParents.length > 0) {
+          coParentNote = ` | co-parent: ${coParents.join(", ")}`;
+        }
+      }
+      return `- [${m.memberType.toUpperCase()}] ${label}: ${evs}${coParentNote}`;
     }
 
     // BIRTHDAYS + ANNIVERSARIES — collect from crew members AND from
@@ -1203,6 +1227,11 @@ export default async function handler(req, res) {
       });
     }
     for (const m of crewMembers) {
+      // Household members (memberType: "member") are covered by the
+      // user-profile loop below — skip here to avoid double-pushing
+      // the same birthday once we mirror profile edits into the crew
+      // record for UI display purposes.
+      if (m.memberType === "member") continue;
       if (m.birthday) pushIfUpcoming(m.name || "Unknown", m.memberType || "adult", "birthday", m.birthday);
       if (m.anniversary) pushIfUpcoming(m.name || "Unknown", m.memberType || "adult", "anniversary", m.anniversary);
     }
@@ -1780,6 +1809,7 @@ ${isSingleMember
 - Weather: use weather as context only when it changes what someone should do about a signal. (a) If WEATHER TODAY is rain/showers/thunderstorm AND any outdoor service appointment is scheduled today/tomorrow, mention timing may be affected. (b) If extreme heat (>90°F) AND an HVAC service is scheduled, mention this is good timing for the service. (c) If rain/storm AND any package delivery is arriving today, mention packages may need to be brought in promptly. (d) Otherwise — including all "normal" weather (clear, partly cloudy, mild temperatures) and any case where no signal would actually be affected — say absolutely nothing about weather. Do NOT mention weather as a closing flourish, do NOT use weather as an "everything's fine otherwise" transition, do NOT describe weather to round out a paragraph, do NOT include phrases like "the day is clear and warm" or "with the nice weather" or "given the calm forecast." A brief without any weather mention reads correctly when weather isn't load-bearing — the reader will not notice it's missing. Never lead with weather. Never quote the temperature or condition string verbatim — paraphrase ("the rain coming through this afternoon") rather than restate ("72°F, Rain"). When in doubt about whether weather is load-bearing, omit it.
 - Childcare: mention only if it affects coordination today or tomorrow
 - Crew (children and pets): Crew members surface in the brief only when something is happening today or tomorrow that requires the household to act or be present. Never mention routine pickups or recurring activities unless there is a conflict or timing consideration. A pet vet appointment today is as important as a child's activity.
+- Co-parent coordination: when a CREW line for a child ends with " | co-parent: NAME", that means a non-household co-parent shares responsibility for that child. Mention coordination naturally ONLY when the event is a handoff-type item (pickup, drop-off, school event, activity) where logistics genuinely warrant a heads-up — e.g. "Mia's soccer game is Thursday at 4 — worth coordinating pickup with [name] if needed." Do NOT include the co-parent in every child mention; if the event doesn't need their involvement (a birthday card from school, a friendly classroom note), leave them out. Never expose the literal "co-parent:" annotation in the brief — it's routing metadata.
 - Crew birthdays/anniversaries: any entry in the CREW BIRTHDAYS/ANNIVERSARIES layer within 14 days ALWAYS appears in the brief. On the day itself (0 days), lead with it unless a high-severity conflict outranks it; 3 days out or less, mention with gentle urgency; further out, a single quiet acknowledgment is enough. Lift the parenthesized phrase verbatim ("today", "tomorrow", "in N days") — never compute your own count. Frame anniversaries as a household milestone, not a directive.
 - Home requirements: flag naturally if service window conflicts with likely schedule
 - Carried forward: if CARRIED FORWARD FROM YESTERDAY is populated, weave in one understated sentence near the end (before the horizon line) — e.g. "Carrying forward from yesterday: the HVAC appointment is still unconfirmed." Never alarming, never repetitive of the main brief narrative. If multiple carry-forwards exist, name at most one or two; the rest are implied.

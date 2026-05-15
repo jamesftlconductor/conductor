@@ -167,6 +167,46 @@ export default async function handler(req, res) {
       }
     }
 
+    // Auto-populate the household crew with a member record for this
+    // user. Idempotent — if a record with the same userId already
+    // exists, we leave it alone (preserving any birthday/anniversary
+    // edits made via the Crew screen's Edit modal). Wrapped in try/
+    // catch so a crew-write failure doesn't break the auth flow.
+    try {
+      const crewKey = `household:${resolvedHouseholdId}:crew`;
+      const crewRaw = await redis.get(crewKey);
+      const crew = (() => {
+        if (!crewRaw) return [];
+        try {
+          const parsed = typeof crewRaw === "string" ? JSON.parse(crewRaw) : crewRaw;
+          return Array.isArray(parsed) ? parsed : [];
+        } catch {
+          return [];
+        }
+      })();
+      const alreadyMember = crew.some(
+        (m) => m && m.memberType === "member" && m.userId === userId
+      );
+      if (!alreadyMember) {
+        const firstName = (user.name || "").split(/\s+/)[0] || "";
+        crew.push({
+          memberType: "member",
+          userId,
+          name: firstName,
+          fullName: user.name || null,
+          picture: user.picture || null,
+          email: user.email,
+          joinedAt: new Date().toISOString(),
+          birthday: null,
+          anniversary: null,
+        });
+        await redis.set(crewKey, JSON.stringify(crew));
+        console.log(`[callback] added crew member record for ${userId} in ${resolvedHouseholdId}`);
+      }
+    } catch (crewErr) {
+      console.warn(`[callback] crew auto-populate failed:`, crewErr?.message || crewErr);
+    }
+
     // Trigger the full onboarding sweep (email + calendar + horizon) via QStash.
     // Runs for every sign-in path — invite-join, new-create, and returning
     // — since /api/onboard reads user:{id}:household at execution time and
