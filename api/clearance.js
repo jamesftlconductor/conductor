@@ -111,7 +111,7 @@ async function tagBriefSegments(brief, signals) {
 - { type: 'text', content: '...' } for plain text
 - { type: 'signal', content: '...', signalId: '...', signalType: '...' } for phrases that refer to a specific signal
 
-signalType MUST be exactly one of: package, delivery, food, grocery, service, reservation, appointment, travel, deadline, unknown. Pick the closest match for the signal's nature. Use "unknown" if no value fits — never invent a different label.
+signalType MUST be exactly one of: package, delivery, food, grocery, service, reservation, appointment, travel, deadline, unknown. Copy the 'type' field directly from the matched signal's entry in the Signals list — that field IS the canonical signalType. Do NOT re-classify based on how the brief phrases it (e.g. if the signal's type is "deadline" and the brief calls it a "subscription", use "deadline" — the list is authoritative). Use "unknown" only when the matched signal's type is not in the allowed list above.
 
 MATCHING: use fuzzy/substring matching when the brief paraphrases a signal — descriptions in the Signals list are the canonical form, but the brief naturally shortens them. If the brief mentions a service, subscription, product, or vendor name that partially matches a signal's description, tag it. Examples:
 - Brief "Health Tech Nerds subscription" → matches signal description "Health Tech Nerds subscription renewal"

@@ -572,7 +572,7 @@ async function tagBriefSegments(brief, signals) {
 - { type: 'text', content: '...' } for plain text
 - { type: 'signal', content: '...', signalId: '...', signalType: '...' } for phrases that refer to a specific signal
 
-signalType MUST be exactly one of: package, delivery, food, grocery, service, reservation, appointment, travel, deadline, unknown. Pick the closest match for the signal's nature. Use "unknown" if no value fits — never invent a different label.
+signalType MUST be exactly one of: package, delivery, food, grocery, service, reservation, appointment, travel, deadline, unknown. Copy the 'type' field directly from the matched signal's entry in the Signals list — that field IS the canonical signalType. Do NOT re-classify based on how the brief phrases it (e.g. if the signal's type is "deadline" and the brief calls it a "subscription", use "deadline" — the list is authoritative). Use "unknown" only when the matched signal's type is not in the allowed list above.
 
 CRITICAL: signalId MUST be copied verbatim from the Signals list below — never invent, never reuse one signal's id for an unrelated phrase. If a phrase in the brief refers to something NOT in the Signals list (a calendar event, a crew member's activity, a weather note, a health metric), it MUST be a 'text' segment. When in doubt, prefer 'text'.
 
