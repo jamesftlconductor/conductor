@@ -1298,12 +1298,19 @@ ${emailsList}`;
   // Wrapped in try/catch so a failure here doesn't blow up the main
   // crew records that already landed.
   let birthdayProcessed = 0;
+  let birthdayFound = 0;
   try {
     const bdayQuery =
       `after:${twelveMonthsAgo} subject:(birthday OR "happy birthday" OR ` +
       `"birth date" OR anniversary OR "years together" OR "years married" OR ` +
       `"born on" OR "date of birth" OR "turning" OR "celebrates")`;
-    const bdayIds = await gmailSearch(accessToken, bdayQuery, 50).catch(() => []);
+    console.log(`[crew:birthday] query: ${bdayQuery.substring(0, 100)}...`);
+    const bdayIds = await gmailSearch(accessToken, bdayQuery, 50).catch((err) => {
+      console.warn(`[crew:birthday] gmailSearch threw: ${err.message}`);
+      return [];
+    });
+    birthdayFound = bdayIds.length;
+    console.log(`[crew:birthday] Gmail returned ${bdayIds.length} message ids`);
 
     if (bdayIds.length > 0) {
       const bdayHeaders = [];
@@ -1441,6 +1448,7 @@ ${emailsList}`;
     state: "complete",
     finishedAt: Date.now(),
     processed,
+    birthdayFound,
     birthdayProcessed,
     members: crew.length,
   });
