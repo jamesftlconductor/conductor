@@ -76,6 +76,33 @@ function parseDateLoose(value) {
   return isNaN(ms) ? null : new Date(ms);
 }
 
+// Days until the next occurrence of an MM-DD anchor (birthday or
+// anniversary, no year stored). Returns 0 for today, 1 for tomorrow,
+// and wraps to next year if the date has already passed this year.
+// Returns null for malformed input.
+function daysUntilMMDD(mmDd) {
+  if (typeof mmDd !== "string" || !/^\d{2}-\d{2}$/.test(mmDd)) return null;
+  const [mm, dd] = mmDd.split("-").map(Number);
+  if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  let candidate = new Date(now.getFullYear(), mm - 1, dd);
+  if (candidate.getTime() < today.getTime()) {
+    candidate = new Date(now.getFullYear() + 1, mm - 1, dd);
+  }
+  return Math.round((candidate.getTime() - today.getTime()) / DAY_MS);
+}
+
+// Renders an MM-DD date as e.g. "June 3" — month name + day, no year.
+function formatMMDD(mmDd) {
+  if (typeof mmDd !== "string" || !/^\d{2}-\d{2}$/.test(mmDd)) return mmDd;
+  const [mm, dd] = mmDd.split("-").map(Number);
+  return new Date(2000, mm - 1, dd).toLocaleDateString("en-US", {
+    month: "long",
+    day: "numeric",
+  });
+}
+
 // Module-level day-count phrase: emits authoritative "(in N days)" /
 // "(today)" / "(tomorrow)" / "(in N weeks)" for clean multiples of 7,
 // or "(yesterday)" / "(already passed N days ago)" for past dates.
@@ -1047,6 +1074,54 @@ export default async function handler(req, res) {
       return `- [${m.memberType.toUpperCase()}] ${label}: ${evs}`;
     }
 
+    // BIRTHDAYS + ANNIVERSARIES — collect from crew members AND from
+    // other household members' profiles (the requesting user is
+    // excluded by householdNameMap). 14-day forward window; today and
+    // tomorrow surface unconditionally per the prompt rule. Each entry
+    // carries the same authoritative "(in N days)" / "(today)" /
+    // "(tomorrow)" phrase the rest of the brief uses, so Claude lifts
+    // the count instead of computing it.
+    const upcomingCelebrations = [];
+    function pushIfUpcoming(who, relationship, kind, mmDd) {
+      const days = daysUntilMMDD(mmDd);
+      if (days == null || days > 14) return;
+      // Synthesize a real date so daysFromTodayPhrase can produce the
+      // same lift phrase the rest of the brief uses.
+      const [mm, dd] = mmDd.split("-").map(Number);
+      const nowSnap = new Date();
+      let target = new Date(nowSnap.getFullYear(), mm - 1, dd);
+      const todaySnap = new Date(nowSnap.getFullYear(), nowSnap.getMonth(), nowSnap.getDate());
+      if (target.getTime() < todaySnap.getTime()) {
+        target = new Date(nowSnap.getFullYear() + 1, mm - 1, dd);
+      }
+      const phrase = daysFromTodayPhrase(target.toISOString()) || `in ${days} days`;
+      upcomingCelebrations.push({
+        who, relationship, kind, mmDd, days, phrase,
+        dateLabel: formatMMDD(mmDd),
+      });
+    }
+    for (const m of crewMembers) {
+      if (m.birthday) pushIfUpcoming(m.name || "Unknown", m.memberType || "adult", "birthday", m.birthday);
+      if (m.anniversary) pushIfUpcoming(m.name || "Unknown", m.memberType || "adult", "anniversary", m.anniversary);
+    }
+    // Other household members' birthdays — householdNameMap already
+    // excludes the requesting user, so this naturally surfaces "the
+    // other person's" birthday rather than the reader's own.
+    for (const [memberUserId, memberFirstName] of (householdNameMap || new Map())) {
+      try {
+        const rawProfile = await redis.get(`user:${memberUserId}:profile`);
+        const profile = typeof rawProfile === "string" ? JSON.parse(rawProfile) : rawProfile;
+        if (profile?.birthday) pushIfUpcoming(memberFirstName, "household_member", "birthday", profile.birthday);
+        if (profile?.anniversary) pushIfUpcoming(memberFirstName, "household_member", "anniversary", profile.anniversary);
+      } catch {
+        // ignored
+      }
+    }
+    upcomingCelebrations.sort((a, b) => a.days - b.days);
+    function formatCelebrationLine(ev) {
+      return `- ${ev.who}'s ${ev.kind}: ${ev.dateLabel} (${ev.phrase})`;
+    }
+
     // FLAGGED CATEGORIES — match against nearSignals + calendar events.
     // nearSignals is already background-filtered above, so flagged-category
     // matches inherit the mute behavior automatically.
@@ -1428,6 +1503,9 @@ ${isSingleMember
       `CREW (children and pets — mention only if relevant today or tomorrow, never daily routine):`,
       crewToday.length > 0 ? crewToday.map(formatCrewLine).join("\n") : "None",
       ``,
+      `CREW BIRTHDAYS/ANNIVERSARIES (always surface if within 14 days):`,
+      upcomingCelebrations.length > 0 ? upcomingCelebrations.map(formatCelebrationLine).join("\n") : "None",
+      ``,
       `IN-PERSON HOME REQUIREMENTS (flag if nobody confirmed home):`,
       homeRequirements.length > 0
         ? homeRequirements
@@ -1485,6 +1563,7 @@ ${isSingleMember
 - Weather: use weather as context only when it changes what someone should do about a signal. (a) If WEATHER TODAY is rain/showers/thunderstorm AND any outdoor service appointment is scheduled today/tomorrow, mention timing may be affected. (b) If extreme heat (>90°F) AND an HVAC service is scheduled, mention this is good timing for the service. (c) If rain/storm AND any package delivery is arriving today, mention packages may need to be brought in promptly. (d) Otherwise — including all "normal" weather (clear, partly cloudy, mild temperatures) and any case where no signal would actually be affected — say absolutely nothing about weather. Do NOT mention weather as a closing flourish, do NOT use weather as an "everything's fine otherwise" transition, do NOT describe weather to round out a paragraph, do NOT include phrases like "the day is clear and warm" or "with the nice weather" or "given the calm forecast." A brief without any weather mention reads correctly when weather isn't load-bearing — the reader will not notice it's missing. Never lead with weather. Never quote the temperature or condition string verbatim — paraphrase ("the rain coming through this afternoon") rather than restate ("72°F, Rain"). When in doubt about whether weather is load-bearing, omit it.
 - Childcare: mention only if it affects coordination today or tomorrow
 - Crew (children and pets): Crew members surface in the brief only when something is happening today or tomorrow that requires the household to act or be present. Never mention routine pickups or recurring activities unless there is a conflict or timing consideration. A pet vet appointment today is as important as a child's activity.
+- Crew birthdays/anniversaries: any entry in the CREW BIRTHDAYS/ANNIVERSARIES layer within 14 days ALWAYS appears in the brief. On the day itself (0 days), lead with it unless a high-severity conflict outranks it; 3 days out or less, mention with gentle urgency; further out, a single quiet acknowledgment is enough. Lift the parenthesized phrase verbatim ("today", "tomorrow", "in N days") — never compute your own count. Frame anniversaries as a household milestone, not a directive.
 - Home requirements: flag naturally if service window conflicts with likely schedule
 - Carried forward: if CARRIED FORWARD FROM YESTERDAY is populated, weave in one understated sentence near the end (before the horizon line) — e.g. "Carrying forward from yesterday: the HVAC appointment is still unconfirmed." Never alarming, never repetitive of the main brief narrative. If multiple carry-forwards exist, name at most one or two; the rest are implied.
 - Still in motion: if STILL IN MOTION has an item, you MAY include one quiet "still moving" mention (e.g. "the renewal is still in motion, due Thursday"). Do NOT include if the same signal was already covered in URGENT or NEAR WINDOW prose this brief, and skip it entirely if doing so would push the brief past 5 sentences. A clean omission is fine — this layer is optional.

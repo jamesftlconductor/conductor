@@ -1285,6 +1285,146 @@ ${emailsList}`;
     });
   }
 
+  // ---------- Second pass: birthdays + anniversaries ----------
+  //
+  // Separate Gmail search keyed on birthday/anniversary subjects.
+  // Extracts MM-DD dates (no year) per crew member. Three routing
+  // paths after extraction:
+  //   A) Name matches a household member's first name → write to that
+  //      user's profile (user:{userId}:profile.birthday / .anniversary)
+  //   B) Name matches an existing crew member → patch birthday or
+  //      anniversary onto that record
+  //   C) New name → add a new crew member with just the date data
+  // Wrapped in try/catch so a failure here doesn't blow up the main
+  // crew records that already landed.
+  let birthdayProcessed = 0;
+  try {
+    const bdayQuery =
+      `after:${twelveMonthsAgo} subject:(birthday OR "happy birthday" OR ` +
+      `"birth date" OR anniversary OR "years together" OR "years married" OR ` +
+      `"born on" OR "date of birth" OR "turning" OR "celebrates")`;
+    const bdayIds = await gmailSearch(accessToken, bdayQuery, 50).catch(() => []);
+
+    if (bdayIds.length > 0) {
+      const bdayHeaders = [];
+      for (let i = 0; i < bdayIds.length; i += 15) {
+        const chunk = bdayIds.slice(i, i + 15);
+        const chunkResults = await Promise.all(
+          chunk.map((id) => fetchEmailMetadata(accessToken, id).catch(() => null))
+        );
+        bdayHeaders.push(...chunkResults);
+      }
+      const validBdayHeaders = bdayHeaders.filter(Boolean);
+
+      // Build first-name → userId map for routing path A. Used to
+      // distinguish household member birthdays (write to user profile)
+      // from extended-family / crew birthdays (write to :crew).
+      const memberIds = await redis.smembers(`household:${householdId}:members`);
+      const memberMap = new Map();
+      for (const mid of memberIds || []) {
+        try {
+          const rawProfile = await redis.get(`user:${mid}:profile`);
+          const profile = typeof rawProfile === "string" ? JSON.parse(rawProfile) : rawProfile;
+          const fullName = profile?.name || "";
+          const firstName = fullName.split(/\s+/)[0]?.toLowerCase();
+          if (firstName) memberMap.set(firstName, mid);
+        } catch {
+          // ignored
+        }
+      }
+
+      for (let i = 0; i < validBdayHeaders.length; i += 10) {
+        const batch = validBdayHeaders.slice(i, i + 10);
+        const emailsList = batch
+          .map((e, idx) => `${idx + 1}. Subject: ${e.subject}\n   From: ${e.from}`)
+          .join("\n");
+
+        const prompt = `Extract birthday or anniversary information from these emails. Return a JSON array or empty array:
+[{
+  "memberType": "child" | "adult" | "pet",
+  "name": string | null,
+  "eventType": "birthday" | "anniversary",
+  "date": "MM-DD" (month and day only, no year) | null,
+  "age": number | null,
+  "notes": string | null
+}]
+Only extract if you have high confidence in the name AND the date. Return empty array if nothing clear found.
+
+Emails:
+${emailsList}`;
+
+        try {
+          const text = await callClaude(prompt, 1000);
+          const items = safeParseJsonText(text);
+          if (!Array.isArray(items)) continue;
+
+          for (const item of items) {
+            if (!item || typeof item !== "object") continue;
+            const name = typeof item.name === "string" ? item.name.trim() : "";
+            const date = typeof item.date === "string" ? item.date.trim() : "";
+            if (!name || !date) continue;
+            // Reject anything that doesn't look like MM-DD (Claude
+            // occasionally hands back "June 3" prose form).
+            if (!/^\d{2}-\d{2}$/.test(date)) continue;
+            const firstName = name.split(/\s+/)[0];
+            const lowerFirst = firstName.toLowerCase();
+            const field = item.eventType === "anniversary" ? "anniversary" : "birthday";
+
+            // Path A: household member match → user profile
+            if (memberMap.has(lowerFirst)) {
+              const uid = memberMap.get(lowerFirst);
+              try {
+                const rawProfile = await redis.get(`user:${uid}:profile`);
+                const profile =
+                  typeof rawProfile === "string" ? JSON.parse(rawProfile) : (rawProfile || {});
+                profile[field] = date;
+                await redis.set(`user:${uid}:profile`, JSON.stringify(profile));
+                console.log(`[crew:birthday] stored ${field}=${date} for household member ${uid}`);
+              } catch (err) {
+                console.warn(`[crew:birthday] profile write failed for ${uid}:`, err.message);
+              }
+              continue;
+            }
+
+            // Path B/C: merge into crew. Try existing crew first under
+            // each plausible memberType key — Claude's memberType guess
+            // may differ from how the prior crew pass categorized them
+            // (e.g. "Mia" as both "child" from school comms and "adult"
+            // from a birthday card sender).
+            const requestedType = item.memberType || "adult";
+            const candidateKeys = ["child", "pet", "adult"].map((t) => `${t}:${lowerFirst}`);
+            let merged = false;
+            for (const ck of candidateKeys) {
+              const existing = crewByKey.get(ck);
+              if (existing) {
+                existing[field] = date;
+                if (item.age != null) existing.age = existing.age ?? item.age;
+                if (item.notes) existing.notes = existing.notes ?? item.notes;
+                merged = true;
+                break;
+              }
+            }
+            if (!merged) {
+              const newMember = {
+                memberType: requestedType,
+                name: firstName,
+                age: item.age || null,
+                [field]: date,
+              };
+              if (item.notes) newMember.notes = item.notes;
+              crewByKey.set(`${requestedType}:${lowerFirst}`, newMember);
+            }
+          }
+        } catch (err) {
+          console.warn("Birthday batch failed:", err.message);
+        }
+        birthdayProcessed += batch.length;
+      }
+    }
+  } catch (err) {
+    console.warn("Birthday pass failed:", err.message);
+  }
+
   const crew = [...crewByKey.values(), ...unkeyed];
 
   // Single-key string write; consumers parse JSON on read.
@@ -1296,6 +1436,7 @@ ${emailsList}`;
     state: "complete",
     finishedAt: Date.now(),
     processed,
+    birthdayProcessed,
     members: crew.length,
   });
 
