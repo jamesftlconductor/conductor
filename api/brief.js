@@ -76,6 +76,108 @@ function parseDateLoose(value) {
   return isNaN(ms) ? null : new Date(ms);
 }
 
+// Common-airport-to-city map for destination extraction. Not exhaustive
+// — covers the heavy-traffic routes a household traveler is likeliest to
+// see in flight confirmation subjects/descriptions. Falls back to text
+// pattern matching for anything outside this list.
+const AIRPORT_TO_CITY = {
+  ATL: "Atlanta", AUS: "Austin", BOS: "Boston", BWI: "Baltimore",
+  CLT: "Charlotte", DCA: "Washington DC", DEN: "Denver", DFW: "Dallas",
+  DTW: "Detroit", EWR: "Newark", FLL: "Fort Lauderdale", IAD: "Washington DC",
+  IAH: "Houston", JFK: "New York", LAS: "Las Vegas", LAX: "Los Angeles",
+  LGA: "New York", MCO: "Orlando", MIA: "Miami", MSP: "Minneapolis",
+  ORD: "Chicago", PDX: "Portland", PHL: "Philadelphia", PHX: "Phoenix",
+  RDU: "Raleigh", SAN: "San Diego", SEA: "Seattle", SFO: "San Francisco",
+  SLC: "Salt Lake City", STL: "St. Louis", TPA: "Tampa",
+  YYZ: "Toronto", YVR: "Vancouver", YUL: "Montreal",
+  LHR: "London", LGW: "London", CDG: "Paris", ORY: "Paris",
+  AMS: "Amsterdam", FRA: "Frankfurt", MUC: "Munich", ZRH: "Zurich",
+  MAD: "Madrid", BCN: "Barcelona", FCO: "Rome", VCE: "Venice",
+  ATH: "Athens", IST: "Istanbul", DUB: "Dublin", CPH: "Copenhagen",
+  ARN: "Stockholm", HEL: "Helsinki", OSL: "Oslo",
+  NRT: "Tokyo", HND: "Tokyo", ICN: "Seoul", PEK: "Beijing",
+  PVG: "Shanghai", HKG: "Hong Kong", SIN: "Singapore", BKK: "Bangkok",
+  DXB: "Dubai", DOH: "Doha", BOM: "Mumbai", DEL: "Delhi",
+  SYD: "Sydney", MEL: "Melbourne", AKL: "Auckland",
+  GRU: "São Paulo", GIG: "Rio de Janeiro", EZE: "Buenos Aires",
+  MEX: "Mexico City", CUN: "Cancun", CDMX: "Mexico City",
+};
+
+const CITY_STOPWORDS = new Set([
+  "The", "A", "An", "January", "February", "March", "April", "May",
+  "June", "July", "August", "September", "October", "November", "December",
+  "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+  "Hotel", "Flight", "Trip", "Reservation", "Confirmation", "Departure",
+]);
+
+// Pulls a destination from a travel-signal description or title.
+// Strategy: 3-letter airport code first (most reliable), then "to <City>"
+// or "in <City>" patterns. Returns null when nothing confident enough.
+function extractDestination(text) {
+  if (typeof text !== "string" || !text) return null;
+  // Strip very common patterns that confuse pattern matching.
+  const normalized = text.replace(/[(),]/g, " ").replace(/\s+/g, " ");
+  // Airport code: 3 capitalized letters, word-boundary. Map back to city.
+  const airportMatches = [...normalized.matchAll(/\b([A-Z]{3})\b/g)];
+  for (const m of airportMatches) {
+    const city = AIRPORT_TO_CITY[m[1]];
+    if (city) return city;
+  }
+  // "to <Capitalized words>" — captures up to 3-word place names like "New York" or "São Paulo".
+  const toMatch = normalized.match(/\bto\s+([A-Z][a-zà-ÿ]+(?:\s+[A-Z][a-zà-ÿ]+){0,2})/);
+  if (toMatch && !CITY_STOPWORDS.has(toMatch[1].split(/\s+/)[0])) {
+    return toMatch[1];
+  }
+  // "in <Capitalized words>" — covers hotel reservation descriptions like
+  // "Hotel Lumen Paris Louvre reservation" where the city follows "in"
+  // less often, but also matches direct names. We require the word right
+  // after "in" not to be a stopword (month/weekday/etc.) before returning.
+  const inMatch = normalized.match(/\bin\s+([A-Z][a-zà-ÿ]+(?:\s+[A-Z][a-zà-ÿ]+){0,2})/);
+  if (inMatch && !CITY_STOPWORDS.has(inMatch[1].split(/\s+/)[0])) {
+    return inMatch[1];
+  }
+  return null;
+}
+
+// Geocode + weather lookup for a destination city. Best-effort with a
+// 3s timeout (same budget as the local fetchWeather). Returns null on
+// any failure so the brief still ships without destination weather.
+async function fetchDestinationWeather(destination) {
+  if (!destination) return null;
+  try {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 3000);
+    const geoUrl =
+      `https://geocoding-api.open-meteo.com/v1/search` +
+      `?name=${encodeURIComponent(destination)}&count=1&language=en&format=json`;
+    const geoRes = await fetch(geoUrl, { signal: controller.signal });
+    if (!geoRes.ok) { clearTimeout(t); return null; }
+    const geoData = await geoRes.json();
+    const place = geoData?.results?.[0];
+    if (!place) { clearTimeout(t); return null; }
+    const weatherUrl =
+      `https://api.open-meteo.com/v1/forecast` +
+      `?latitude=${place.latitude}&longitude=${place.longitude}` +
+      `&current=temperature_2m,weathercode&temperature_unit=fahrenheit`;
+    const weatherRes = await fetch(weatherUrl, { signal: controller.signal });
+    clearTimeout(t);
+    if (!weatherRes.ok) return null;
+    const weatherData = await weatherRes.json();
+    const cur = weatherData?.current;
+    if (!cur || typeof cur.temperature_2m !== "number") return null;
+    const tempF = Math.round(cur.temperature_2m);
+    return {
+      destination,
+      tempF,
+      weatherCode: cur.weathercode ?? 0,
+      summary: classifyWeather(cur.weathercode ?? 0, tempF),
+    };
+  } catch (err) {
+    console.warn(`[travel-prep] destination weather fetch failed for ${destination}:`, err?.message || err);
+    return null;
+  }
+}
+
 // Days until the next occurrence of an MM-DD anchor (birthday or
 // anniversary, no year stored). Returns 0 for today, 1 for tomorrow,
 // and wraps to next year if the date has already passed this year.
@@ -1122,6 +1224,117 @@ export default async function handler(req, res) {
       return `- ${ev.who}'s ${ev.kind}: ${ev.dateLabel} (${ev.phrase})`;
     }
 
+    // TRAVEL PREP — when any signal with type "travel" has ETA within
+    // 72 hours, the brief shifts into pre-departure mode. We assemble
+    // the trip context (accommodation on matching dates, pre-departure
+    // deliveries, same-day service conflicts, destination weather)
+    // and inject it as a high-priority layer the prompt is told to
+    // lead with.
+    const NOW_MS = Date.now();
+    const SEVENTY_TWO_HOURS_MS = 72 * HOUR_MS;
+    const imminentTravel = activeSignals
+      .filter((s) => s.type === "travel" && s.eta)
+      .map((s) => {
+        const etaMs = parseDateLoose(s.eta)?.getTime();
+        return etaMs ? { signal: s, etaMs } : null;
+      })
+      .filter(Boolean)
+      .filter((x) => x.etaMs > NOW_MS && x.etaMs - NOW_MS <= SEVENTY_TWO_HOURS_MS)
+      .sort((a, b) => a.etaMs - b.etaMs);
+
+    let travelPrep = null;
+    if (imminentTravel.length > 0) {
+      const { signal: travelSignal, etaMs: travelEtaMs } = imminentTravel[0];
+      const sevenDaysAfter = travelEtaMs + 7 * 24 * HOUR_MS;
+      const sameDayWindowEnd = travelEtaMs + 24 * HOUR_MS;
+
+      // Hotel/accommodation: reservation with ETA in [travel - 24h,
+      // travel + 7 days]. Hotel check-ins typically fall on departure
+      // day or shortly after for international travel.
+      const accommodations = activeSignals
+        .filter((s) => s.type === "reservation" && s.eta)
+        .map((s) => ({ s, etaMs: parseDateLoose(s.eta)?.getTime() }))
+        .filter((x) => x.etaMs && x.etaMs >= travelEtaMs - 24 * HOUR_MS && x.etaMs <= sevenDaysAfter)
+        .map((x) => x.s);
+
+      // Pre-departure deliveries: delivery/package with ETA before
+      // travel, in the window (now, departure). Further-out deliveries
+      // aren't relevant to this trip's checklist.
+      const preDeparture = activeSignals
+        .filter((s) => (s.type === "delivery" || s.type === "package") && s.eta)
+        .map((s) => ({ s, etaMs: parseDateLoose(s.eta)?.getTime() }))
+        .filter((x) => x.etaMs && x.etaMs > NOW_MS && x.etaMs < travelEtaMs)
+        .map((x) => x.s);
+
+      // Same-day conflicts: service or appointment on the same day as
+      // travel (within 12h before to 24h after the travel ETA).
+      const sameDayConflicts = activeSignals
+        .filter((s) => (s.type === "service" || s.type === "appointment") && s.eta)
+        .map((s) => ({ s, etaMs: parseDateLoose(s.eta)?.getTime() }))
+        .filter((x) => x.etaMs && x.etaMs >= travelEtaMs - 12 * HOUR_MS && x.etaMs <= sameDayWindowEnd)
+        .map((x) => x.s);
+
+      // Destination extraction draws from the travel signal description
+      // first, then accommodation as a fallback (a Hotel reservation in
+      // Paris is just as telling as a flight to CDG). Weather fetch is
+      // best-effort: 3s budget, returns null on any failure so the
+      // brief still ships without destination weather.
+      const destText = [
+        travelSignal.description || "",
+        accommodations[0]?.description || "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      const destination = extractDestination(destText);
+      const destinationWeather = destination
+        ? await fetchDestinationWeather(destination)
+        : null;
+
+      travelPrep = {
+        travelSignal,
+        accommodations,
+        preDeparture,
+        sameDayConflicts,
+        destination,
+        destinationWeather,
+      };
+    }
+
+    function formatTravelPrepBlock() {
+      if (!travelPrep) return null;
+      const lines = [];
+      const lift = (eta) => {
+        const phrase = eta ? daysFromTodayPhrase(eta) : null;
+        return phrase ? ` (${phrase})` : "";
+      };
+      lines.push(
+        `Flight/travel: ${travelPrep.travelSignal.description || "Travel"}${lift(travelPrep.travelSignal.eta)}`
+      );
+      if (travelPrep.accommodations.length > 0) {
+        lines.push(
+          `Accommodation: ${travelPrep.accommodations.map((s) => `${s.description || "Reservation"}${lift(s.eta)}`).join("; ")}`
+        );
+      }
+      if (travelPrep.destinationWeather) {
+        lines.push(
+          `Destination weather: ${travelPrep.destinationWeather.summary} at ${travelPrep.destination}`
+        );
+      } else if (travelPrep.destination) {
+        lines.push(`Destination: ${travelPrep.destination} (weather unavailable)`);
+      }
+      if (travelPrep.preDeparture.length > 0) {
+        lines.push(
+          `Before you leave: ${travelPrep.preDeparture.map((s) => `${s.description || "Item"}${lift(s.eta)}`).join("; ")}`
+        );
+      }
+      if (travelPrep.sameDayConflicts.length > 0) {
+        lines.push(
+          `Conflicts: ${travelPrep.sameDayConflicts.map((s) => `${s.description || "Conflict"}${lift(s.eta)}`).join("; ")}`
+        );
+      }
+      return lines.join("\n");
+    }
+
     // FLAGGED CATEGORIES — match against nearSignals + calendar events.
     // nearSignals is already background-filtered above, so flagged-category
     // matches inherit the mute behavior automatically.
@@ -1485,6 +1698,9 @@ ${isSingleMember
     const layeredContext = [
       `Today is ${today}.`,
       ``,
+      `TRAVEL PREP (within 72 hours — when this layer is non-empty, lead with it):`,
+      travelPrep ? formatTravelPrepBlock() : "None",
+      ``,
       `CONFLICTS DETECTED (surface these naturally and specifically — these are the most important things to mention):`,
       conflictLines,
       ``,
@@ -1553,6 +1769,7 @@ ${isSingleMember
     const baseRules = `RULES:
 - CRITICAL RULE: Maximum 5 sentences. Count every sentence including the final one. If you reach 5 sentences, stop. Do not add a 6th sentence under any circumstances. A 4-sentence brief is better than a 6-sentence brief.
 - Synthesize all layers into flowing prose — never a list
+- Travel prep: when TRAVEL PREP is non-empty (any item shown beyond "None"), OPEN the brief with travel context. Weave the flight time, accommodation, destination weather, pre-departure deliveries, and any same-day conflicts into 2-3 natural sentences — never list robotically, never bullet, never restate the layer's section headers. Make it feel like a pre-departure checklist assembled by someone who knows the trip. Subsequent layers (urgent renewals, near-window, etc.) become secondary unless they're tied to the trip; mention at most one non-trip item after the travel paragraph, only if it genuinely needs surfacing. Lift the parenthesized day-count phrases verbatim — never compute your own.
 - Lead with urgent if present
 - A detected conflict should always appear in the brief if it is high severity
 - Medium severity conflicts appear if there is space in the brief
