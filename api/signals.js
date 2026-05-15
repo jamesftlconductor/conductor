@@ -468,6 +468,17 @@ async function handleMissedCues(req, res) {
   return res.status(200).json({ household: householdId, signals: missed });
 }
 
+async function handleHealthRead(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for health" });
+  }
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: "Missing userId" });
+  const raw = await redis.get(`user:${userId}:health`);
+  return res.status(200).json({ userId, health: safeJson(raw) });
+}
+
 async function handlePreferences(req, res) {
   if (req.method === "GET") {
     const { userId } = req.query;
@@ -509,7 +520,14 @@ async function handlePreferences(req, res) {
     if (healthData !== undefined) {
       // Stamp receipt so brief.js can decide whether the snapshot is stale.
       const stamped = { ...healthData, receivedAt: Date.now() };
+      // Diagnostic logs — left in place so we can confirm health data is
+      // flowing from a freshly-installed device without waiting for the
+      // next brief to surface (or not surface) the values.
+      console.log(
+        `Health sync received for ${userId}: sleep=${healthData?.sleep?.duration}h HRV=${healthData?.hrv?.current} steps=${healthData?.steps}`
+      );
       await redis.set(`user:${userId}:health`, JSON.stringify(stamped));
+      console.log(`Health data stored at user:${userId}:health`);
     }
     return res.status(200).json({ ok: true, userId });
   }
@@ -539,6 +557,8 @@ function applyDefaultsAndExpiry(signal) {
   // it" for missed-cue flagging.
   const wasIncoming = !signal.state || signal.state === "incoming";
   if (!signal.state) signal.state = "incoming";
+
+  let expiryReason = null;
 
   if (signal.state !== "resolved" && signal.state !== "expired" && signal.eta) {
     const etaMs = Date.parse(signal.eta);
@@ -572,6 +592,7 @@ function applyDefaultsAndExpiry(signal) {
       if (shouldExpire) {
         signal.state = "expired";
         signal.expiredAt = new Date().toISOString();
+        expiryReason = `eta-past-${type || "unknown"}-window`;
         // Missed cue = user never Rested or Held the signal before it
         // auto-expired. The Missed Cues screen reads from a separate
         // LPUSH'd list (handled by loadSignals after the per-signal
@@ -581,8 +602,38 @@ function applyDefaultsAndExpiry(signal) {
     }
   }
 
+  // Stale no-ETA rule: signals stuck in "incoming" for >7 days with no
+  // ETA at all were never actionable — they're radar clutter from
+  // import sweeps that couldn't extract a date. Expire them so they
+  // stop competing for brief attention. Falls back to signal.id when
+  // lastUpdate is missing (id is Date.now() at import time).
+  if (
+    signal.state === "incoming" &&
+    (!signal.eta || signal.eta === "" || signal.eta === "Unknown") &&
+    wasIncoming
+  ) {
+    const lastMs = signal.lastUpdate ? Date.parse(signal.lastUpdate) : NaN;
+    const ageMs = !isNaN(lastMs)
+      ? Date.now() - lastMs
+      : typeof signal.id === "number" && signal.id > 0
+      ? Date.now() - signal.id
+      : 0;
+    const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+    if (ageMs > SEVEN_DAYS_MS) {
+      signal.state = "expired";
+      signal.expiredAt = new Date().toISOString();
+      signal.missedCue = true;
+      expiryReason = "incoming-no-eta-stale-7d";
+    }
+  }
+
   const changed = JSON.stringify(signal) !== original;
   const justExpired = wasNotExpired && signal.state === "expired";
+  if (justExpired) {
+    console.log(
+      `auto-expired signal ${signal.id} type=${signal.type || "unknown"} reason=${expiryReason || "unknown"}`
+    );
+  }
   return { signal, changed, justExpired };
 }
 
@@ -676,6 +727,13 @@ export default async function handler(req, res) {
     // Powers the Compass screen.
     if (queryType === "compass" || bodyType === "compass") {
       return handleCompass(req, res);
+    }
+
+    // Health snapshot — returns whatever the most recent healthData POST
+    // wrote to user:{userId}:health. Used to verify Apple Watch data is
+    // actually flowing without waiting for the next brief generation.
+    if (queryType === "health") {
+      return handleHealthRead(req, res);
     }
 
     if (req.method === "GET") {

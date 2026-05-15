@@ -765,13 +765,20 @@ Return only the JSON object.`,
 const VAULT_PASSES = [
   {
     key: "insurance",
+    // OR-fallback at the end catches high-signal insurance subjects that
+    // don't match the two-clause structure (e.g. "your annual renewal"
+    // has no insurance keyword in the first clause). A low-confidence
+    // insurance policy with a real date is still better than an empty
+    // Vault — kept in the instructions below.
     query:
-      `subject:(insurance OR policy OR coverage OR premium OR deductible) ` +
+      `(subject:(insurance OR policy OR coverage OR premium OR deductible) ` +
       `subject:(renewal OR renews OR renewed OR expires OR expiring OR "due" OR ` +
-      `"anniversary" OR "effective date")`,
+      `"anniversary" OR "effective date")) OR ` +
+      `subject:("policy renewal notice" OR "your annual renewal" OR "renewal invoice" OR ` +
+      `"premium notice" OR "your policy renews")`,
     instructions: `Extract insurance policy information. Return JSON or null:
 { "category": "insurance", "subtype": "auto|home|health|dental|vision|life|renters|other", "description": "specific policy description", "provider": "company name", "renewalDate": "YYYY-MM-DD or null", "amount": "annual premium if known or null", "policyNumber": "if visible or null", "consequence": "what lapses if missed", "confidence": "high|medium|low" }
-Only return if renewal date is in the future or within 60 days past. Return null if purely promotional.`,
+Return the item whenever you can identify BOTH a provider AND a renewal date, even at low confidence — a real date plus a known issuer is enough to be useful. Drop only if either is missing, the renewal date is more than 60 days in the past, or the email is purely promotional with no policy reference.`,
   },
   {
     key: "subscriptions",
@@ -782,7 +789,7 @@ Only return if renewal date is in the future or within 60 days past. Return null
       `expires OR expiring OR "auto-renewal")`,
     instructions: `Extract subscription or membership renewal. Return JSON or null:
 { "category": "subscription", "subtype": "streaming|software|membership|service|other", "description": "what this subscription is for", "provider": "company name", "renewalDate": "YYYY-MM-DD or null", "amount": "monthly or annual cost if known or null", "frequency": "monthly|annual|other", "consequence": "service stops or auto-charges", "confidence": "high|medium|low" }
-Only return if this is a real subscription with a renewal date, not a promotional offer. Return null if promotional.`,
+Return the item whenever you can identify BOTH a provider AND a renewal date, even at low confidence. Drop only if either is missing or the email is a pure promotional offer with no real subscription.`,
   },
   {
     key: "medical",
@@ -792,7 +799,7 @@ Only return if this is a real subscription with a renewal date, not a promotiona
       `"days supply" OR "open enrollment" OR renewal OR renews)`,
     instructions: `Extract prescription or medical benefit information. Return JSON or null:
 { "category": "medical", "subtype": "prescription|FSA|HSA|benefits|appointment|other", "description": "medication name or benefit type", "provider": "pharmacy or insurer name", "renewalDate": "YYYY-MM-DD — next refill date or benefit expiry or null", "amount": "cost if known or null", "consequence": "runs out or expires or lapses", "confidence": "high|medium|low" }
-Return null if purely promotional or no actionable date.`,
+Return the item whenever you can identify BOTH a provider AND an actionable date, even at low confidence. Drop only if either is missing or the email is purely promotional.`,
   },
   {
     key: "warranties",
@@ -803,7 +810,7 @@ Return null if purely promotional or no actionable date.`,
       `"about to expire" OR registration)`,
     instructions: `Extract warranty or service contract information. Return JSON or null:
 { "category": "warranty", "subtype": "electronics|appliance|vehicle|home|other", "description": "what is covered", "provider": "warranty provider name", "renewalDate": "YYYY-MM-DD — expiry date or null", "amount": "cost if known or null", "consequence": "no coverage if expires", "confidence": "high|medium|low" }
-Return null if no expiry date found or purely promotional.`,
+Return the item whenever you can identify BOTH a provider AND an expiry date, even at low confidence. Drop only if either is missing or the email is purely promotional.`,
   },
   {
     key: "registrations",
@@ -814,7 +821,7 @@ Return null if no expiry date found or purely promotional.`,
       `"renewal reminder" OR "renewal notice")`,
     instructions: `Extract registration, license, or legal document expiration. Return JSON or null:
 { "category": "registration", "subtype": "vehicle|drivers_license|passport|lease|domain|business|other", "description": "what needs renewing", "provider": "issuing authority or company", "renewalDate": "YYYY-MM-DD or null", "amount": "fee if known or null", "consequence": "lapses or illegal or service stops", "confidence": "high|medium|low" }
-Return null if no clear expiry date or purely informational.`,
+Return the item whenever you can identify BOTH an issuing authority/provider AND a renewal date, even at low confidence. Drop only if either is missing or the email is purely informational with no actionable expiry.`,
   },
 ];
 
@@ -1128,12 +1135,12 @@ async function runCrewJob(userId, householdId) {
   const twelveMonthsAgo = Math.floor((Date.now() - 365 * DAY_MS) / 1000);
 
   const query =
-    `after:${twelveMonthsAgo} subject:(soccer OR baseball OR basketball OR football OR ` +
-    `swim OR dance OR piano OR violin OR guitar OR lessons OR practice OR game OR ` +
-    `recital OR "school pickup" OR "drop off" OR dropoff OR pediatric OR ` +
-    `"vet appointment" OR veterinary OR grooming OR "dog park" OR ClassDojo OR ` +
-    `Brightwheel OR Remind OR "parent teacher" OR "field trip" OR "school calendar" OR ` +
-    `"activity fee" OR registration)`;
+    `after:${twelveMonthsAgo} subject:(soccer OR baseball OR basketball OR swim OR ` +
+    `dance OR piano OR guitar OR violin OR lessons OR practice OR game OR recital OR ` +
+    `"school" OR "pickup" OR pediatric OR vet OR veterinary OR grooming OR ` +
+    `ClassDojo OR Brightwheel OR Remind OR "parent teacher" OR "field trip" OR ` +
+    `tutor OR karate OR gymnastics OR lacrosse OR hockey OR tennis OR ` +
+    `"after school" OR "day care" OR daycare OR preschool)`;
 
   const messageIds = await gmailSearch(accessToken, query, 100).catch(() => []);
   await patchJob(householdId, "crew", { found: messageIds.length });
@@ -1251,7 +1258,9 @@ For pets:
   "upcomingEvents": [{ "description": string, "date": string }]
 }
 
-Only return items where you have high confidence. Return empty array if nothing found.
+Look for any indication of children or pets. Even indirect signals count — a school newsletter, a vet bill receipt, a sports registration confirmation, a daycare invoice. Extract whatever you can find even if incomplete. A child's first name alone is worth capturing.
+
+Return a crew member if you have at least a name OR a recurring activity. Return empty array only if you genuinely find no children/pets references.
 Return ONLY the JSON array, nothing else.
 
 Emails:

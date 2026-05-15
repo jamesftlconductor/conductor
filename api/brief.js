@@ -467,8 +467,9 @@ Childcare: ${eventList(pools.childcare)}
 Home requirements: ${briefList(pools.homeRequirements)}
 Horizon: ${pools.horizon ? `- ${pools.horizon.description || "Unknown"}` : "(none)"}
 Carried forward: ${briefList(pools.carriedForward)}
+Background (already mentioned in a prior brief, unchanged — surface here as quiet background awareness when other layers are thin): ${briefList(pools.backgroundRest)}
 
-Always provide 1-2 sentences. If the brief already covered the most pressing items, write about what's quietly in the background — signals in motion that weren't urgent enough to lead with, things Conductor is watching, or forward-looking awareness for the week ahead. Never repeat anything specific from the brief. Never introduce new urgency. This is background awareness, not action items. Plain text only.`;
+Always provide 1-2 sentences. If the brief already covered the most pressing items, write about what's quietly in the background — signals in motion that weren't urgent enough to lead with, things Conductor is watching, or forward-looking awareness for the week ahead. When the Background pool is non-empty AND there's nothing more pressing to say, you may name one or two of those items as still-in-motion context (e.g. "the HVAC appointment is still on the books for Thursday"). Never repeat anything specific from the brief. Never introduce new urgency. This is background awareness, not action items. Plain text only.`;
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -829,12 +830,14 @@ export default async function handler(req, res) {
 
     // NEAR WINDOW (excluding urgent) — background-filter applies. A near-window
     // signal that's already been narrated and hasn't shifted ring/status/state
-    // moves to the silent background pool (still on the Hover radar, just not
-    // narrated again until something changes).
-    const nearSignals = activeSignals
+    // moves to a background pool: max 1 surfaces as a quiet "still in motion"
+    // mention in the brief, the rest flow to The Read so they're not silent
+    // entirely.
+    const nearWindowCandidates = activeSignals
       .filter((s) => !urgentIds.has(String(s.id)))
-      .filter(isInNearWindow)
-      .filter((s) => !isBackgroundFiltered(s));
+      .filter(isInNearWindow);
+    const nearSignals = nearWindowCandidates.filter((s) => !isBackgroundFiltered(s));
+    const backgroundNearSignals = nearWindowCandidates.filter((s) => isBackgroundFiltered(s));
 
     // DEADLINES — pulled from :vault (the new dedicated deadline storage).
     // Vault items use renewalDate; adapt to the eta-based shape the rest of
@@ -875,6 +878,7 @@ export default async function handler(req, res) {
 
     const urgentDeadlines = [];
     const nearDeadlines = [];
+    const backgroundNearDeadlines = [];
     for (const d of allDeadlines) {
       const eta = parseDateLoose(d.eta);
       if (!eta) continue;
@@ -884,8 +888,10 @@ export default async function handler(req, res) {
       if (days >= -1 && days < 14) urgentDeadlines.push(d);
       else if (days >= 14 && days <= 60) {
         // Near-window vault items get the background-filter treatment too —
-        // same "don't repeat last brief" rule applies.
-        if (!isBackgroundFiltered(d)) nearDeadlines.push(d);
+        // same "don't repeat last brief" rule applies; muted items spill into
+        // the background pool rather than vanishing entirely.
+        if (isBackgroundFiltered(d)) backgroundNearDeadlines.push(d);
+        else nearDeadlines.push(d);
       }
       // 60-90 days reserved for horizon; handled below.
     }
@@ -904,10 +910,25 @@ export default async function handler(req, res) {
 
     // HOME REQUIREMENTS — service signals today or tomorrow. Same mute rule:
     // if we already flagged "Plumber tomorrow at 9" yesterday and nothing
-    // changed, don't say it again this morning.
-    const homeRequirements = activeSignals
-      .filter(isHomeRequirement)
-      .filter((s) => !isBackgroundFiltered(s));
+    // changed, route to background instead of silently dropping.
+    const homeRequirementsCandidates = activeSignals.filter(isHomeRequirement);
+    const homeRequirements = homeRequirementsCandidates.filter((s) => !isBackgroundFiltered(s));
+    const backgroundHomeRequirements = homeRequirementsCandidates.filter((s) => isBackgroundFiltered(s));
+
+    // Background pool: signals that would have been narrated but are unchanged
+    // since the last brief. Max 1 surfaces in the brief itself as a quiet
+    // "still in motion" mention; the rest spill into The Read so they're
+    // acknowledged in background-awareness prose rather than disappearing.
+    // Urgent and status-changed signals are already excluded upstream
+    // (isBackgroundFiltered checks status/state/ring; urgent bypass at the
+    // urgentSignals filter).
+    const backgroundPool = [
+      ...backgroundNearSignals,
+      ...backgroundHomeRequirements,
+      ...backgroundNearDeadlines,
+    ];
+    const stillInMotion = backgroundPool[0] || null;
+    const backgroundRest = backgroundPool.slice(1);
 
     // CREW — children + pets layer. Read the JSON-string household:{id}:crew
     // written by the onboard worker, then filter for upcomingEvents falling
@@ -1362,6 +1383,11 @@ ${isSingleMember
       `NEAR WINDOW — next 14 days:`,
       nearForPrompt.length > 0 ? nearForPrompt.map(formatSignal).join("\n") : "Nothing in the near window",
       ``,
+      `STILL IN MOTION (at most one item — already covered in a prior brief, hasn't changed; mention quietly only if it adds value, otherwise omit):`,
+      stillInMotion
+        ? `- ${stillInMotion.description || "Unknown"} | ${etaWithFriendly(stillInMotion.eta)}`
+        : "None",
+      ``,
       `FLAGGED CATEGORIES:`,
       Object.keys(flaggedSignals).length > 0 ? JSON.stringify(flaggedSignals) : "No flagged categories set",
       ``,
@@ -1406,6 +1432,7 @@ ${isSingleMember
 - Crew (children and pets): Crew members surface in the brief only when something is happening today or tomorrow that requires the household to act or be present. Never mention routine pickups or recurring activities unless there is a conflict or timing consideration. A pet vet appointment today is as important as a child's activity.
 - Home requirements: flag naturally if service window conflicts with likely schedule
 - Carried forward: if CARRIED FORWARD FROM YESTERDAY is populated, weave in one understated sentence near the end (before the horizon line) — e.g. "Carrying forward from yesterday: the HVAC appointment is still unconfirmed." Never alarming, never repetitive of the main brief narrative. If multiple carry-forwards exist, name at most one or two; the rest are implied.
+- Still in motion: if STILL IN MOTION has an item, you MAY include one quiet "still moving" mention (e.g. "the renewal is still in motion, due Thursday"). Do NOT include if the same signal was already covered in URGENT or NEAR WINDOW prose this brief, and skip it entirely if doing so would push the brief past 5 sentences. A clean omission is fine — this layer is optional.
 - Horizon signal: one sentence at the end, tonal shift to future-aware, specific and surprising
 - Horizon awareness: if HORIZON AWARENESS is populated, surface it as one quiet sentence near the end (a "by the way..." not a lead). If both HORIZON SIGNAL and HORIZON AWARENESS are populated, prefer HORIZON AWARENESS — at most one horizon-style sentence per brief total.
 - Feedback tuning: the FEEDBACK HISTORY counts reflect how prior briefs landed. If thumbs-down significantly outnumbers thumbs-up for this brief type (takeoff or clearance, depending on which you're writing), be more concise and specific — trim discretionary sentences, lean harder into the most concrete signals. If thumbs-up is high or both counts are low, maintain current voice. Never reference the feedback in the brief output.
@@ -1486,6 +1513,11 @@ ${isSingleMember
       homeRequirements,
       horizon: horizonAwarenessSignal || horizonSignal,
       carriedForward: carriedForwardSignals,
+      // Signals that were muted from the main brief because they were
+      // already narrated and unchanged. The Read picks these up so they
+      // get acknowledged in background-awareness prose rather than going
+      // completely silent.
+      backgroundRest,
     };
     const [segments, transparency, theRead] = await Promise.all([
       tagBriefSegments(brief, tagSignals),
