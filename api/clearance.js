@@ -715,7 +715,12 @@ ${isSingleMember
       ...nearDeadlines,
       ...lastChancePool,
     ];
-    if (horizonSignal) tagPool.push(horizonSignal);
+    // Horizon items are vault deadlines — augment with type:"deadline"
+    // so the segmenter's idToType map records the canonical type
+    // (vault raw category is "subscription"/"insurance"/etc. which
+    // isn't in the allowed signalType enum and would otherwise let
+    // the segmenter drift to "unknown").
+    if (horizonSignal) tagPool.push({ ...horizonSignal, _isDeadline: true, type: "deadline" });
     // Dedupe by id — lastChancePool overlaps with stillActive/carryingForward
     // by design, and Claude's segment tagger gets confused when the same
     // signal appears multiple times with the same id but slightly different

@@ -1545,8 +1545,13 @@ ${isSingleMember
 
     // Tag clickable signal phrases — pass everything that could plausibly appear.
     const tagPool = [...urgentForPrompt, ...nearForPrompt, ...homeRequirements, ...carriedForwardSignals];
-    if (horizonSignal) tagPool.push(horizonSignal);
-    if (horizonAwarenessSignal) tagPool.push(horizonAwarenessSignal);
+    // Horizon items are vault deadlines — augment with type:"deadline"
+    // so the segmenter's idToType map records the canonical signalType
+    // (vault raw category is "subscription"/"insurance"/etc. which
+    // isn't in the allowed enum and would let the segmenter drift to
+    // "unknown" even with the post-parse coercion in place).
+    if (horizonSignal) tagPool.push({ ...horizonSignal, _isDeadline: true, type: "deadline" });
+    if (horizonAwarenessSignal) tagPool.push({ ...horizonAwarenessSignal, _isDeadline: true, type: "deadline" });
 
     // Also feed the segmenter the full unhandled vault, not just items
     // that fell into the urgent/near time windows. The brief can mention
