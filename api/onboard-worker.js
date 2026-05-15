@@ -1336,7 +1336,7 @@ ${emailsList}`;
       for (let i = 0; i < validBdayHeaders.length; i += 10) {
         const batch = validBdayHeaders.slice(i, i + 10);
         const emailsList = batch
-          .map((e, idx) => `${idx + 1}. Subject: ${e.subject}\n   From: ${e.from}`)
+          .map((e, idx) => `${idx + 1}. Subject: ${e.subject}\n   From: ${e.from}\n   Date: ${e.date}`)
           .join("\n");
 
         const prompt = `Extract birthday or anniversary information from these emails. Return a JSON array or empty array:
@@ -1348,7 +1348,12 @@ ${emailsList}`;
   "age": number | null,
   "notes": string | null
 }]
-Only extract if you have high confidence in the name AND the date. Return empty array if nothing clear found.
+
+Rules:
+- DROP brand/company anniversaries entirely. "GayDays 35th Anniversary", "Jos. A. Bank 120th Anniversary Blazer", "Home Depot Anniversary Gift" all refer to a business celebrating itself, not a person — return nothing for these.
+- When a subject wishes a named person happy birthday or anniversary but contains no explicit date in the subject body, use the email's Date header — that's when the celebration occurred. Example: subject "Happy birthday, James 🎂" with Date "Fri, 17 May 2025" → name="James", date="05-17". Same logic for anniversaries.
+- Only extract if you have high confidence in BOTH the name AND the date. Drop the record if either is uncertain.
+- Return empty array if nothing clear is found.
 
 Emails:
 ${emailsList}`;
