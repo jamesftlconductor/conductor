@@ -1299,6 +1299,7 @@ ${emailsList}`;
   // crew records that already landed.
   let birthdayProcessed = 0;
   let birthdayFound = 0;
+  let birthdayKept = 0;
   try {
     const bdayQuery =
       `after:${twelveMonthsAgo} subject:(birthday OR "happy birthday" OR ` +
@@ -1342,6 +1343,9 @@ ${emailsList}`;
 
       for (let i = 0; i < validBdayHeaders.length; i += 10) {
         const batch = validBdayHeaders.slice(i, i + 10);
+        // Count BEFORE the try so an in-loop `continue` (non-array
+        // Claude response) doesn't bypass the counter.
+        birthdayProcessed += batch.length;
         const emailsList = batch
           .map((e, idx) => `${idx + 1}. Subject: ${e.subject}\n   From: ${e.from}\n   Date: ${e.date}`)
           .join("\n");
@@ -1368,7 +1372,11 @@ ${emailsList}`;
         try {
           const text = await callClaude(prompt, 1000);
           const items = safeParseJsonText(text);
-          if (!Array.isArray(items)) continue;
+          if (!Array.isArray(items)) {
+            console.log(`[crew:birthday] batch returned non-array (text len ${text?.length || 0}, head: ${(text || "").substring(0, 80)})`);
+            continue;
+          }
+          console.log(`[crew:birthday] batch parsed ${items.length} candidate(s)`);
 
           for (const item of items) {
             if (!item || typeof item !== "object") continue;
@@ -1392,6 +1400,7 @@ ${emailsList}`;
                 profile[field] = date;
                 await redis.set(`user:${uid}:profile`, JSON.stringify(profile));
                 console.log(`[crew:birthday] stored ${field}=${date} for household member ${uid}`);
+                birthdayKept++;
               } catch (err) {
                 console.warn(`[crew:birthday] profile write failed for ${uid}:`, err.message);
               }
@@ -1425,12 +1434,14 @@ ${emailsList}`;
               };
               if (item.notes) newMember.notes = item.notes;
               crewByKey.set(`${requestedType}:${lowerFirst}`, newMember);
+              birthdayKept++;
+            } else {
+              birthdayKept++;
             }
           }
         } catch (err) {
           console.warn("Birthday batch failed:", err.message);
         }
-        birthdayProcessed += batch.length;
       }
     }
   } catch (err) {
@@ -1450,6 +1461,7 @@ ${emailsList}`;
     processed,
     birthdayFound,
     birthdayProcessed,
+    birthdayKept,
     members: crew.length,
   });
 
