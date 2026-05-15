@@ -691,6 +691,7 @@ ${isSingleMember
    * "watching for it"
    * "we'll flag it when it matters"
   Never modify these phrases. Never append "as it gets closer" or any other tail. Never use "we're watching" or any other subject substitution — always "Conductor" or one of the passive forms above. Never use the same phrase twice in one brief.
+  Use these phrases verbatim only — never append additional words like "one", "too", "as well", or any other suffix. The phrase ends exactly as written.
 - Output plain text only. No markdown. No hashtags. No headers.
 - Do not begin with a date or header. Start directly with the first sentence.
 - If nothing notable happened or is coming, say so confidently — a quiet day is a real outcome

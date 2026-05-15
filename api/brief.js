@@ -1831,6 +1831,7 @@ ${isSingleMember
    * "watching for it"
    * "we'll flag it when it matters"
   Never modify these phrases. Never append "as it gets closer" or any other tail. Never use "we're watching" or any other subject substitution — always "Conductor" or one of the passive forms above. Never use the same phrase twice in one brief.
+  Use these phrases verbatim only — never append additional words like "one", "too", "as well", or any other suffix. The phrase ends exactly as written.
 - Plain text only, no markdown
 - Do not begin with date or header
 - Personalize to ${userName} — use "you" naturally
