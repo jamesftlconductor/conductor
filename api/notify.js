@@ -1,18 +1,16 @@
 import { Redis } from "@upstash/redis";
-import { loadHouseholdCalendar } from "./calendar-loader.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-const HOUR_MS = 60 * 60 * 1000;
+const BASE_URL = "https://conductor-ivory.vercel.app";
 
-function safeJson(value) {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== "string") return value;
-  try { return JSON.parse(value); } catch { return null; }
-}
+// Brief fetch (internal HTTP) + first-sentence extraction together can take
+// ~5-10s per household. 30s budget keeps us comfortable for multi-household
+// fan-out even when /api/brief is slow.
+export const config = { maxDuration: 30 };
 
 async function listHouseholds() {
   // Mirrors sync.js: derive membership from user:*:household keys, since
@@ -35,77 +33,35 @@ async function listHouseholds() {
   return map;
 }
 
-async function generateSummary(householdId, type) {
-  const fallback = type === "takeoff"
-    ? "Your morning brief is ready."
-    : "Your evening brief is ready.";
+// Pull the actual brief prose so the push body matches exactly what the
+// user sees when they open the app. /api/brief and /api/clearance both
+// resolve household from userId and return { brief: string, ... } — any
+// member's userId in a household yields the same household-level brief.
+async function fetchBriefText(userId, type) {
+  const path = type === "takeoff" ? "/api/brief" : "/api/clearance";
+  const url = `${BASE_URL}${path}?userId=${encodeURIComponent(userId)}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`brief fetch ${res.status}`);
+  const data = await res.json();
+  return typeof data?.brief === "string" ? data.brief : "";
+}
 
-  try {
-    // Multi-driver calendar: loadHouseholdCalendar merges per-user
-    // calendar slices and returns a parsed array directly.
-    const [rawSignals, calendar] = await Promise.all([
-      redis.lrange(`household:${householdId}:signals`, 0, -1),
-      loadHouseholdCalendar(redis, householdId),
-    ]);
-
-    const signals = (rawSignals || [])
-      .map(safeJson)
-      .filter(Boolean)
-      .filter(s => !s.state || s.state === "incoming" || s.state === "active");
-
-    const topSignals = signals.slice(0, 10).map(s =>
-      `- ${s.description || "Unknown"} | status:${s.status || "?"} | eta:${s.eta || "?"}`
-    ).join("\n");
-
-    const now = Date.now();
-    const upcomingEvents = calendar
-      .filter(e => {
-        const t = Date.parse(e.start);
-        return !isNaN(t) && t >= now - HOUR_MS && t <= now + 24 * HOUR_MS;
-      })
-      .slice(0, 5)
-      .map(e => `- ${e.title || "Untitled"} | ${e.start}`)
-      .join("\n");
-
-    const orientation = type === "takeoff"
-      ? "Morning push: forward-looking, what to know for today."
-      : "Evening push: wrap-up, what landed today and what's tomorrow.";
-
-    const prompt = `Write a single-sentence push notification body for Conductor (a household assistant).
-${orientation}
-Maximum 100 characters. Calm, specific, never a list. No quotes, no preamble.
-
-Active signals:
-${topSignals || "None"}
-
-Next 24 hours of events:
-${upcomingEvents || "None"}
-
-Return only the sentence.`;
-
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 80,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-
-    const data = await response.json();
-    let text = data?.content?.[0]?.text?.trim() || fallback;
-    text = text.replace(/^["']+|["']+$/g, "").trim();
-    if (text.length > 100) text = text.slice(0, 97) + "...";
-    return text;
-  } catch (err) {
-    console.error("Summary generation failed:", err);
-    return fallback;
+// First sentence of the brief, clipped to 100 chars. Split on ". " is the
+// simplest reliable boundary — abbreviations don't typically end with
+// ". " (they're followed by another word with no space). When the brief
+// is a single sentence with no ". " boundary, return it whole. We only
+// append a terminal period when one isn't already there, so a single-
+// sentence brief doesn't end up with "Hello, James..".
+function firstSentence(text, max = 100) {
+  if (!text) return "";
+  const idx = text.indexOf(". ");
+  let first = idx === -1 ? text : text.slice(0, idx + 1);
+  first = first.trim();
+  if (!/[.!?]$/.test(first)) first += ".";
+  if (first.length > max) {
+    first = first.slice(0, max - 3).trimEnd() + "...";
   }
+  return first;
 }
 
 async function sendExpoPush(token, title, body) {
@@ -135,6 +91,9 @@ export default async function handler(req, res) {
   }
 
   const title = type === "takeoff" ? "Takeoff" : "Clearance";
+  const fallback = type === "takeoff"
+    ? "Your Takeoff brief is ready."
+    : "Your Clearance brief is ready.";
 
   try {
     const allHouseholds = await listHouseholds();
@@ -163,18 +122,29 @@ export default async function handler(req, res) {
         continue;
       }
 
-      // First-run takeoff push gets a hardcoded body — same intent as the
-      // first-run brief, no Claude call needed. Don't flip firstRun here;
-      // brief.js owns that transition so the brief and push stay in sync.
+      // First-run takeoff push uses hardcoded copy — there's no brief yet
+      // on day one to lift a first sentence from. Don't flip firstRun
+      // here; brief.js owns that transition so the brief and push stay
+      // in sync when the user opens the app.
       let body;
       if (type === "takeoff") {
         const firstRunFlag = await redis.get(`household:${hid}:firstRun`);
         const isFirstRun = firstRunFlag === "true" || firstRunFlag === true;
         if (isFirstRun) {
-          body = "Good morning. Conductor is getting to know your household — today is a good day to settle in.";
+          body = "Your first Takeoff is ready. Conductor has been reading.";
         }
       }
-      if (!body) body = await generateSummary(hid, type);
+
+      if (!body) {
+        try {
+          const briefUserId = tokensByUser[0].userId;
+          const briefText = await fetchBriefText(briefUserId, type);
+          body = firstSentence(briefText) || fallback;
+        } catch (err) {
+          console.error(`Brief fetch failed for ${hid}:`, err);
+          body = fallback;
+        }
+      }
 
       // Carry-forward suffix on Takeoff only — if anything was flagged in last
       // night's LAST CHANCE pool and is still active this morning (the morning
