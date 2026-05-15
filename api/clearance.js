@@ -669,7 +669,8 @@ FEEDBACK HISTORY: Takeoff thumbs up: ${
 
 Rules:
 - Write in natural, flowing prose — not a list
-- 3-5 sentences maximum
+- 3-5 sentences maximum. Count every sentence aloud as you write — when you reach 5, STOP and end the brief, even if a layer is still unexplored. The cap is hard; a "Looking ahead" closing sentence still counts.
+- Never mention the same signal twice in one brief. Each signal gets exactly one mention, in the layer where it most belongs. The horizon-closer phrases attach to that one mention — they do not warrant a second sentence about the same signal.
 - Lead with what rested or arrived today
 - Note what's still in motion without alarm — these are simply continuing
 - Surface anything important tomorrow so it lands gently in advance
