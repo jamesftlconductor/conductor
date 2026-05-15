@@ -555,6 +555,23 @@ async function tagBriefSegments(brief, signals) {
   // otherwise pick up an arbitrary id from the pool.
   const validIds = new Set(signals.map((s) => String(s.id)));
 
+  // Authoritative id → type map. The prompt asks Claude to copy the
+  // signal's type field verbatim, but the model still sometimes
+  // re-classifies based on brief phrasing (e.g. tagging a vault
+  // deadline as "unknown" because the brief calls it a subscription).
+  // The validation pass below forces signalType to match what's in
+  // the input pool, so output type fidelity is guaranteed regardless
+  // of how Claude reads the brief.
+  const ALLOWED_SIGNAL_TYPES = new Set([
+    "package", "delivery", "food", "grocery", "service",
+    "reservation", "appointment", "travel", "deadline", "unknown",
+  ]);
+  const idToType = new Map();
+  for (const s of signals) {
+    const t = ALLOWED_SIGNAL_TYPES.has(s.type) ? s.type : "unknown";
+    idToType.set(String(s.id), t);
+  }
+
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -610,10 +627,13 @@ ${signalList}`,
     if (rejoined !== brief && rejoined.trim() !== brief.trim()) return fallback;
 
     // Validation pass: any signal segment whose signalId isn't in the
-    // input pool gets demoted to a text segment. Belt-and-braces on top
-    // of the prompt — the prompt instruction is the first line of
-    // defense, this guarantees correctness even when Claude drifts.
+    // input pool gets demoted to a text segment. For valid IDs, force
+    // signalType to match the canonical type from the input pool so the
+    // segmenter can never drift away from the authoritative category.
+    // Belt-and-braces on top of the prompt rule — guarantees output
+    // fidelity regardless of how Claude reads brief prose.
     let coercedCount = 0;
+    let typeCoercedCount = 0;
     const validated = parsed.map((seg) => {
       if (
         seg &&
@@ -623,10 +643,20 @@ ${signalList}`,
         coercedCount++;
         return { type: "text", content: seg.content };
       }
+      if (seg && seg.type === "signal" && seg.signalId) {
+        const canonical = idToType.get(String(seg.signalId));
+        if (canonical && seg.signalType !== canonical) {
+          typeCoercedCount++;
+          return { ...seg, signalType: canonical };
+        }
+      }
       return seg;
     });
     if (coercedCount > 0) {
       console.log(`[brief] segmenter coerced ${coercedCount} segment(s) with invalid signalId to text`);
+    }
+    if (typeCoercedCount > 0) {
+      console.log(`[brief] segmenter coerced ${typeCoercedCount} segment(s) signalType to canonical pool type`);
     }
 
     return validated;

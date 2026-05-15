@@ -94,6 +94,22 @@ async function tagBriefSegments(brief, signals) {
     .map(s => `- id: ${s.id} | type: ${s.type || "unknown"} | description: ${s.description || "Unknown"}`)
     .join("\n");
 
+  // Authoritative id → type map. The prompt asks Claude to copy the
+  // signal's type field verbatim, but the model still sometimes
+  // re-classifies based on brief phrasing. The validation pass below
+  // forces signalType to match what's in the input pool, mirroring
+  // brief.js's segmenter so type fidelity is guaranteed.
+  const ALLOWED_SIGNAL_TYPES = new Set([
+    "package", "delivery", "food", "grocery", "service",
+    "reservation", "appointment", "travel", "deadline", "unknown",
+  ]);
+  const validIds = new Set(signals.map(s => String(s.id)));
+  const idToType = new Map();
+  for (const s of signals) {
+    const t = ALLOWED_SIGNAL_TYPES.has(s.type) ? s.type : "unknown";
+    idToType.set(String(s.id), t);
+  }
+
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
@@ -144,7 +160,37 @@ ${signalList}`,
       .join("");
     if (rejoined !== brief && rejoined.trim() !== brief.trim()) return fallback;
 
-    return parsed;
+    // Validation pass mirrors brief.js: drop signal segments with
+    // unknown signalIds back to text, and coerce signalType to match
+    // the canonical type from the input pool when the model drifts.
+    let coercedCount = 0;
+    let typeCoercedCount = 0;
+    const validated = parsed.map((seg) => {
+      if (
+        seg &&
+        seg.type === "signal" &&
+        (seg.signalId == null || !validIds.has(String(seg.signalId)))
+      ) {
+        coercedCount++;
+        return { type: "text", content: seg.content };
+      }
+      if (seg && seg.type === "signal" && seg.signalId) {
+        const canonical = idToType.get(String(seg.signalId));
+        if (canonical && seg.signalType !== canonical) {
+          typeCoercedCount++;
+          return { ...seg, signalType: canonical };
+        }
+      }
+      return seg;
+    });
+    if (coercedCount > 0) {
+      console.log(`[clearance] segmenter coerced ${coercedCount} segment(s) with invalid signalId to text`);
+    }
+    if (typeCoercedCount > 0) {
+      console.log(`[clearance] segmenter coerced ${typeCoercedCount} segment(s) signalType to canonical pool type`);
+    }
+
+    return validated;
   } catch (err) {
     console.error("Segment tagging failed:", err);
     return fallback;
