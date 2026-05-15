@@ -1796,9 +1796,9 @@ ${isSingleMember
     ].join("\n");
 
     const baseRules = `RULES:
-- CRITICAL RULE: Maximum 5 sentences. Count every sentence including the final one. If you reach 5 sentences, stop. Do not add a 6th sentence under any circumstances. A 4-sentence brief is better than a 6-sentence brief.
+- CRITICAL RULE: Maximum 5 sentences in the standard mode. EXCEPTION: when TRAVEL PREP is non-empty (travel within 72 hours), the cap relaxes to 7 sentences total to make room for trip context; drop non-travel content first to stay within that. Count every sentence including the final one. Outside travel mode, do not add a 6th sentence under any circumstances — a 4-sentence brief is better than a 6-sentence brief.
 - Synthesize all layers into flowing prose — never a list
-- Travel prep: when TRAVEL PREP is non-empty (any item shown beyond "None"), OPEN the brief with travel context. Weave the flight time, accommodation, destination weather, pre-departure deliveries, and any same-day conflicts into 2-3 natural sentences — never list robotically, never bullet, never restate the layer's section headers. Make it feel like a pre-departure checklist assembled by someone who knows the trip. Subsequent layers (urgent renewals, near-window, etc.) become secondary unless they're tied to the trip; mention at most one non-trip item after the travel paragraph, only if it genuinely needs surfacing. Lift the parenthesized day-count phrases verbatim — never compute your own.
+- Travel prep: when TRAVEL PREP is non-empty (any item shown beyond "None"), OPEN the brief with travel context. Weave the flight time, accommodation, destination weather, pre-departure deliveries, and any same-day conflicts into 2-3 natural sentences — never list robotically, never bullet, never restate the layer's section headers. Make it feel like a pre-departure checklist assembled by someone who knows the trip. Subsequent layers (urgent renewals, near-window, etc.) become secondary unless they're tied to the trip; mention at most one non-trip item after the travel paragraph, only if it genuinely needs surfacing. In travel mode the brief may run up to 7 sentences total — drop non-travel content first to stay within that. Lift the parenthesized day-count phrases verbatim — never compute your own.
 - Lead with urgent if present
 - A detected conflict should always appear in the brief if it is high severity
 - Medium severity conflicts appear if there is space in the brief
@@ -1824,7 +1824,13 @@ ${isSingleMember
 - Never say you are looking for signals, watching for signals, or running sweeps
 - Never use the words: alert, monitor, scan, detect, pipeline, sweep, system, tracking
 - Simply say what you know. Never explain how you know it.
-- When mentioning a future event more than 7 days out, end that sentence with one of these phrases naturally woven in: "worth watching", "Conductor has its eye on this", "it's on the radar", "watching for it", or "we'll flag it as it gets closer". Choose the phrase that fits most naturally. Never use the same phrase twice in one brief. Two constraints on these phrases: (a) "has its eye on this" REQUIRES "Conductor" as the subject — never drop the name and never substitute another subject ("the subscription has its eye on this" is wrong); (b) "we'll flag it" REQUIRES the implicit subject to be Conductor — don't rephrase to "you'll flag it" or "they'll flag it." If you want to vary the subject, pick a different phrase from the list instead.
+- When mentioning a signal more than 14 days out, end that sentence with EXACTLY ONE of these approved phrases — no variations, no additions, no suffixes:
+   * "worth watching"
+   * "Conductor has its eye on this"
+   * "on the radar"
+   * "watching for it"
+   * "we'll flag it when it matters"
+  Never modify these phrases. Never append "as it gets closer" or any other tail. Never use "we're watching" or any other subject substitution — always "Conductor" or one of the passive forms above. Never use the same phrase twice in one brief.
 - Plain text only, no markdown
 - Do not begin with date or header
 - Personalize to ${userName} — use "you" naturally
