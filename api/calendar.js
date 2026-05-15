@@ -17,14 +17,62 @@ const CONSUMER_EMAIL_DOMAINS = new Set([
   "aol.com", "protonmail.com", "proton.me",
 ]);
 
-function isWorkCalendar(cal, userEmail) {
+function isWorkCalendar(cal, userEmail, userWorkCalendarName) {
   const summary = (cal?.summary || "").toLowerCase();
   if (/\b(work|office)\b/.test(summary)) return true;
+  // User-supplied calendar name from Settings (case-insensitive whole-word
+  // match). Lets users tag a non-default calendar like "Day Job" or
+  // "Consulting" as work without it having to literally contain "work".
+  if (userWorkCalendarName && summary === userWorkCalendarName.toLowerCase().trim()) {
+    return true;
+  }
   if (cal?.primary === true && userEmail) {
     const domain = userEmail.split("@")[1]?.toLowerCase();
     if (domain && !CONSUMER_EMAIL_DOMAINS.has(domain)) return true;
   }
   return false;
+}
+
+// Privacy guarantee: work calendar events store ONLY time-block fields,
+// never title/description/attendees/location/calendar-name/eventType.
+// Conductor knows you're busy, never knows why or with whom. Conflict
+// detector reads `start`/`end` ISO strings (kept here as derivative time
+// data, not content) plus the structured date/startTime/endTime fields.
+function stripToTimeBlock(event, classifiedBy) {
+  const startIso = event.start;
+  const endIso = event.end;
+  const d = startIso ? new Date(startIso) : null;
+  const endD = endIso ? new Date(endIso) : null;
+  const pad = (n) => String(n).padStart(2, "0");
+  const date = d
+    ? `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    : null;
+  const startTime = d ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : null;
+  const endTime = endD ? `${pad(endD.getHours())}:${pad(endD.getMinutes())}` : null;
+  const dayOfWeek = d
+    ? ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][d.getDay()]
+    : null;
+  return {
+    // Synthetic id from the time block — opaque, content-free, stable
+    // across syncs for the same slot. Google's event.id is intentionally
+    // dropped so we never persist anything tied to the original record.
+    id: `work_${date || "unknown"}_${startTime || "00:00"}_${endTime || "00:00"}`,
+    type: "work",
+    source: "work",
+    isBlocking: true,
+    workConflictCheck: true,
+    householdRelevant: false,
+    date,
+    startTime,
+    endTime,
+    dayOfWeek,
+    // Derivative ISO timestamps for the conflict detector (brief.js
+    // memberBlockedInWindow uses these via parseDateLoose).
+    start: startIso || null,
+    end: endIso || null,
+    userId: event.userId,
+    classifiedBy,
+  };
 }
 
 export async function runCalendarSync(userId) {
@@ -70,6 +118,18 @@ export async function runCalendarSync(userId) {
     // ignored
   }
 
+  // Resolve the user-supplied work-calendar name from preferences so
+  // isWorkCalendar can match calendars whose names don't include
+  // "work"/"office" but the user has tagged as their work calendar.
+  let userWorkCalendarName = null;
+  try {
+    const prefsRaw = await redis.get(`user:${userId}:preferences`);
+    const prefs = typeof prefsRaw === "string" ? JSON.parse(prefsRaw) : prefsRaw;
+    userWorkCalendarName = prefs?.workCalendarName || null;
+  } catch {
+    // ignored
+  }
+
   const now = new Date();
   const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();
   const thirtyDaysAhead = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -85,7 +145,7 @@ export async function runCalendarSync(userId) {
   // Identify work calendars from metadata before fetching events.
   const workCalendarIds = new Set();
   for (const cal of calendars) {
-    if (isWorkCalendar(cal, userEmail)) workCalendarIds.add(cal.id);
+    if (isWorkCalendar(cal, userEmail, userWorkCalendarName)) workCalendarIds.add(cal.id);
   }
 
   let allEvents = [];
@@ -124,7 +184,9 @@ export async function runCalendarSync(userId) {
 
   // Pre-tag structurally-known work events so they skip the LLM call.
   // Same logic as api/onboard-worker.js: events from a work calendar OR
-  // events that Google itself flagged as outOfOffice/focusTime.
+  // events that Google itself flagged as outOfOffice/focusTime. Both
+  // paths run through stripToTimeBlock so the stored record carries no
+  // title/description/calendar-name — privacy by construction.
   const classified = [];
   const needsClassification = [];
   for (const ev of allEvents) {
@@ -132,14 +194,8 @@ export async function runCalendarSync(userId) {
     const structurallyBlocking =
       ev.eventType === "outOfOffice" || ev.eventType === "focusTime";
     if (fromWorkCal || structurallyBlocking) {
-      classified.push({
-        ...ev,
-        type: "work",
-        householdRelevant: false,
-        workConflictCheck: true,
-        tags: structurallyBlocking ? [ev.eventType] : ["work"],
-        classifiedBy: fromWorkCal ? "work-calendar" : "event-type",
-      });
+      const tag = fromWorkCal ? "work-calendar" : "event-type";
+      classified.push(stripToTimeBlock(ev, tag));
     } else {
       needsClassification.push(ev);
     }
@@ -178,7 +234,17 @@ Return only the JSON object.`,
       const clean = text.replace(/```json|```/g, "").trim();
       const classification = JSON.parse(clean);
 
-      classified.push({ ...event, ...classification, classifiedBy: "llm" });
+      // Privacy strip: if the LLM classifies an event as work (or marks
+      // workConflictCheck=true), persist only the time block. The title
+      // and description were sent to Claude for the classification call
+      // itself but are dropped before storage.
+      const isWorkByLLM =
+        classification.type === "work" || classification.workConflictCheck === true;
+      if (isWorkByLLM) {
+        classified.push(stripToTimeBlock(event, "llm"));
+      } else {
+        classified.push({ ...event, ...classification, classifiedBy: "llm" });
+      }
       await new Promise(r => setTimeout(r, 100));
 
     } catch (err) {

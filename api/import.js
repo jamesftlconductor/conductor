@@ -347,6 +347,56 @@ ${emailText.substring(0, 1000)}`,
       const signalsKey = `household:${householdId}:signals`;
       const recentRaw = await redis.lrange(signalsKey, 0, 99);
       const recent = recentRaw.map(safeParseSignal).filter(Boolean);
+
+      // Status-update detection: when the new email's classified status
+      // is a confirmation/delivery/cancel/delay/out-for-delivery keyword,
+      // and a matching in-flight signal exists from the same sender +
+      // same type, PATCH the existing signal in place instead of
+      // creating a new one. Runs BEFORE semantic dedup so the update
+      // path is preferred over the replace-by-confidence path.
+      const STATUS_UPDATE_TRIGGERS = {
+        "Confirmed": { resolve: false },
+        "Delivered": { resolve: true },
+        "Out for Delivery": { resolve: false },
+        "Delayed": { resolve: false },
+        "Cancelled": { resolve: true },
+      };
+      const trigger = STATUS_UPDATE_TRIGGERS[signal.status];
+      if (trigger) {
+        const newSender = normalizeSender(signal.sender);
+        let updateIndex = -1;
+        let updateExisting = null;
+        for (let i = 0; i < recent.length; i++) {
+          const ex = recent[i];
+          if (ex.type !== signal.type) continue;
+          if (ex.state !== "incoming" && ex.state !== "active") continue;
+          const exSender = normalizeSender(ex.sender);
+          if (!newSender || !exSender || newSender !== exSender) continue;
+          updateIndex = i;
+          updateExisting = ex;
+          break;
+        }
+        if (updateIndex !== -1) {
+          const patched = {
+            ...updateExisting,
+            status: signal.status,
+            lastUpdate: new Date().toLocaleString(),
+          };
+          if (trigger.resolve) {
+            patched.state = "resolved";
+            patched.resolvedAt = new Date().toISOString();
+          }
+          await redis.lset(signalsKey, updateIndex, JSON.stringify(patched));
+          await redis.sadd(fingerprintSetKey, fp);
+          console.log(
+            `Updated signal ${updateExisting.id} status to ${signal.status} from confirmation email`
+          );
+          imported++;
+          await new Promise(r => setTimeout(r, 1000));
+          continue;
+        }
+      }
+
       let dupIndex = -1;
       let dupExisting = null;
       for (let i = 0; i < recent.length; i++) {
