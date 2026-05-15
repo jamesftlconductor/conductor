@@ -671,6 +671,8 @@ Rules:
 - Write in natural, flowing prose — not a list
 - 3-5 sentences maximum. Count every sentence aloud as you write — when you reach 5, STOP and end the brief, even if a layer is still unexplored. The cap is hard; a "Looking ahead" closing sentence still counts.
 - Never mention the same signal twice in one brief. Each signal gets exactly one mention, in the layer where it most belongs. The horizon-closer phrases attach to that one mention — they do not warrant a second sentence about the same signal.
+- If you find yourself writing a second sentence about a signal you've already mentioned, DELETE the second sentence and stop. The horizon-closer phrases are NOT a reason to mention a signal again — fold them into the original sentence if they apply, or omit them entirely if they don't. "Looking ahead" / "Looking further out" / "Beyond that" sentences are forbidden when their subject already appeared earlier in the brief.
+- The horizon-closer phrases (worth watching / Conductor has its eye on this / on the radar / watching for it / we'll flag it when it matters) apply ONLY to signals MORE THAN 14 DAYS out. A signal at 13 days, 7 days, or less is in the near window — it gets a date or day-count reference, NOT a horizon closer.
 - Lead with what rested or arrived today
 - Note what's still in motion without alarm — these are simply continuing
 - Surface anything important tomorrow so it lands gently in advance
