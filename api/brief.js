@@ -76,6 +76,33 @@ function parseDateLoose(value) {
   return isNaN(ms) ? null : new Date(ms);
 }
 
+// Module-level day-count phrase: emits authoritative "(in N days)" /
+// "(today)" / "(tomorrow)" / "(in N weeks)" for clean multiples of 7,
+// or "(yesterday)" / "(already passed N days ago)" for past dates.
+// Shared by the steady-state handler's etaWithFriendly AND by
+// generateTransparency's pre-formatting so the transparency Claude
+// call can lift counts instead of computing them.
+function daysFromTodayPhrase(value) {
+  const d = parseDateLoose(value);
+  if (!d) return null;
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const target = new Date(d);
+  target.setHours(0, 0, 0, 0);
+  const n = Math.round((target.getTime() - startOfToday.getTime()) / DAY_MS);
+  if (n === 0) return "today";
+  if (n === 1) return "tomorrow";
+  if (n > 0) {
+    if (n >= 7 && n % 7 === 0) {
+      const weeks = n / 7;
+      return weeks === 1 ? "in 1 week" : `in ${weeks} weeks`;
+    }
+    return `in ${n} days`;
+  }
+  if (n === -1) return "yesterday";
+  return `already passed ${-n} days ago`;
+}
+
 function dayOffsetFromToday(date) {
   const a = new Date(date.getFullYear(), date.getMonth(), date.getDate());
   const now = new Date();
@@ -379,25 +406,40 @@ function isWithinNextHours(date, hours) {
 async function generateTransparency(brief, pools) {
   if (!brief) return null;
 
+  // Pre-format signal lines with the same authoritative day-count phrase
+  // the main brief lifts from. Prevents the transparency Claude call
+  // from computing its own day-count and getting it wrong (e.g.
+  // claiming "in 8 days" when the actual gap is 13).
   const briefList = (arr) => {
     if (!arr || arr.length === 0) return "(none)";
-    return arr.map((s) => `- ${s.description || "Unknown"}`).join("\n");
+    return arr
+      .map((s) => {
+        const desc = s.description || "Unknown";
+        const phrase = s.eta ? daysFromTodayPhrase(s.eta) : null;
+        return phrase ? `- ${desc} (${phrase})` : `- ${desc}`;
+      })
+      .join("\n");
   };
   const eventList = (arr) => {
     if (!arr || arr.length === 0) return "(none)";
     return arr.map((e) => `- ${e.title || "Untitled"}`).join("\n");
   };
+  const horizonPhrase =
+    pools.horizon?.eta ? daysFromTodayPhrase(pools.horizon.eta) : null;
+  const horizonLine = pools.horizon
+    ? `- ${pools.horizon.description || "Unknown"}${horizonPhrase ? ` (${horizonPhrase})` : ""}`
+    : "(none)";
 
   const prompt = `You just generated this brief: ${brief}
 
-The signals you considered were:
+The signals you considered were (each carries an authoritative day-count phrase in parentheses — lift it verbatim, do NOT compute your own):
 Urgent: ${briefList(pools.urgent)}
 Near window: ${briefList(pools.near)}
 Health context: ${pools.healthContext ? JSON.stringify(pools.healthContext) : "(not connected)"}
 Weather today: ${pools.weather || "(not available)"}
 Childcare: ${eventList(pools.childcare)}
 Home requirements: ${briefList(pools.homeRequirements)}
-Horizon: ${pools.horizon ? `- ${pools.horizon.description || "Unknown"}` : "(none)"}
+Horizon: ${horizonLine}
 Carried forward: ${briefList(pools.carriedForward)}
 
 Write a plain-language explanation of how you thought about today. Cover:
@@ -412,6 +454,7 @@ Rules:
 - Honest and specific — name actual signals
 - Calm, not defensive
 - Never assert what the user said, noted, mentioned, told you, indicated, expressed, confirmed, asked, or wrote. Describe only the signals present in the pool and how you weighed them. If you want to convey a user state, frame it as your own inference: "I inferred X" or "this reads like X" — never "you noted X".
+- Never compute or estimate how many days away something is. Each signal line above carries an authoritative day-count phrase in parentheses ("(in 5 days)", "(today)", "(in 2 weeks)", "(yesterday)"); lift that phrase verbatim if you reference timing. Do NOT produce your own counts like "in 8 days" — the math is frequently wrong, and the authoritative phrase is provided so you don't have to compute.
 - Weather should appear in your reasoning ONLY if a weather condition actually changed which signals you included, excluded, or framed differently. "The clear weather made it a good weekend" is NOT a reason — that's rationalization, not influence. If you would have made the same inclusion decisions regardless of weather, do not mention weather in your reasoning at all. Be honest about what actually drove your choices.`;
 
   try {
@@ -532,6 +575,13 @@ async function tagBriefSegments(brief, signals) {
 signalType MUST be exactly one of: package, delivery, food, grocery, service, reservation, appointment, travel, deadline, unknown. Pick the closest match for the signal's nature. Use "unknown" if no value fits — never invent a different label.
 
 CRITICAL: signalId MUST be copied verbatim from the Signals list below — never invent, never reuse one signal's id for an unrelated phrase. If a phrase in the brief refers to something NOT in the Signals list (a calendar event, a crew member's activity, a weather note, a health metric), it MUST be a 'text' segment. When in doubt, prefer 'text'.
+
+MATCHING: use fuzzy/substring matching when the brief paraphrases a signal — descriptions in the Signals list are the canonical form, but the brief naturally shortens them. If the brief mentions a service, subscription, product, or vendor name that partially matches a signal's description, tag it. Examples:
+- Brief "Health Tech Nerds subscription" → matches signal description "Health Tech Nerds subscription renewal"
+- Brief "Google Home renewal" → matches signal description "Google Home Premium Standard (Ranger Oaks) subscription renewal"
+- Brief "the Wind Policy" → matches signal description "Wind Policy on Homeowners insurance renewal"
+- Brief "your vehicle registration" → matches signal description "Vehicle registration renewal"
+The distinctive brand/product/policy noun is the anchor — full-string identity is NOT required.
 
 Split the brief exactly — every character must appear in exactly one segment. Signal phrases should be the natural language reference to that signal as it appears in the brief (e.g. 'hair styling items' not the full description). Return only the JSON array, nothing else.
 
@@ -1080,33 +1130,8 @@ export default async function handler(req, res) {
       });
     };
 
-    const daysFromTodayPhrase = (value) => {
-      const d = parseDateLoose(value);
-      if (!d) return null;
-      const startOfToday = new Date();
-      startOfToday.setHours(0, 0, 0, 0);
-      const target = new Date(d);
-      target.setHours(0, 0, 0, 0);
-      const n = Math.round((target.getTime() - startOfToday.getTime()) / DAY_MS);
-      if (n === 0) return "today";
-      if (n === 1) return "tomorrow";
-      if (n > 0) {
-        // Clean multiples of 7 emit a weeks-form. Reads more naturally
-        // than "in 14 days" and gives the model an authoritative
-        // weeks-phrase to lift instead of paraphrasing "in 14 days" →
-        // "in two weeks" (which the lift-don't-compute rule forbids).
-        if (n >= 7 && n % 7 === 0) {
-          const weeks = n / 7;
-          return weeks === 1 ? "in 1 week" : `in ${weeks} weeks`;
-        }
-        return `in ${n} days`;
-      }
-      // Past dates: surface explicitly so Claude doesn't frame them as
-      // upcoming. -1 reads naturally as "yesterday" rather than
-      // "already passed 1 day ago".
-      if (n === -1) return "yesterday";
-      return `already passed ${-n} days ago`;
-    };
+    // daysFromTodayPhrase is module-scope so generateTransparency can
+    // also use it for lift-don't-compute pre-formatting.
 
     const etaWithFriendly = (raw) => {
       const friendly = friendlyDate(raw);
@@ -1492,6 +1517,24 @@ ${isSingleMember
     const tagPool = [...urgentForPrompt, ...nearForPrompt, ...homeRequirements, ...carriedForwardSignals];
     if (horizonSignal) tagPool.push(horizonSignal);
     if (horizonAwarenessSignal) tagPool.push(horizonAwarenessSignal);
+
+    // Also feed the segmenter the full unhandled vault, not just items
+    // that fell into the urgent/near time windows. The brief can mention
+    // a longer-horizon vault item via The Read or a horizon line, and
+    // we want those phrases to tag back to their vault id too. Pre-
+    // existing tagPool ids take precedence — these are deduped below.
+    const fullVaultForTagging = (rawDeadlines || [])
+      .map(safeJson)
+      .filter(Boolean)
+      .filter((v) => !v.handled)
+      .map((v) => ({
+        ...v,
+        eta: v.renewalDate || v.eta,
+        _isDeadline: true,
+        type: "deadline",
+      }));
+    tagPool.push(...fullVaultForTagging);
+
     // dedupe by id
     const seen = new Set();
     const tagSignals = tagPool.filter((s) => {

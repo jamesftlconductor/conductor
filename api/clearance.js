@@ -12,18 +12,33 @@ const redis = new Redis({
 async function generateTransparency(brief, pools) {
   if (!brief) return null;
 
+  // Pre-format signal lines with the authoritative day-count phrase the
+  // main clearance brief lifts from. Prevents the transparency Claude
+  // call from computing its own counts and producing values that
+  // disagree with the brief prose.
   const briefList = (arr) => {
     if (!arr || arr.length === 0) return "(none)";
-    return arr.map((s) => `- ${s.description || "Unknown"}`).join("\n");
+    return arr
+      .map((s) => {
+        const desc = s.description || "Unknown";
+        const phrase = s.eta ? daysFromTodayPhrase(s.eta) : null;
+        return phrase ? `- ${desc} (${phrase})` : `- ${desc}`;
+      })
+      .join("\n");
   };
   const eventList = (arr) => {
     if (!arr || arr.length === 0) return "(none)";
     return arr.map((e) => `- ${e.title || "Untitled"}`).join("\n");
   };
+  const horizonPhrase =
+    pools.horizon?.eta ? daysFromTodayPhrase(pools.horizon.eta) : null;
+  const horizonLine = pools.horizon
+    ? `- ${pools.horizon.description || "Unknown"}${horizonPhrase ? ` (${horizonPhrase})` : ""}`
+    : "(none)";
 
   const prompt = `You just generated this evening brief: ${brief}
 
-The signals you considered were:
+The signals you considered were (each carries an authoritative day-count phrase in parentheses — lift it verbatim, do NOT compute your own):
 Rested today: ${briefList(pools.resolvedToday)}
 Lapsed today: ${briefList(pools.expiredToday)}
 Still in motion: ${briefList(pools.stillActive)}
@@ -32,7 +47,7 @@ Imminent deadlines: ${briefList(pools.urgentDeadlines)}
 Near deadlines: ${briefList(pools.nearDeadlines)}
 Last chance (still open from today): ${briefList(pools.lastChance)}
 Tomorrow's calendar: ${eventList(pools.tomorrow)}
-Horizon: ${pools.horizon ? `- ${pools.horizon.description || "Unknown"}` : "(none)"}
+Horizon: ${horizonLine}
 
 Write a plain-language explanation of how you thought about closing the day. Cover:
 1. What you included and why (1-2 sentences)
@@ -45,7 +60,8 @@ Rules:
 - Maximum 4 sentences total
 - Honest and specific — name actual signals
 - Calm, not defensive
-- Never assert what the user said, noted, mentioned, told you, indicated, expressed, confirmed, asked, or wrote. Describe only the signals present in the pool and how you weighed them. If you want to convey a user state, frame it as your own inference: "I inferred X" or "this reads like X" — never "you noted X".`;
+- Never assert what the user said, noted, mentioned, told you, indicated, expressed, confirmed, asked, or wrote. Describe only the signals present in the pool and how you weighed them. If you want to convey a user state, frame it as your own inference: "I inferred X" or "this reads like X" — never "you noted X".
+- Never compute or estimate how many days away something is. Each signal line above carries an authoritative day-count phrase in parentheses ("(in 5 days)", "(today)", "(in 2 weeks)", "(yesterday)"); lift that phrase verbatim if you reference timing. Do NOT produce your own counts — the math is frequently wrong, and the authoritative phrase is provided so you don't have to compute.`;
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {
@@ -96,6 +112,11 @@ async function tagBriefSegments(brief, signals) {
 - { type: 'signal', content: '...', signalId: '...', signalType: '...' } for phrases that refer to a specific signal
 
 signalType MUST be exactly one of: package, delivery, food, grocery, service, reservation, appointment, travel, deadline, unknown. Pick the closest match for the signal's nature. Use "unknown" if no value fits — never invent a different label.
+
+MATCHING: use fuzzy/substring matching when the brief paraphrases a signal — descriptions in the Signals list are the canonical form, but the brief naturally shortens them. If the brief mentions a service, subscription, product, or vendor name that partially matches a signal's description, tag it. Examples:
+- Brief "Health Tech Nerds subscription" → matches signal description "Health Tech Nerds subscription renewal"
+- Brief "the Wind Policy" → matches signal description "Wind Policy on Homeowners insurance renewal"
+The distinctive brand/product/policy noun is the anchor — full-string identity is NOT required.
 
 Split the brief exactly — every character must appear in exactly one segment. Signal phrases should be the natural language reference to that signal as it appears in the brief (e.g. 'hair styling items' not the full description). Only tag phrases that clearly refer to a specific signal. Return only the JSON array, nothing else.
 
