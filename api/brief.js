@@ -2176,6 +2176,16 @@ ${isSingleMember
     });
 
     const data = await response.json();
+    if (!response.ok || !data?.content?.[0]?.text) {
+      console.error("[brief] Anthropic main-call non-content response", {
+        status: response.status,
+        type: data?.type,
+        errorType: data?.error?.type,
+        errorMessage: data?.error?.message,
+        stopReason: data?.stop_reason,
+        rawHead: JSON.stringify(data).slice(0, 400),
+      });
+    }
     const brief = (data && data.content && data.content[0] && data.content[0].text) || "";
 
     // Stash the most-recent generated brief at a stable key with a 48h TTL
