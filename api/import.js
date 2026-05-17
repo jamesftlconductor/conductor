@@ -183,8 +183,14 @@ function isSameThread(newSignal, candidate) {
   if (kindsNew.has("us") && kindsCand.has("intl")) return false;
   if (kindsNew.has("intl") && kindsCand.has("us")) return false;
 
-  // N3: Wildly different type families → only same-sender overrides.
-  if (typesIncompatible(newSignal, candidate) && !sameSender) return false;
+  // N3: Wildly different type families → only same-sender OR shared
+  // destination city overrides. Shared-city is the "rental in the
+  // travel destination" carve-out from spec — a car rental (service)
+  // in Paris co-threads with a Paris flight (travel) even though
+  // service↔travel is normally incompatible.
+  if (typesIncompatible(newSignal, candidate) && !sameSender && !sharedCity) {
+    return false;
+  }
 
   // -------- POSITIVE RULES --------
 
