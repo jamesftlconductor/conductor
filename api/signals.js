@@ -754,6 +754,128 @@ function applyDefaultsAndExpiry(signal) {
   return { signal, changed, justExpired };
 }
 
+// Camouflage rules — signals matching any rule never reach the brief,
+// radar, or any consuming surface. Stored as a Redis SET of JSON
+// strings under household:{id}:camouflage. Two rule kinds:
+//   { type: "sender",     value: <normalized sender name>, addedAt }
+//   { type: "signalType", value: <signal type enum>,       addedAt }
+//
+// Sender matches use normalizeSender for case-insensitive whitespace-
+// collapsed equality so "FedEx", "fedex", and "FedEx " all dedupe to
+// the same rule. signalType matches are exact.
+function normalizeSender(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+export async function loadCamouflageRules(householdId) {
+  const raw = await redis.smembers(`household:${householdId}:camouflage`);
+  if (!raw || raw.length === 0) return [];
+  const rules = [];
+  for (const r of raw) {
+    try {
+      const parsed = JSON.parse(r);
+      if (parsed && (parsed.type === "sender" || parsed.type === "signalType")) {
+        rules.push(parsed);
+      }
+    } catch { /* skip malformed */ }
+  }
+  return rules;
+}
+
+export function applyCamouflage(signals, rules) {
+  if (!rules || rules.length === 0) return signals;
+  const senderSet = new Set(
+    rules.filter((r) => r.type === "sender").map((r) => r.value)
+  );
+  const typeSet = new Set(
+    rules.filter((r) => r.type === "signalType").map((r) => r.value)
+  );
+  return signals.filter((s) => {
+    if (!s) return false;
+    if (typeSet.has(s.type)) return false;
+    if (s.sender && senderSet.has(normalizeSender(s.sender))) return false;
+    return true;
+  });
+}
+
+async function handleCamouflage(req, res) {
+  if (req.method === "GET") {
+    const householdId = await resolveHouseholdId(req.query?.userId);
+    const rules = await loadCamouflageRules(householdId);
+    return res.status(200).json({ household: householdId, rules });
+  }
+
+  if (req.method === "POST") {
+    const { userId, ruleType, value } = req.body || {};
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    if (ruleType !== "sender" && ruleType !== "signalType") {
+      return res.status(400).json({ error: "ruleType must be 'sender' or 'signalType'" });
+    }
+    if (!value || typeof value !== "string" || value.trim().length === 0) {
+      return res.status(400).json({ error: "value required" });
+    }
+
+    const householdId = await resolveHouseholdId(userId);
+    const normalizedValue = ruleType === "sender" ? normalizeSender(value) : value.trim();
+
+    const rule = { type: ruleType, value: normalizedValue, addedAt: Date.now() };
+    await redis.sadd(`household:${householdId}:camouflage`, JSON.stringify(rule));
+
+    // Remove any currently-active signals matching the new rule so the
+    // user sees the effect immediately. Goes through the full LRANGE +
+    // LREM dance since SET membership doesn't help us find list entries.
+    const signalKey = `household:${householdId}:signals`;
+    const rawSignals = await redis.lrange(signalKey, 0, -1);
+    let removedCount = 0;
+    for (const raw of rawSignals) {
+      let s;
+      try { s = JSON.parse(raw); } catch { continue; }
+      const matchesSender = ruleType === "sender"
+        && s.sender && normalizeSender(s.sender) === normalizedValue;
+      const matchesType = ruleType === "signalType" && s.type === normalizedValue;
+      if (matchesSender || matchesType) {
+        const removed = await redis.lrem(signalKey, 1, raw);
+        if (removed > 0) removedCount++;
+      }
+    }
+
+    console.log(
+      `[camouflage] household=${householdId} added ${ruleType}="${normalizedValue}", removed ${removedCount} active signal(s)`
+    );
+
+    return res.status(200).json({ added: true, removedCount, rule });
+  }
+
+  if (req.method === "DELETE") {
+    const userId = req.query?.userId || req.body?.userId;
+    const value = req.query?.value || req.body?.value;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    if (!value || typeof value !== "string") {
+      return res.status(400).json({ error: "value required" });
+    }
+
+    const householdId = await resolveHouseholdId(userId);
+    const rules = await loadCamouflageRules(householdId);
+    // Match by value alone — sender and signalType namespaces don't
+    // collide in practice (sender names contain spaces; type enum
+    // doesn't) and the mobile screen identifies rules by value.
+    const matching = rules.filter((r) => r.value === value);
+    for (const r of matching) {
+      await redis.srem(`household:${householdId}:camouflage`, JSON.stringify(r));
+    }
+
+    console.log(
+      `[camouflage] household=${householdId} removed ${matching.length} rule(s) matching "${value}"`
+    );
+
+    return res.status(200).json({ removed: matching.length });
+  }
+
+  res.setHeader("Allow", "GET, POST, DELETE");
+  return res.status(405).json({ error: "Method not allowed for camouflage" });
+}
+
 async function loadSignals(householdId) {
   const key = `household:${householdId}:signals`;
   const raw = await redis.lrange(key, 0, -1);
@@ -897,10 +1019,24 @@ export default async function handler(req, res) {
       return handleHealthRead(req, res);
     }
 
+    // Camouflage — per-household filter rules. GET lists rules, POST
+    // adds + scrubs matching active signals, DELETE removes a rule.
+    if (queryType === "camouflage" || bodyType === "camouflage") {
+      return handleCamouflage(req, res);
+    }
+
     if (req.method === "GET") {
       const householdId = await resolveHouseholdId(req.query.userId);
-      const { signals } = await loadSignals(householdId);
-      return res.status(200).json({ household: householdId, signals });
+      const [{ signals }, camouflageRules] = await Promise.all([
+        loadSignals(householdId),
+        loadCamouflageRules(householdId),
+      ]);
+      // Camouflaged signals never leave this handler — every consumer
+      // (brief, radar, hover, programme) reads the filtered list. The
+      // rules are also checked at POST-rule time to scrub current
+      // active signals, so this is the second line of defense.
+      const filtered = applyCamouflage(signals, camouflageRules);
+      return res.status(200).json({ household: householdId, signals: filtered });
     }
 
     // Manual signal creation. Mobile's "+ Add Signal" sheet posts here

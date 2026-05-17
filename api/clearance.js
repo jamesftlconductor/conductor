@@ -1,5 +1,6 @@
 import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
+import { loadCamouflageRules, applyCamouflage } from "./signals.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -525,7 +526,15 @@ export default async function handler(req, res) {
     ]);
     const isSingleMember = (rawMembers || []).length <= 1;
 
-    const signals = (rawSignals || []).map(s => typeof s === "string" ? JSON.parse(s) : s);
+    // Camouflage filter — same guarantee as brief.js. Every downstream
+    // pool (resolvedToday, expiredToday, stillActive, carryingForward,
+    // lastChance) reads from `signals`, so a single filter pass here
+    // keeps camouflaged entries out of the evening brief entirely.
+    const camouflageRules = await loadCamouflageRules(householdId);
+    const signals = applyCamouflage(
+      (rawSignals || []).map(s => typeof s === "string" ? JSON.parse(s) : s),
+      camouflageRules
+    );
     const briefedIds = new Set((rawBriefed || []).map(s => String(s)));
 
     // briefedToday hash shared with brief.js — same shape, same TTL. We use it

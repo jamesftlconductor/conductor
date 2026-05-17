@@ -7,6 +7,7 @@
 // patterns the morning brief is guarded against.
 
 import { Redis } from "@upstash/redis";
+import { loadCamouflageRules, applyCamouflage } from "./signals.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -153,7 +154,14 @@ export default async function handler(req, res) {
       redis.hgetall(`household:${householdId}:morningBriefed`),
     ]);
 
-    const allSignals = (rawSignals || []).map(safeJson).filter(Boolean);
+    // Camouflage filter — same guarantee as the morning brief. Applied
+    // at parse time so the bucketing logic below never sees a
+    // camouflaged signal in any of the four buckets.
+    const camouflageRules = await loadCamouflageRules(householdId);
+    const allSignals = applyCamouflage(
+      (rawSignals || []).map(safeJson).filter(Boolean),
+      camouflageRules
+    );
     const activeSignals = allSignals.filter(
       (s) => !s.state || s.state === "incoming" || s.state === "active"
     );

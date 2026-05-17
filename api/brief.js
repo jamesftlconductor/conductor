@@ -1,5 +1,6 @@
 import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
+import { loadCamouflageRules, applyCamouflage } from "./signals.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -1594,7 +1595,15 @@ export default async function handler(req, res) {
       }
     }
 
-    const allSignals = (rawSignals || []).map(safeJson).filter(Boolean);
+    // Camouflage filter applied at LRANGE-parse time — every downstream
+    // pool (urgent, near, carriedForward, segments, transparency, The
+    // Read) reads from allSignals, so dropping camouflaged entries here
+    // guarantees they never reach any brief surface.
+    const camouflageRules = await loadCamouflageRules(householdId);
+    const allSignals = applyCamouflage(
+      (rawSignals || []).map(safeJson).filter(Boolean),
+      camouflageRules
+    );
 
     // Carry-forward marking — happens before activeSignals is derived so the
     // flag is visible to downstream pools and the prompt. A signal that landed
