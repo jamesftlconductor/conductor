@@ -41,6 +41,95 @@ function senderLocalPart(from) {
   return match[1].toLowerCase().split("@")[0];
 }
 
+// ---------- recurring pattern detection ----------
+//
+// After a signal lands in :signals, look back at the last 90 days for
+// 2+ prior signals from the same sender + same type. If they exist,
+// compute the average inter-arrival interval and stamp the new signal
+// recurring: true, plus persist (or refresh) the pattern record in
+// household:{id}:patterns. The pattern is what api/sync.js's
+// anticipated-signal generator reads when a sender is overdue.
+
+function normalizeSenderForPattern(sender) {
+  if (!sender || typeof sender !== "string") return "";
+  return sender.toLowerCase().replace(/\s+/g, " ").trim();
+}
+
+function classifyRecurringPattern(avgDays) {
+  if (avgDays == null || !isFinite(avgDays) || avgDays <= 0) return null;
+  if (avgDays <= 9) return "weekly";
+  if (avgDays <= 45) return "monthly";
+  if (avgDays <= 120) return "quarterly";
+  return "annual";
+}
+
+async function detectAndStampRecurring(householdId, newSignal) {
+  if (!newSignal?.sender || !newSignal?.type) return null;
+  const senderKey = normalizeSenderForPattern(newSignal.sender);
+  if (!senderKey) return null;
+
+  // Look back at the most recent 200 signals; 90-day window for prior
+  // matches. Cheap LRANGE since dedup already keeps the list tight.
+  const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - NINETY_DAYS_MS;
+  const raw = await redis.lrange(`household:${householdId}:signals`, 0, 199);
+  const priors = [];
+  for (const r of raw || []) {
+    let parsed;
+    try { parsed = typeof r === "string" ? JSON.parse(r) : r; } catch { continue; }
+    if (!parsed || !parsed.id || parsed.id === newSignal.id) continue;
+    if (parsed.type !== newSignal.type) continue;
+    if (normalizeSenderForPattern(parsed.sender) !== senderKey) continue;
+    const stamp = parsed.id || Date.parse(parsed.lastUpdate || "") || 0;
+    if (!stamp || stamp < cutoff) continue;
+    priors.push({ ...parsed, _stamp: stamp });
+  }
+  if (priors.length < 2) return null;
+
+  // Average inter-arrival interval — sort by stamp ascending, mean
+  // the deltas. id is Date.now() at import so it's a reliable proxy.
+  priors.sort((a, b) => a._stamp - b._stamp);
+  const deltas = [];
+  for (let i = 1; i < priors.length; i++) {
+    deltas.push((priors[i]._stamp - priors[i - 1]._stamp) / (24 * 60 * 60 * 1000));
+  }
+  const avgDays = deltas.reduce((a, b) => a + b, 0) / deltas.length;
+  const pattern = classifyRecurringPattern(avgDays);
+  if (!pattern) return null;
+
+  // Stamp the new signal record.
+  newSignal.recurring = true;
+  newSignal.recurringInterval = Math.round(avgDays * 10) / 10;
+  newSignal.recurringPattern = pattern;
+
+  // Upsert the pattern in household:{id}:patterns hash, keyed by
+  // "{type}:{senderKey}". Stores enough metadata for the anticipated-
+  // signal generator to fire from the next sync.
+  const patternKey = `${newSignal.type}:${senderKey}`;
+  const patternRecord = {
+    type: newSignal.type,
+    sender: newSignal.sender,
+    senderKey,
+    intervalDays: newSignal.recurringInterval,
+    pattern,
+    description: newSignal.description || null,
+    lastSignalAt: newSignal.id || Date.now(),
+    sampleCount: priors.length + 1,
+    updatedAt: Date.now(),
+  };
+  try {
+    await redis.hset(`household:${householdId}:patterns`, {
+      [patternKey]: JSON.stringify(patternRecord),
+    });
+  } catch (err) {
+    console.warn("[recurring] pattern write failed:", err?.message || err);
+  }
+  console.log(
+    `[recurring] ${householdId} ${patternKey}: ${pattern} (~${newSignal.recurringInterval}d, n=${priors.length + 1})`
+  );
+  return patternRecord;
+}
+
 // ---------- provider extraction ----------
 
 // Normalize a provider name into a stable Redis hash key. Lowercase,
@@ -850,6 +939,17 @@ ${emailText.substring(0, 1000)}`,
         }
         await new Promise(r => setTimeout(r, 1000));
         continue;
+      }
+
+      // Recurring pattern detection — stamps the signal in place if 2+
+      // prior signals from the same sender+type exist in the last 90
+      // days. Writes the pattern record to household:{id}:patterns.
+      // Done BEFORE LPUSH so the signal lands with recurring fields
+      // already attached.
+      try {
+        await detectAndStampRecurring(householdId, signal);
+      } catch (err) {
+        console.error("[recurring] detection error:", err?.message || err);
       }
 
       await redis.lpush(signalsKey, JSON.stringify(signal));
