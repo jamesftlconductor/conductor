@@ -1,4 +1,5 @@
 import { Redis } from "@upstash/redis";
+import { loadHouseholdCalendar } from "./calendar-loader.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -367,6 +368,21 @@ async function handleVault(req, res) {
 
   res.setHeader("Allow", "GET, POST");
   return res.status(405).json({ error: "Method not allowed for vault" });
+}
+
+// Calendar — read-only view of the merged household calendar. Used by
+// the Programme screen to assemble its 14-day timeline. The mobile app
+// gets the same event shape brief.js consumes (id / title / start / end
+// / type / householdRelevant), with work events already privacy-stripped
+// to time-block-only fields by the upstream sync.
+async function handleCalendarRead(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for calendar" });
+  }
+  const householdId = await resolveHouseholdId(req.query.userId);
+  const events = await loadHouseholdCalendar(redis, householdId);
+  return res.status(200).json({ household: householdId, events });
 }
 
 async function handleHorizon(req, res) {
@@ -822,6 +838,14 @@ export default async function handler(req, res) {
     // Crew — household:{id}:crew JSON-string array of children + pets.
     if (queryType === "crew" || bodyType === "crew") {
       return handleCrew(req, res);
+    }
+
+    // Calendar — merged household calendar events. GET only. Feeds the
+    // Programme screen's 14-day timeline so the mobile app doesn't have
+    // to know about the per-user calendar fan-out + legacy single-key
+    // fallback handled in api/calendar-loader.js.
+    if (queryType === "calendar") {
+      return handleCalendarRead(req, res);
     }
 
     // Compass — longitudinal household intelligence over the memory log.
