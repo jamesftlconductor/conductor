@@ -848,6 +848,131 @@ ${signalList}`,
   }
 }
 
+// ---------- inventory-derived signals ----------
+
+// Synthesize proactive service signals from the household's home
+// inventory. These are not persisted to :signals — they're computed
+// on every brief from the current inventory state. Empty array when
+// inventory is absent or no rules fire. Merged into activeSignals
+// after the camouflage filter so they flow through bucketing the
+// same way real signals do.
+function inventoryDerivedSignals(inventory, today = new Date()) {
+  if (!inventory || typeof inventory !== "object") return [];
+  const signals = [];
+  const nowMs = today.getTime();
+  const nowYear = today.getFullYear();
+
+  function ageYears(yearInstalled) {
+    if (yearInstalled == null) return null;
+    const y = parseInt(yearInstalled, 10);
+    if (isNaN(y)) return null;
+    return nowYear - y;
+  }
+
+  // Roof >15 years old + no recent inspection within 2 years → Horizon
+  // candidate. eta=null so the horizon picker treats it as a no-date
+  // long-tail item rather than a near-window deadline.
+  const roof = inventory.roof;
+  if (roof) {
+    const age = ageYears(roof.yearInstalled);
+    const lastInspectMs = roof.lastInspected ? Date.parse(roof.lastInspected) : NaN;
+    const recentInspection = !isNaN(lastInspectMs) && (nowMs - lastInspectMs) < 730 * DAY_MS;
+    if (age != null && age > 15 && !recentInspection) {
+      signals.push({
+        id: `inv_roof_${nowMs}`,
+        description: `Roof inspection: ${age}-year-old ${roof.material || "roof"} due for review`,
+        type: "service",
+        sender: "Home Inventory",
+        eta: null,
+        state: "incoming",
+        source: "inventory",
+        _inventoryDerived: true,
+      });
+    }
+  }
+
+  // HVAC >10 years old + approaching summer (Apr-Jun) → near-window
+  // pre-summer tune-up reminder. Targets mid-May; rolls forward if past.
+  const hvac = inventory.hvac;
+  if (hvac) {
+    const age = ageYears(hvac.yearInstalled);
+    const month = today.getMonth();
+    const approachingSummer = month >= 3 && month <= 5;
+    if (age != null && age > 10 && approachingSummer) {
+      const target = new Date(nowYear, 4, 15);
+      if (target.getTime() < nowMs) target.setFullYear(nowYear + 1);
+      signals.push({
+        id: `inv_hvac_${nowMs}`,
+        description: `${hvac.brand || "HVAC"} system ${age} years old — pre-summer tune-up worth scheduling`,
+        type: "service",
+        sender: "Home Inventory",
+        eta: target.toISOString(),
+        state: "incoming",
+        source: "inventory",
+        _inventoryDerived: true,
+      });
+    }
+
+    // HVAC lastServiced >90 days → filter change reminder (near window).
+    const lastServicedMs = hvac.lastServiced ? Date.parse(hvac.lastServiced) : NaN;
+    if (!isNaN(lastServicedMs) && (nowMs - lastServicedMs) > 90 * DAY_MS) {
+      signals.push({
+        id: `inv_filter_${nowMs}`,
+        description: `HVAC filter change overdue — last serviced ${hvac.lastServiced}`,
+        type: "service",
+        sender: "Home Inventory",
+        eta: new Date(nowMs + 7 * DAY_MS).toISOString(),
+        state: "incoming",
+        source: "inventory",
+        _inventoryDerived: true,
+      });
+    }
+  }
+
+  // Water heater >10 years → deadline-typed long-tail item.
+  const wh = inventory.waterHeater;
+  if (wh) {
+    const age = ageYears(wh.yearInstalled);
+    if (age != null && age > 10) {
+      signals.push({
+        id: `inv_wh_${nowMs}`,
+        description: `Water heater ${age} years old — typical lifespan is 8-12, worth planning replacement`,
+        type: "deadline",
+        sender: "Home Inventory",
+        eta: null,
+        state: "incoming",
+        source: "inventory",
+        _inventoryDerived: true,
+      });
+    }
+  }
+
+  // Vehicle within 500 miles of next 10k milestone → service reminder.
+  if (Array.isArray(inventory.vehicles)) {
+    for (const v of inventory.vehicles) {
+      const mileage = parseInt(v.mileage, 10);
+      if (isNaN(mileage)) continue;
+      const next10k = Math.ceil(mileage / 10000) * 10000;
+      const milesToNext = next10k - mileage;
+      if (milesToNext >= 0 && milesToNext <= 500) {
+        const label = [v.year, v.make, v.model].filter(Boolean).join(" ").trim() || "Vehicle";
+        signals.push({
+          id: `inv_vehicle_${(v.make || "x")}_${(v.model || "x")}_${nowMs}`,
+          description: `${label} approaching ${next10k.toLocaleString()} miles — service interval`,
+          type: "service",
+          sender: "Home Inventory",
+          eta: null,
+          state: "incoming",
+          source: "inventory",
+          _inventoryDerived: true,
+        });
+      }
+    }
+  }
+
+  return signals;
+}
+
 // ---------- synthesis ----------
 
 // NOAA Rothfusz heat-index formula. Valid for T >= 80°F. Below that the
@@ -1605,6 +1730,7 @@ export default async function handler(req, res) {
       fetchedWeather,
       rawCrew,
       rawMembers,
+      rawInventory,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: merges per-user calendar slices, falls back to
@@ -1638,6 +1764,10 @@ export default async function handler(req, res) {
       // narration rules. Avoids stilted "the household" framing when
       // there is only one person to address.
       redis.smembers(`household:${householdId}:members`),
+      // Home inventory — JSON blob written through ?type=inventory.
+      // Used to derive proactive service signals (roof/HVAC/water
+      // heater age, vehicle mileage milestones, HVAC filter cadence).
+      redis.get(`household:${householdId}:inventory`),
     ]);
     const isSingleMember = (rawMembers || []).length <= 1;
 
@@ -1669,10 +1799,18 @@ export default async function handler(req, res) {
     // Read) reads from allSignals, so dropping camouflaged entries here
     // guarantees they never reach any brief surface.
     const camouflageRules = await loadCamouflageRules(householdId);
-    const allSignals = applyCamouflage(
+    const persistedSignals = applyCamouflage(
       (rawSignals || []).map(safeJson).filter(Boolean),
       camouflageRules
     );
+
+    // Inventory-derived proactive signals — synthesized per-brief from
+    // the current inventory state. Never persisted; flow through the
+    // same bucketing as real signals so an aging-roof or filter-due
+    // line lands in Horizon / Near pools naturally.
+    const inventory = safeJson(rawInventory);
+    const derivedSignals = inventoryDerivedSignals(inventory);
+    const allSignals = [...persistedSignals, ...derivedSignals];
 
     // Carry-forward marking — happens before activeSignals is derived so the
     // flag is visible to downstream pools and the prompt. A signal that landed
