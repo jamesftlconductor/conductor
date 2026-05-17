@@ -790,6 +790,42 @@ async function loadSignals(householdId) {
     await redis.ltrim(mcKey, 0, 99);
   }
 
+  // Follow-up detection: signals where state is incoming/active AND the
+  // ETA passed between 1-3 hours ago AND followUpSent is not already set.
+  // These are signals the user might have forgotten to Rest or Hold — the
+  // /api/followup cron picks them up and sends a "Quick check" push asking
+  // whether it happened. We mark followUpSent=true here so the same signal
+  // doesn't re-queue across multiple GETs in the same window.
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const THREE_HOURS_MS = 3 * 60 * 60 * 1000;
+  const SUSPICIOUSLY_OLD_MS = 5 * 365 * 24 * 60 * 60 * 1000;
+  const followUpAdds = [];
+  for (let i = 0; i < signals.length; i++) {
+    const s = signals[i];
+    if (s.state !== "incoming" && s.state !== "active") continue;
+    if (s.followUpSent === true) continue;
+    if (!s.eta) continue;
+    const etaMs = Date.parse(s.eta);
+    if (isNaN(etaMs)) continue;
+    // Year-less date guard (same as the expiry path): skip absurdly old
+    // parsed dates which V8 produces for "May 15" → 2001.
+    if (etaMs < Date.now() - SUSPICIOUSLY_OLD_MS) continue;
+    const msPast = Date.now() - etaMs;
+    if (msPast < ONE_HOUR_MS || msPast > THREE_HOURS_MS) continue;
+    s.followUpSent = true;
+    followUpAdds.push(String(s.id));
+    await redis.lset(key, i, JSON.stringify(s));
+  }
+  if (followUpAdds.length > 0) {
+    await redis.sadd(`household:${householdId}:pendingFollowups`, ...followUpAdds);
+    // 24h TTL — well past the 3h follow-up window so we never lose a
+    // pending entry, but cleaned up if the followup cron stops running.
+    await redis.expire(`household:${householdId}:pendingFollowups`, 24 * 60 * 60);
+    console.log(
+      `[signals] queued ${followUpAdds.length} follow-up(s) for ${householdId}: ${followUpAdds.join(", ")}`
+    );
+  }
+
   return { key, signals };
 }
 
