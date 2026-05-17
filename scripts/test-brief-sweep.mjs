@@ -27,6 +27,7 @@ const POSITIVE_HEALTH_RE = /\b(your body (?:feels?|is|'s) strong|feeling strong|
 
 const HYDRATION_NUDGE_RE = /\b(drink (?:more )?water (?:throughout|today|often|early|all day|regularly)|stay hydrated|hydrate (?:today|early|often|throughout|more|all day|regularly)|keep water (?:close|nearby|handy|on you)|the air (?:is|feels) (?:thick|heavy|sticky|soupy)|heavy air today|humid today|muggy today|thick air|sticky (?:out|today))\b/gi;
 const UNTIL_IN_RE = /\buntil in\b/gi;
+const INVENTED_DATE_RANGE_RE = /\b(sometime between\b|expected sometime\b|by the end of (?:the |this )?(?:year|month|quarter|week)\b|around the (?:end|middle|start) of (?:the |this )?(?:year|month|quarter|season|january|february|march|april|may|june|july|august|september|october|november|december)\b|in the (?:next|coming) (?:month|quarter|season) or so\b)/gi;
 
 const TRANSPARENCY_HEALTH_NUMBER_RE = /\b\d+(?:\.\d+)?\s*(?:steps|calories|kcal|bpm|ms|hours?\s+of\s+sleep|hrs?\s+of\s+sleep|hours?\s+slept|hrs?\s+slept)\b/gi;
 const TRANSPARENCY_HEALTH_PCT_RE = /\b\d+%\s+(?:below|above|of|under|over)\s+(?:baseline|normal|average|usual|typical)\b/gi;
@@ -121,12 +122,14 @@ function check(text, today = new Date()) {
   POSITIVE_HEALTH_RE.lastIndex = 0;
   WINDOW_PHRASE_RE.lastIndex = 0;
   UNTIL_IN_RE.lastIndex = 0;
+  INVENTED_DATE_RANGE_RE.lastIndex = 0;
   if (WINDOW_PHRASE_RE.test(text)) return "window";
   if (GAP_PHRASE_RE.test(text)) return "gap";
   if (WEATHER_CLOSER_RE.test(text)) return "weather";
   if (HYDRATION_NUDGE_RE.test(text)) return "hydration";
   if (POSITIVE_HEALTH_RE.test(text)) return "health";
   if (UNTIL_IN_RE.test(text)) return "until_in";
+  if (INVENTED_DATE_RANGE_RE.test(text)) return "invented_date_range";
   if (horizonNearViolations(text, today).length > 0) return "horizon_near";
   return "CLEAN";
 }
@@ -204,6 +207,17 @@ const cases = [
   // Negative — "until" used naturally without "in N" following
   ["Doesn't come due until Thursday, May 28.", "CLEAN"],
   ["Comes due in 11 days, on Thursday, May 28.", "CLEAN"],
+
+  // Invented date ranges / windows — must flag
+  ["Your Chime Card is on its way, expected sometime between mid-December and the end of the year.", "invented_date_range"],
+  ["The renewal is expected sometime in fall.", "invented_date_range"],
+  ["The package should arrive by the end of the year.", "invented_date_range"],
+  ["The work will be done around the end of December.", "invented_date_range"],
+  ["The estimate is anywhere from $500 to $1,200.", "CLEAN"], // $ amounts, not dates — should NOT flag
+  // Negative — legitimate phrasings stay clean
+  ["The package is still in motion — no confirmed date yet.", "CLEAN"],
+  ["Conductor is watching for the Chime Card; details still coming through.", "CLEAN"],
+  ["Health Tech Nerds renews Wednesday, May 20.", "CLEAN"],
 ];
 
 const TRANSPARENCY_CASES = [

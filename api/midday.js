@@ -74,6 +74,7 @@ const WEATHER_CLOSER_RE = /\b(clear skies( today| ahead)?|otherwise quiet weathe
 const HYDRATION_NUDGE_RE = /\b(drink (?:more )?water (?:throughout|today|often|early|all day|regularly)|stay hydrated|hydrate (?:today|early|often|throughout|more|all day|regularly)|keep water (?:close|nearby|handy|on you)|the air (?:is|feels) (?:thick|heavy|sticky|soupy)|heavy air today|humid today|muggy today|thick air|sticky (?:out|today))\b/gi;
 const POSITIVE_HEALTH_RE = /\b(your body (?:feels?|is|'s) strong|feeling strong|energy is good|in a strong window|strong recovery|recovery looks solid|good timing energy-wise|you're in a strong window)\b/gi;
 const UNTIL_IN_RE = /\buntil in\b/gi;
+const INVENTED_DATE_RANGE_RE = /\b(sometime between\b|expected sometime\b|by the end of (?:the |this )?(?:year|month|quarter|week)\b|around the (?:end|middle|start) of (?:the |this )?(?:year|month|quarter|season|january|february|march|april|may|june|july|august|september|october|november|december)\b|in the (?:next|coming) (?:month|quarter|season) or so\b)/gi;
 
 function dedupeCi(arr) {
   const seen = new Set();
@@ -97,6 +98,7 @@ function sweepMiddayForViolations(text) {
     ["hydration_nudge", HYDRATION_NUDGE_RE],
     ["positive_health", POSITIVE_HEALTH_RE],
     ["until_in_glue", UNTIL_IN_RE],
+    ["invented_date_range", INVENTED_DATE_RANGE_RE],
   ];
   for (const [rule, re] of checks) {
     re.lastIndex = 0;
