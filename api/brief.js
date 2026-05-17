@@ -1381,6 +1381,123 @@ function synthesizeHouseholdState({
 // Proactive question generator — one short curious question Conductor
 // raises about something quietly stalled. Returns a string or null.
 // Best-effort: any failure returns null so the brief still ships.
+// Behavior patterns — distilled from the household's memory log.
+// Used to give the brief voice a sense of how this household tends
+// to operate. Returned values are kept loose; the prompt instructs
+// Claude to use them as voice cues only (never quote them, never
+// say "based on your patterns"). Anything that's not derivable
+// returns null/empty rather than risking confident-but-wrong claims.
+function analyzeBehaviorPatterns(memoryEntries) {
+  const entries = Array.isArray(memoryEntries) ? memoryEntries : [];
+  if (entries.length === 0) {
+    return {
+      fastResolvers: [],
+      slowResolvers: [],
+      peakDay: null,
+      quietDay: null,
+      avgResolutionHours: null,
+      totalSignalsHandled: 0,
+      householdAge: 0,
+      personalityType: "steady",
+    };
+  }
+
+  const senderHours = new Map();
+  const typeHours = new Map();
+  const dayBuckets = new Map();
+  let oldest = Infinity;
+  let totalResolved = 0;
+  let totalResolveLatency = 0;
+  let resolveLatencyCount = 0;
+
+  for (const e of entries) {
+    const actionMs = Date.parse(e.actionAt || "");
+    if (!isNaN(actionMs)) {
+      if (actionMs < oldest) oldest = actionMs;
+    }
+    if (e.action !== "resolved") continue;
+    totalResolved++;
+    // Resolution latency: how long the signal sat between import
+    // (signalId is Date.now() at LPUSH time) and the resolve event.
+    const importMs = typeof e.signalId === "number" ? e.signalId : NaN;
+    if (!isNaN(importMs) && !isNaN(actionMs)) {
+      const hours = Math.max(0, (actionMs - importMs) / (60 * 60 * 1000));
+      totalResolveLatency += hours;
+      resolveLatencyCount++;
+      if (e.sender) {
+        const cur = senderHours.get(e.sender) || { sum: 0, n: 0 };
+        cur.sum += hours;
+        cur.n += 1;
+        senderHours.set(e.sender, cur);
+      }
+      if (e.type) {
+        const cur = typeHours.get(e.type) || { sum: 0, n: 0 };
+        cur.sum += hours;
+        cur.n += 1;
+        typeHours.set(e.type, cur);
+      }
+    }
+    if (!isNaN(actionMs)) {
+      const day = new Date(actionMs).toLocaleDateString("en-US", {
+        timeZone: "America/New_York",
+        weekday: "long",
+      });
+      dayBuckets.set(day, (dayBuckets.get(day) || 0) + 1);
+    }
+  }
+
+  // Fast = sender's avg-hours-to-resolve < 24h with at least 2
+  // resolutions; slow = type's avg-hours-to-resolve > 72h with at
+  // least 2 resolutions.
+  const fastResolvers = [];
+  for (const [sender, { sum, n }] of senderHours.entries()) {
+    if (n >= 2 && sum / n < 24) fastResolvers.push(sender);
+  }
+  fastResolvers.sort();
+  const slowResolvers = [];
+  for (const [type, { sum, n }] of typeHours.entries()) {
+    if (n >= 2 && sum / n > 72) slowResolvers.push(type);
+  }
+  slowResolvers.sort();
+
+  let peakDay = null;
+  let quietDay = null;
+  if (dayBuckets.size > 0) {
+    const sorted = [...dayBuckets.entries()].sort((a, b) => b[1] - a[1]);
+    peakDay = sorted[0]?.[0] || null;
+    quietDay = sorted[sorted.length - 1]?.[0] || null;
+    if (peakDay === quietDay) quietDay = null;
+  }
+
+  const avgResolutionHours = resolveLatencyCount > 0
+    ? Math.round(totalResolveLatency / resolveLatencyCount)
+    : null;
+  const householdAge = isFinite(oldest)
+    ? Math.max(0, Math.round((Date.now() - oldest) / (24 * 60 * 60 * 1000)))
+    : 0;
+
+  // Personality classification from the latency distribution:
+  //   proactive — avg latency < 24h (signals close fast)
+  //   reactive  — avg latency > 96h (signals sit days)
+  //   steady    — middle / unknown
+  let personalityType = "steady";
+  if (avgResolutionHours != null) {
+    if (avgResolutionHours < 24) personalityType = "proactive";
+    else if (avgResolutionHours > 96) personalityType = "reactive";
+  }
+
+  return {
+    fastResolvers: fastResolvers.slice(0, 6),
+    slowResolvers: slowResolvers.slice(0, 6),
+    peakDay,
+    quietDay,
+    avgResolutionHours,
+    totalSignalsHandled: totalResolved,
+    householdAge,
+    personalityType,
+  };
+}
+
 async function generateConductorQuestion({
   activeSignals,
   vaultUpcoming,
@@ -2037,6 +2154,7 @@ export default async function handler(req, res) {
       rawInventory,
       networkContext,
       rawActiveTransition,
+      rawMemoryEntries,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: merges per-user calendar slices, falls back to
@@ -2085,6 +2203,10 @@ export default async function handler(req, res) {
       // present. Drives prompt-level tone adjustments — softer
       // framing, suppressed mentions, etc. — for the 90-day window.
       redis.get(`household:${householdId}:activeTransition`).catch(() => null),
+      // Memory log — feeds analyzeBehaviorPatterns so the prompt
+      // can carry voice cues calibrated to how this household
+      // actually behaves over time.
+      redis.lrange(`household:${householdId}:memory`, 0, -1).catch(() => []),
     ]);
     let isSingleMember = (rawMembers || []).length <= 1;
 
@@ -3130,7 +3252,46 @@ ${isSingleMember
     // activeTransition is present. Each type gets a tailored softener;
     // divorce additionally trips the isSingleMember flag earlier in
     // the pipeline so multi-member narration mechanics quiet down.
+    // Behavioral patterns — used to shape the brief's voice based
+    // on how the household actually operates over time. The prompt
+    // section is non-quoted (the model is instructed to NEVER name
+    // these explicitly), and the language gates by householdAge so
+    // early days carry less assertive personality framing.
+    const memoryEntries = (rawMemoryEntries || [])
+      .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+      .filter(Boolean);
+    const behavior = analyzeBehaviorPatterns(memoryEntries);
+
     let composedRules = baseRules;
+    if (behavior.totalSignalsHandled > 0) {
+      const personalityHint = behavior.personalityType === "proactive"
+        ? "This household acts fast — trust them to handle things. The brief can be slightly more forward-looking; you don't need to spell out timing or consequences in detail."
+        : behavior.personalityType === "reactive"
+        ? "This household tends to let things sit. The brief can be slightly more explicit about timing and consequences — not alarming, just concrete."
+        : "This household is steady. Neutral voice — they're consistent.";
+
+      // Tier the language gates by household age so early voice is
+      // tentative, then earns the right to reference patterns.
+      const ageGate = behavior.householdAge >= 90
+        ? "You have genuine knowledge of this household now. Use it sparingly but meaningfully when it actually serves a sentence — e.g. 'Your Amazon deliveries usually clear quickly, so this one sitting three days is worth a glance.' Never overuse."
+        : behavior.householdAge >= 30
+        ? "You can reference patterns naturally when relevant — e.g. 'this one's been sitting longer than usual'. Only when the observation actually adds value, not as filler."
+        : "Voice should be calibrated to the personality cue but never reference patterns explicitly yet. Too early.";
+
+      const patternsRule = `- HOUSEHOLD PATTERNS (voice cues only, never mention explicitly, never use phrases like "based on your patterns" or "I've noticed"): ${
+        behavior.totalSignalsHandled
+      } signals handled over ${behavior.householdAge} days. ${
+        behavior.fastResolvers.length > 0
+          ? `Tends to clear ${behavior.fastResolvers.join(", ")} quickly. `
+          : ""
+      }${
+        behavior.slowResolvers.length > 0
+          ? `Lets ${behavior.slowResolvers.join(", ")} sit longer. `
+          : ""
+      }${behavior.peakDay ? `Most active on ${behavior.peakDay}. ` : ""}Personality: ${behavior.personalityType}. ${personalityHint} ${ageGate}`;
+      composedRules = `${composedRules}\n${patternsRule}`;
+    }
+
     if (activeTransition && activeTransition.type) {
       const t = activeTransition.type;
       const TRANSITION_RULES = {
