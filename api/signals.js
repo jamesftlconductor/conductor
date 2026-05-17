@@ -303,17 +303,56 @@ async function handleVault(req, res) {
 
   if (req.method === "GET") {
     const raw = await redis.lrange(key, 0, -1);
-    const items = raw
+    let items = raw
       .map(parseSignal)
       .filter(Boolean)
       .filter((v) => !v.handled);
-    items.sort((a, b) => {
-      const aMs = Date.parse(a.renewalDate);
-      const bMs = Date.parse(b.renewalDate);
-      if (isNaN(aMs)) return 1;
-      if (isNaN(bMs)) return -1;
-      return aMs - bMs;
-    });
+
+    // Optional search — case-insensitive substring across description,
+    // provider, category, and notes.
+    const search = (req.query?.search || "").toString().trim().toLowerCase();
+    if (search.length > 0) {
+      items = items.filter((v) => {
+        const haystack = [
+          v.description, v.provider, v.category, v.notes, v.agentName,
+        ].filter(Boolean).join(" ").toLowerCase();
+        return haystack.includes(search);
+      });
+    }
+
+    // Sort key: "urgency" (default; soonest renewal first), "category"
+    // (alphabetical), "amount" (numeric desc), "added" (newest first by
+    // createdAt / foundAt timestamp).
+    const sort = (req.query?.sort || "urgency").toString();
+    const parseAmount = (v) => {
+      if (typeof v?.amount === "number") return v.amount;
+      if (typeof v?.amount === "string") {
+        const m = v.amount.match(/[\d.]+/);
+        return m ? parseFloat(m[0]) : 0;
+      }
+      return 0;
+    };
+    if (sort === "category") {
+      items.sort((a, b) => (a.category || "").localeCompare(b.category || ""));
+    } else if (sort === "amount") {
+      items.sort((a, b) => parseAmount(b) - parseAmount(a));
+    } else if (sort === "added") {
+      items.sort((a, b) => {
+        const at = Date.parse(a.createdAt) || a.foundAt || 0;
+        const bt = Date.parse(b.createdAt) || b.foundAt || 0;
+        return (bt || 0) - (at || 0);
+      });
+    } else {
+      // urgency / default
+      items.sort((a, b) => {
+        const aMs = Date.parse(a.renewalDate);
+        const bMs = Date.parse(b.renewalDate);
+        if (isNaN(aMs)) return 1;
+        if (isNaN(bMs)) return -1;
+        return aMs - bMs;
+      });
+    }
+
     return res.status(200).json({ household: householdId, count: items.length, items });
   }
 
@@ -324,6 +363,10 @@ async function handleVault(req, res) {
       if (!item || typeof item !== "object" || !item.description) {
         return res.status(400).json({ error: "Missing item.description" });
       }
+      // Extended schema: contactPhone, contactEmail, agentName, notes,
+      // reminderDate, policyNumber, priceHistory all default to null/
+      // empty so the new UI's inline-edit affordances always have a
+      // place to write into.
       const vaultItem = {
         id: `vault_user_${Date.now()}`,
         category: item.category || "other",
@@ -333,8 +376,17 @@ async function handleVault(req, res) {
         amount: item.amount || null,
         consequence: item.consequence || null,
         confidence: item.confidence || "medium",
-        source: "user",
+        source: item.source || "manual",
+        policyNumber: item.policyNumber || null,
+        contactPhone: item.contactPhone || null,
+        contactEmail: item.contactEmail || null,
+        agentName: item.agentName || null,
+        notes: item.notes || null,
+        reminderDate: item.reminderDate || null,
+        priceHistory: [],
+        handled: false,
         foundAt: Date.now(),
+        createdAt: new Date().toISOString(),
       };
       await redis.lpush(key, JSON.stringify(vaultItem));
       return res.status(200).json({ ok: true, item: vaultItem });
@@ -366,7 +418,38 @@ async function handleVault(req, res) {
     return res.status(400).json({ error: "action must be 'add', 'handle', or 'delete'" });
   }
 
-  res.setHeader("Allow", "GET, POST");
+  // PATCH — merge enrichment fields onto an existing vault item.
+  // Body: { itemId, updates: { policyNumber, notes, contactPhone,
+  // contactEmail, agentName, reminderDate, description, provider,
+  // renewalDate, amount } }. Whitelisted keys only so accidental
+  // payloads can't overwrite source / handled / priceHistory.
+  if (req.method === "PATCH") {
+    const { itemId, updates } = req.body || {};
+    if (!itemId) return res.status(400).json({ error: "itemId required" });
+    if (!updates || typeof updates !== "object") {
+      return res.status(400).json({ error: "updates object required" });
+    }
+    const raw = await redis.lrange(key, 0, -1);
+    const items = raw.map(parseSignal).filter(Boolean);
+    const index = items.findIndex((v) => String(v.id) === String(itemId));
+    if (index === -1) return res.status(404).json({ error: "vault item not found" });
+
+    const ALLOWED = new Set([
+      "policyNumber", "notes", "contactPhone", "contactEmail", "agentName",
+      "reminderDate", "description", "provider", "renewalDate", "amount",
+      "category", "consequence",
+    ]);
+    const merged = { ...items[index] };
+    for (const [k, v] of Object.entries(updates)) {
+      if (!ALLOWED.has(k)) continue;
+      merged[k] = v === "" ? null : v;
+    }
+    merged.lastUpdate = new Date().toLocaleString();
+    await redis.lset(key, index, JSON.stringify(merged));
+    return res.status(200).json({ ok: true, item: merged });
+  }
+
+  res.setHeader("Allow", "GET, POST, PATCH");
   return res.status(405).json({ error: "Method not allowed for vault" });
 }
 
