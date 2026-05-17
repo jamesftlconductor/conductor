@@ -41,6 +41,167 @@ function senderLocalPart(from) {
   return match[1].toLowerCase().split("@")[0];
 }
 
+// ---------- thread detection ----------
+//
+// After a signal is added to :signals, check whether it belongs in an
+// existing thread (same sender within 30d, ETA within 7d of an
+// existing signal from the same sender, or shared city/destination
+// keyword). When grouped, all thread members carry the same threadId
+// (id of the oldest member) and thread metadata lives at
+// household:{id}:threads:{threadId}.
+
+const CITY_KEYWORDS = [
+  // Common travel destinations — extend as needed. Match is case-
+  // insensitive whole-word, so "Paris" matches "...Paris Louvre..." but
+  // not "parishioner".
+  "paris", "london", "tokyo", "new york", "nyc", "miami", "los angeles", "la",
+  "chicago", "boston", "seattle", "san francisco", "sf", "denver", "vegas",
+  "las vegas", "orlando", "dallas", "atlanta", "barcelona", "rome", "berlin",
+  "amsterdam", "madrid", "dubai", "singapore",
+];
+
+function descriptionKeywords(desc) {
+  const lower = (desc || "").toLowerCase();
+  const hits = new Set();
+  for (const k of CITY_KEYWORDS) {
+    const re = new RegExp(`\\b${k.replace(/\s+/g, "\\s+")}\\b`, "i");
+    if (re.test(lower)) hits.add(k);
+  }
+  return hits;
+}
+
+// Decide whether two signals belong in the same thread.
+function isSameThread(newSignal, candidate) {
+  if (!newSignal || !candidate) return false;
+  if (newSignal.id === candidate.id) return false;
+
+  // Same sender within 30 days (id is Date.now() at import time, so
+  // this doubles as "imported within 30 days").
+  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+  const newStamp = newSignal.id || Date.now();
+  const candStamp = candidate.id || 0;
+  const senderNew = normalizeSenderForPattern(newSignal.sender);
+  const senderCand = normalizeSenderForPattern(candidate.sender);
+  if (senderNew && senderCand && senderNew === senderCand
+      && Math.abs(newStamp - candStamp) < THIRTY_DAYS_MS) {
+    return true;
+  }
+
+  // ETA within 7 days of an existing signal from the same sender.
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+  const newEta = newSignal.eta ? Date.parse(newSignal.eta) : NaN;
+  const candEta = candidate.eta ? Date.parse(candidate.eta) : NaN;
+  if (!isNaN(newEta) && !isNaN(candEta) && senderNew && senderCand
+      && senderNew === senderCand && Math.abs(newEta - candEta) < SEVEN_DAYS_MS) {
+    return true;
+  }
+
+  // Shared destination/city keyword in description (covers cross-
+  // sender groupings like a hotel reservation + airport transfer + a
+  // dinner reservation, all tagged "Paris").
+  const kwNew = descriptionKeywords(newSignal.description);
+  const kwCand = descriptionKeywords(candidate.description);
+  for (const k of kwNew) {
+    if (kwCand.has(k)) return true;
+  }
+  return false;
+}
+
+function pickThreadSummary(signals, primaryKeyword) {
+  // Heuristic summary: if a shared keyword exists, "{Keyword} trip"
+  // when at least one signal is travel/reservation. Otherwise fall
+  // back to "{Sender} batch" for sender-only threads.
+  const capitalize = (s) =>
+    s ? s.split(/\s+/).map((w) => w[0].toUpperCase() + w.slice(1)).join(" ") : s;
+  if (primaryKeyword) {
+    const hasTravel = signals.some(
+      (s) => s.type === "travel" || s.type === "reservation"
+    );
+    return hasTravel ? `${capitalize(primaryKeyword)} trip` : `${capitalize(primaryKeyword)}`;
+  }
+  const sender = signals.map((s) => s.sender).filter(Boolean)[0];
+  return sender ? `${sender} batch` : "Related signals";
+}
+
+async function detectAndStampThread(householdId, newSignal) {
+  if (!newSignal || (!newSignal.sender && !newSignal.description)) return null;
+  // Scan recent signals (cap at 200) for matches.
+  const rawSignals = await redis.lrange(`household:${householdId}:signals`, 0, 199);
+  const candidates = [];
+  for (const r of rawSignals || []) {
+    let parsed;
+    try { parsed = typeof r === "string" ? JSON.parse(r) : r; } catch { continue; }
+    if (!parsed || !parsed.id) continue;
+    candidates.push(parsed);
+  }
+
+  const matches = candidates.filter((c) => isSameThread(newSignal, c));
+  if (matches.length === 0) return null;
+
+  // Determine threadId — use the oldest existing threadId if any
+  // match already has one; otherwise use the oldest signal's id.
+  let threadId = null;
+  const withThread = matches.filter((m) => m.threadId);
+  if (withThread.length > 0) {
+    threadId = String(withThread[0].threadId);
+  } else {
+    const oldest = [...matches, newSignal].sort((a, b) => (a.id || 0) - (b.id || 0))[0];
+    threadId = String(oldest.id);
+  }
+
+  // Stamp the new signal (mutates in place).
+  newSignal.threadId = threadId;
+
+  // Backfill threadId onto matches that don't already carry it.
+  const signalsKey = `household:${householdId}:signals`;
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    if (!matches.some((m) => m.id === c.id)) continue;
+    if (c.threadId === threadId) continue;
+    c.threadId = threadId;
+    await redis.lset(signalsKey, i, JSON.stringify(c));
+  }
+
+  // Persist thread metadata. Members include the new signal and every
+  // match — the brief and Hover read this to display thread-aware UI.
+  const members = [...matches, newSignal];
+  const sharedKw = (() => {
+    // Find a keyword that appears in at least half the members.
+    const counts = new Map();
+    for (const m of members) {
+      for (const k of descriptionKeywords(m.description)) {
+        counts.set(k, (counts.get(k) || 0) + 1);
+      }
+    }
+    let top = null;
+    let topCount = 0;
+    for (const [k, c] of counts) if (c > topCount) { top = k; topCount = c; }
+    return topCount >= Math.ceil(members.length / 2) ? top : null;
+  })();
+  const summary = pickThreadSummary(members, sharedKw);
+  const typeCounts = new Map();
+  for (const m of members) typeCounts.set(m.type, (typeCounts.get(m.type) || 0) + 1);
+  const primaryType = [...typeCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || "unknown";
+  const latestEta = members
+    .map((m) => (m.eta ? Date.parse(m.eta) : NaN))
+    .filter((n) => !isNaN(n))
+    .sort((a, b) => b - a)[0];
+
+  const threadRecord = {
+    threadId,
+    summary,
+    primaryType,
+    latestEta: latestEta ? new Date(latestEta).toISOString() : null,
+    signals: members.map((m) => String(m.id)),
+    updatedAt: Date.now(),
+  };
+  await redis.set(`household:${householdId}:threads:${threadId}`, JSON.stringify(threadRecord));
+  console.log(
+    `[thread] ${householdId} ${threadId}: "${summary}" (${members.length} signals)`
+  );
+  return threadRecord;
+}
+
 // ---------- recurring pattern detection ----------
 //
 // After a signal lands in :signals, look back at the last 90 days for
@@ -950,6 +1111,17 @@ ${emailText.substring(0, 1000)}`,
         await detectAndStampRecurring(householdId, signal);
       } catch (err) {
         console.error("[recurring] detection error:", err?.message || err);
+      }
+
+      // Thread detection — groups related signals (same sender within
+      // 30d, ETA within 7d of an existing same-sender signal, or
+      // shared destination/city keyword). Stamps threadId on the new
+      // signal AND backfills onto matched existing signals so the
+      // brief and Hover can narrate/render them as one item.
+      try {
+        await detectAndStampThread(householdId, signal);
+      } catch (err) {
+        console.error("[thread] detection error:", err?.message || err);
       }
 
       await redis.lpush(signalsKey, JSON.stringify(signal));

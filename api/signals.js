@@ -1214,6 +1214,35 @@ export default async function handler(req, res) {
       return res.status(200).json({ household: householdId, transactions });
     }
 
+    // Threads — read thread metadata for a specific threadId. GET
+    // returns the thread record plus the full signal objects for
+    // each member. Mobile Hover / Finale use this for the
+    // "Part of: {summary}" header + "View thread" list.
+    if (queryType === "thread") {
+      if (req.method !== "GET") {
+        res.setHeader("Allow", "GET");
+        return res.status(405).json({ error: "Method not allowed for thread" });
+      }
+      const threadId = req.query?.threadId;
+      if (!threadId) return res.status(400).json({ error: "threadId required" });
+      const householdId = await resolveHouseholdId(req.query?.userId);
+      const raw = await redis.get(`household:${householdId}:threads:${threadId}`);
+      const meta = safeJson(raw);
+      if (!meta) return res.status(404).json({ error: "thread not found" });
+
+      // Resolve member signal objects from the household signal list.
+      const memberIds = new Set((meta.signals || []).map(String));
+      const rawSignals = await redis.lrange(`household:${householdId}:signals`, 0, -1);
+      const members = [];
+      for (const r of rawSignals || []) {
+        try {
+          const s = typeof r === "string" ? JSON.parse(r) : r;
+          if (s && memberIds.has(String(s.id))) members.push(s);
+        } catch { /* skip */ }
+      }
+      return res.status(200).json({ household: householdId, thread: meta, members });
+    }
+
     // Providers — service-provider directory at
     // household:{id}:providers (Redis hash keyed by normalized name).
     // GET lists all providers; POST manually adds one. Auto-population
