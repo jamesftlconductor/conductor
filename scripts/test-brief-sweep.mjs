@@ -26,6 +26,7 @@ const WEATHER_CLOSER_RE = /\b(clear skies( today| ahead)?|otherwise quiet weathe
 const POSITIVE_HEALTH_RE = /\b(your body (?:feels?|is|'s) strong|feeling strong|energy is good|in a strong window|strong recovery|recovery looks solid|good timing energy-wise|you're in a strong window)\b/gi;
 
 const HYDRATION_NUDGE_RE = /\b(drink (?:more )?water (?:throughout|today|often|early|all day|regularly)|stay hydrated|hydrate (?:today|early|often|throughout|more|all day|regularly)|keep water (?:close|nearby|handy|on you)|the air (?:is|feels) (?:thick|heavy|sticky|soupy)|heavy air today|humid today|muggy today|thick air|sticky (?:out|today))\b/gi;
+const UNTIL_IN_RE = /\buntil in\b/gi;
 
 const TRANSPARENCY_HEALTH_NUMBER_RE = /\b\d+(?:\.\d+)?\s*(?:steps|calories|kcal|bpm|ms|hours?\s+of\s+sleep|hrs?\s+of\s+sleep|hours?\s+slept|hrs?\s+slept)\b/gi;
 const TRANSPARENCY_HEALTH_PCT_RE = /\b\d+%\s+(?:below|above|of|under|over)\s+(?:baseline|normal|average|usual|typical)\b/gi;
@@ -118,11 +119,14 @@ function check(text, today = new Date()) {
   WEATHER_CLOSER_RE.lastIndex = 0;
   HYDRATION_NUDGE_RE.lastIndex = 0;
   POSITIVE_HEALTH_RE.lastIndex = 0;
+  WINDOW_PHRASE_RE.lastIndex = 0;
+  UNTIL_IN_RE.lastIndex = 0;
   if (WINDOW_PHRASE_RE.test(text)) return "window";
   if (GAP_PHRASE_RE.test(text)) return "gap";
   if (WEATHER_CLOSER_RE.test(text)) return "weather";
   if (HYDRATION_NUDGE_RE.test(text)) return "hydration";
   if (POSITIVE_HEALTH_RE.test(text)) return "health";
+  if (UNTIL_IN_RE.test(text)) return "until_in";
   if (horizonNearViolations(text, today).length > 0) return "horizon_near";
   return "CLEAN";
 }
@@ -193,6 +197,13 @@ const cases = [
   // Negative hydration cases — should stay CLEAN
   ["The renewal needs water before Wednesday.", "CLEAN"],
   ["Don't forget Mia's water bottle for the field trip.", "CLEAN"],
+
+  // "until in" glue malformation — must flag
+  ["Google Home doesn't come due until in 11 days on Thursday, May 28.", "until_in"],
+  ["The lease isn't up until in 2 weeks.", "until_in"],
+  // Negative — "until" used naturally without "in N" following
+  ["Doesn't come due until Thursday, May 28.", "CLEAN"],
+  ["Comes due in 11 days, on Thursday, May 28.", "CLEAN"],
 ];
 
 const TRANSPARENCY_CASES = [
