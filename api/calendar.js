@@ -129,6 +129,9 @@ export async function runCalendarSync(userId) {
   } catch {
     // ignored
   }
+  console.log(
+    `[calendar] sync for ${userId}: workCalendarName=${JSON.stringify(userWorkCalendarName)}`
+  );
 
   const now = new Date();
   const thirtyDaysAgo = new Date(now - 30 * 24 * 60 * 60 * 1000).toISOString();

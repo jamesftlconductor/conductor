@@ -602,6 +602,17 @@ async function handlePreferences(req, res) {
       const existingRaw = await redis.get(`user:${userId}:preferences`);
       const existing = safeJson(existingRaw) || {};
       const merged = { ...existing, ...preferences };
+      // workCalendarName change observability — the most user-tangible
+      // preference, and the one the user can't visually verify without
+      // running a fresh sync. Log when present so we can confirm writes
+      // are landing without spelunking Redis.
+      if (Object.prototype.hasOwnProperty.call(preferences, "workCalendarName")) {
+        const prev = typeof existing.workCalendarName === "string" ? existing.workCalendarName : "";
+        const next = typeof preferences.workCalendarName === "string" ? preferences.workCalendarName : "";
+        console.log(
+          `[signals] workCalendarName write for ${userId}: ${JSON.stringify(prev)} -> ${JSON.stringify(next)}`
+        );
+      }
       await redis.set(`user:${userId}:preferences`, JSON.stringify(merged));
     }
     if (typeof expoPushToken === "string" && expoPushToken.length > 0) {
