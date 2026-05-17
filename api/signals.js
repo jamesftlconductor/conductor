@@ -1044,8 +1044,36 @@ async function handleCamouflage(req, res) {
   }
 
   if (req.method === "POST") {
-    const { userId, ruleType, value } = req.body || {};
+    let { userId, ruleType, value } = req.body || {};
+    const { signalId } = req.body || {};
     if (!userId) return res.status(400).json({ error: "userId required" });
+
+    // Mobile quick-action "Not relevant" passes just { userId, signalId }
+    // — derive the sender from the named signal so the camouflage rule
+    // suppresses future imports from the same source.
+    if (signalId != null && (!ruleType || !value)) {
+      const hid = await resolveHouseholdId(userId);
+      const raw = await redis.lrange(`household:${hid}:signals`, 0, -1);
+      let foundSender = null;
+      for (const r of raw || []) {
+        try {
+          const s = typeof r === "string" ? JSON.parse(r) : r;
+          if (s && (s.id === signalId || String(s.id) === String(signalId))) {
+            foundSender = s.sender || null;
+            break;
+          }
+        } catch {
+          // skip malformed
+        }
+      }
+      if (foundSender) {
+        ruleType = "sender";
+        value = foundSender;
+      } else {
+        return res.status(404).json({ error: "signalId not found" });
+      }
+    }
+
     if (ruleType !== "sender" && ruleType !== "signalType") {
       return res.status(400).json({ error: "ruleType must be 'sender' or 'signalType'" });
     }
