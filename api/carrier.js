@@ -460,67 +460,96 @@ function normalizeFlightStatus(raw) {
   return "On Time";
 }
 
+// AviationStack flight_status values map directly onto our flight
+// status enum. Checked before the regex normalizer so "active" doesn't
+// fall through to the "On Time" default.
+const AVIATIONSTACK_STATUS_MAP = {
+  scheduled: "On Time",
+  active: "In Flight",
+  landed: "Landed",
+  cancelled: "Cancelled",
+  incident: "Delayed",
+  diverted: "Delayed",
+};
+
 export async function trackFlight(flightNumber, departureDate) {
-  const apiKey = process.env.FLIGHTAWARE_API_KEY;
+  const apiKey = process.env.AVIATIONSTACK_API_KEY;
   if (!apiKey) return null;
   if (!flightNumber) return null;
-  // AeroAPI accepts ident as ICAO or IATA; the path optionally takes
-  // a `start`/`end` date window. We pass a 24h window centered on the
-  // departure date when one is provided, otherwise let it default.
-  const params = new URLSearchParams();
-  if (departureDate) {
-    const startMs = Date.parse(departureDate);
-    if (!isNaN(startMs)) {
-      const start = new Date(startMs - 12 * 60 * 60 * 1000).toISOString();
-      const end = new Date(startMs + 36 * 60 * 60 * 1000).toISOString();
-      params.set("start", start);
-      params.set("end", end);
-    }
-  }
-  const url = `https://aeroapi.flightaware.com/aeroapi/flights/${encodeURIComponent(flightNumber)}${
-    params.toString() ? `?${params}` : ""
-  }`;
-  const res = await fetch(url, { headers: { "x-apikey": apiKey } });
+  // Free tier is HTTP-only (HTTPS requires paid plan) and capped at
+  // 100 req/mo — the cron's tiered refresh keeps us well under that
+  // for a single household running one or two travel signals at a
+  // time. The flight_date filter also requires a paid plan, so we
+  // pull whatever results AviationStack returns for the IATA code
+  // and pick the row whose scheduled departure is closest to the
+  // signal's eta.
+  const url = `http://api.aviationstack.com/v1/flights?access_key=${encodeURIComponent(
+    apiKey
+  )}&flight_iata=${encodeURIComponent(flightNumber)}`;
+  const res = await fetch(url);
   if (!res.ok) {
-    console.warn(`[flightaware] ${flightNumber} → ${res.status}`);
+    console.warn(`[aviationstack] ${flightNumber} → ${res.status}`);
     return null;
   }
   const data = await res.json();
-  const flights = Array.isArray(data?.flights) ? data.flights : [];
+  // AviationStack also returns an `error` object on quota/key
+  // failures with HTTP 200 — surface that as a null result so the
+  // cron skips this signal until next run.
+  if (data?.error) {
+    console.warn(
+      `[aviationstack] api error: ${data.error.code || "?"} ${
+        data.error.message || data.error.info || ""
+      }`
+    );
+    return null;
+  }
+  const flights = Array.isArray(data?.data) ? data.data : [];
   if (flights.length === 0) return null;
-  // Pick the flight whose scheduled-out closest matches the
-  // requested departure date.
+
+  // Pick the flight whose scheduled departure is closest to the
+  // signal's eta. Without that anchor, default to the first row.
   let target = flights[0];
   if (departureDate) {
     const want = Date.parse(departureDate);
-    let bestDelta = Infinity;
-    for (const f of flights) {
-      const t = Date.parse(f.scheduled_out || f.scheduled_off || 0);
-      if (isNaN(t)) continue;
-      const d = Math.abs(t - want);
-      if (d < bestDelta) { bestDelta = d; target = f; }
+    if (!isNaN(want)) {
+      let bestDelta = Infinity;
+      for (const f of flights) {
+        const t = Date.parse(f?.departure?.scheduled || 0);
+        if (isNaN(t)) continue;
+        const d = Math.abs(t - want);
+        if (d < bestDelta) { bestDelta = d; target = f; }
+      }
     }
   }
-  const schedOut = target.scheduled_out || target.scheduled_off || null;
-  const estOut = target.estimated_out || target.estimated_off || schedOut;
-  const schedIn = target.scheduled_in || target.scheduled_on || null;
-  const estIn = target.estimated_in || target.estimated_on || schedIn;
-  // Delay in minutes — favor explicit field, fall back to derived.
+
+  const dep = target?.departure || {};
+  const arr = target?.arrival || {};
+  const schedOut = dep.scheduled || null;
+  const estOut = dep.actual || dep.estimated || schedOut;
+  const schedIn = arr.scheduled || null;
+  const estIn = arr.actual || arr.estimated || schedIn;
+  // Delay in minutes — AviationStack provides departure.delay
+  // directly (in minutes) when available; derive from
+  // scheduled-vs-estimated otherwise.
   let delayMinutes = null;
-  if (typeof target.departure_delay === "number") {
-    delayMinutes = Math.round(target.departure_delay / 60);
+  if (typeof dep.delay === "number") {
+    delayMinutes = dep.delay;
   } else if (schedOut && estOut) {
     delayMinutes = Math.round((Date.parse(estOut) - Date.parse(schedOut)) / 60000);
   }
+
+  const rawStatus = String(target.flight_status || "").toLowerCase();
+  const mappedStatus = AVIATIONSTACK_STATUS_MAP[rawStatus] || normalizeFlightStatus(rawStatus);
+
   return {
-    flightNumber: target.ident || flightNumber,
-    status: normalizeFlightStatus(target.status),
+    flightNumber: target?.flight?.iata || flightNumber,
+    status: mappedStatus,
     scheduledDeparture: schedOut,
     estimatedDeparture: estOut,
     scheduledArrival: schedIn,
     estimatedArrival: estIn,
-    departureGate: target.gate_origin || null,
-    arrivalGate: target.gate_destination || null,
+    departureGate: dep.gate || null,
+    arrivalGate: arr.gate || null,
     delayMinutes,
   };
 }
