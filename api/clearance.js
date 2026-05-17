@@ -501,6 +501,124 @@ Rules: warm but not effusive. Honest. Maximum 4 sentences. Never clinical. This 
   }
 }
 
+// Month in Review — fires only on the last day of the month in ET.
+// Same Haiku pattern as Week in Review but spans the whole month
+// (from day 1 in ET). Returns null on any non-last-day or on empty
+// memory months so the mobile renderer can hide the section.
+async function generateMonthInReview(householdId) {
+  try {
+    // Last-day detection in America/New_York: a day is the last of
+    // the month iff (today + 1 day) is the 1st of any month in the
+    // same timezone.
+    const tomorrowET = new Date(Date.now() + 24 * 60 * 60 * 1000)
+      .toLocaleString("en-US", {
+        timeZone: "America/New_York",
+        day: "2-digit",
+      });
+    if (tomorrowET !== "01") return null;
+
+    // Window: the 1st of the current month (ET) through now.
+    const todayET = new Date().toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric", month: "2-digit", day: "2-digit",
+    });
+    const [m, , y] = todayET.split("/"); // "MM/DD/YYYY"
+    const monthStartMs = Date.parse(`${y}-${m}-01T00:00:00-04:00`);
+    if (isNaN(monthStartMs)) return null;
+
+    const [rawMemory, rawCaught, rawStreak] = await Promise.all([
+      redis.lrange(`household:${householdId}:memory`, 0, -1),
+      redis.lrange(`household:${householdId}:caughtMoments`, 0, -1).catch(() => []),
+      redis.get(`household:${householdId}:streakData`).catch(() => null),
+    ]);
+
+    const entries = (rawMemory || [])
+      .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+      .filter(Boolean)
+      .filter((e) => {
+        const ms = Date.parse(e.actionAt || "");
+        return !isNaN(ms) && ms >= monthStartMs;
+      });
+
+    let rested = 0;
+    let lapsed = 0;
+    let deadlinesCaught = 0;
+    let carriedForward = 0;
+    let crewEvents = 0;
+    let vaultHandled = 0;
+    for (const e of entries) {
+      if (e.action === "resolved") rested++;
+      if (e.action === "expired" || e.action === "lapsed") lapsed++;
+      if (e.action === "held") carriedForward++;
+      if (e.action === "resolved" && e.type === "deadline") {
+        deadlinesCaught++;
+        vaultHandled++;
+      }
+      if (e.type === "appointment" || e.type === "celebration") crewEvents++;
+    }
+    if (rested === 0 && lapsed === 0 && carriedForward === 0) return null;
+
+    const caught = (rawCaught || [])
+      .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+      .filter(Boolean)
+      .filter((c) => {
+        const ms = Date.parse(c.resolvedAt || "");
+        return !isNaN(ms) && ms >= monthStartMs;
+      });
+    const topCaught = caught.length > 0
+      ? caught.slice().sort((a, b) => (a.daysBeforeExpiry ?? 99) - (b.daysBeforeExpiry ?? 99))[0]
+      : null;
+
+    const streak = (() => { try { return typeof rawStreak === "string" ? JSON.parse(rawStreak) : rawStreak; } catch { return null; } })();
+    const longest = (streak && streak.longestStreak) || 0;
+
+    const monthLabel = new Date(monthStartMs).toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      month: "long", year: "numeric",
+    });
+
+    const prompt = `Write a warm, honest Month in Review for this household covering ${monthLabel}.
+
+Data:
+- Signals rested this month: ${rested}
+- Signals that lapsed: ${lapsed}
+- Signals carried forward (held): ${carriedForward}
+- Deadlines caught before slipping: ${deadlinesCaught}
+- Longest streak this month: ${longest} days
+- Crew events / appointments touched: ${crewEvents}
+- Vault items handled: ${vaultHandled}
+${topCaught ? `- Most significant caught moment: "${topCaught.description}" — ${topCaught.daysBeforeExpiry} day(s) to spare` : ""}
+
+Cover: what the household handled, any patterns you noticed, what was caught before it slipped, how the streak looked. If there's something genuinely funny or ironic about the month, let it land. Maximum 5 sentences. Warm, not clinical. This should feel earned. Plain text, no markdown. Refer to the household in second person ("you" / "your"). Never quote raw ratios or percentages.`;
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 400,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      console.error("[monthInReview] Anthropic error", response.status, errText.slice(0, 200));
+      return null;
+    }
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim();
+    if (!text) return null;
+    return text;
+  } catch (err) {
+    console.error("Month in Review failed:", err?.message || err);
+    return null;
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -930,7 +1048,7 @@ ${isSingleMember
     // for a warm one-paragraph reflection. Returns null on non-Sunday or
     // any failure — the field is always present in the response so the
     // mobile renderer can decide whether to show the section.
-    const [segments, transparency, weekInReview] = await Promise.all([
+    const [segments, transparency, weekInReview, monthInReview] = await Promise.all([
       tagBriefSegments(brief, tagSet),
       generateTransparency(brief, {
         resolvedToday,
@@ -944,6 +1062,7 @@ ${isSingleMember
         horizon: horizonSignal,
       }),
       generateWeekInReview(householdId),
+      generateMonthInReview(householdId),
     ]);
 
     // Write narrated signal snapshots into the shared briefedToday hash so the
@@ -987,7 +1106,7 @@ ${isSingleMember
       await redis.expire(clearanceBriefedKey, 14 * 60 * 60);
     }
 
-    const clearanceResponse = { brief, segments, transparency, weekInReview, household: householdId, user: userName, isSingleMember };
+    const clearanceResponse = { brief, segments, transparency, weekInReview, monthInReview, household: householdId, user: userName, isSingleMember };
 
     if (userId) {
       await redis.set(
