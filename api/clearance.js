@@ -619,6 +619,168 @@ Cover: what the household handled, any patterns you noticed, what was caught bef
   }
 }
 
+// Year in Review — fires only on December 31 in ET. Uses Sonnet
+// (not Haiku) because this is the most important brief Conductor
+// writes all year. Persists at household:{id}:yearInReview:{year}
+// with no TTL so historical years remain accessible forever.
+//
+// Returns null on any non-Dec-31 day; clearance.js threads the
+// field through so the mobile renderer can hide it gracefully on
+// every other day.
+async function generateYearInReview(householdId) {
+  try {
+    // ET date guard. Dec 31 only.
+    const etParts = new Date()
+      .toLocaleString("en-US", {
+        timeZone: "America/New_York",
+        month: "2-digit", day: "2-digit", year: "numeric",
+      })
+      .split("/");
+    if (etParts.length < 3) return null;
+    const [mm, dd, yyyy] = etParts;
+    if (mm !== "12" || dd !== "31") return null;
+    const year = parseInt(yyyy, 10);
+    if (!Number.isFinite(year)) return null;
+
+    // Already generated for this year? Return the persisted record
+    // so the cron firing twice (clearance + edge re-evaluation) is
+    // idempotent. The Sonnet call is expensive; we don't want it
+    // running again once we have a result.
+    const persisted = await redis.get(`household:${householdId}:yearInReview:${year}`);
+    if (typeof persisted === "string" && persisted.length > 0) {
+      return persisted;
+    }
+
+    const yearStart = Date.parse(`${year}-01-01T00:00:00-05:00`);
+    const yearEnd = Date.parse(`${year}-12-31T23:59:59-05:00`);
+    if (isNaN(yearStart) || isNaN(yearEnd)) return null;
+
+    const [rawMemory, rawCaught, rawStreak, rawTransitions, rawVault] = await Promise.all([
+      redis.lrange(`household:${householdId}:memory`, 0, -1).catch(() => []),
+      redis.lrange(`household:${householdId}:caughtMoments`, 0, -1).catch(() => []),
+      redis.get(`household:${householdId}:streakData`).catch(() => null),
+      redis.lrange(`household:${householdId}:transitions`, 0, -1).catch(() => []),
+      redis.lrange(`household:${householdId}:vault`, 0, -1).catch(() => []),
+    ]);
+
+    const memory = (rawMemory || [])
+      .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+      .filter(Boolean)
+      .filter((e) => {
+        const ms = Date.parse(e.actionAt || "");
+        return !isNaN(ms) && ms >= yearStart && ms <= yearEnd;
+      });
+    const caught = (rawCaught || [])
+      .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+      .filter(Boolean)
+      .filter((c) => {
+        const ms = Date.parse(c.resolvedAt || "");
+        return !isNaN(ms) && ms >= yearStart && ms <= yearEnd;
+      });
+    const transitions = (rawTransitions || [])
+      .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+      .filter(Boolean)
+      .filter((t) => {
+        const ms = Date.parse(t.createdAt || t.transitionDate || "");
+        return !isNaN(ms) && ms >= yearStart && ms <= yearEnd;
+      });
+    const vaultHandled = (rawVault || [])
+      .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+      .filter(Boolean)
+      .filter((v) => {
+        if (!v.handled && !v.handledAt) return false;
+        const ms = Date.parse(v.handledAt || "");
+        return !isNaN(ms) ? ms >= yearStart && ms <= yearEnd : true;
+      }).length;
+
+    let totalRested = 0;
+    let totalLapsed = 0;
+    let deadlinesCaught = 0;
+    let crewCount = 0;
+    const monthBuckets = new Map();
+    for (const e of memory) {
+      if (e.action === "resolved") totalRested++;
+      if (e.action === "expired" || e.action === "lapsed") totalLapsed++;
+      if (e.action === "resolved" && e.type === "deadline") deadlinesCaught++;
+      if (e.type === "appointment" || e.type === "celebration") crewCount++;
+      const m = new Date(Date.parse(e.actionAt || ""))
+        .toLocaleString("en-US", { timeZone: "America/New_York", month: "long" });
+      monthBuckets.set(m, (monthBuckets.get(m) || 0) + (e.action === "resolved" ? 1 : 0));
+    }
+    if (totalRested === 0 && totalLapsed === 0) return null;
+
+    let mostActiveMonth = null;
+    let quietestMonth = null;
+    if (monthBuckets.size > 0) {
+      const sorted = [...monthBuckets.entries()].sort((a, b) => b[1] - a[1]);
+      mostActiveMonth = sorted[0]?.[0] || null;
+      quietestMonth = sorted[sorted.length - 1]?.[0] || null;
+    }
+
+    const topCaught = caught.length > 0
+      ? caught.slice().sort((a, b) => (a.daysBeforeExpiry ?? 99) - (b.daysBeforeExpiry ?? 99))[0]
+      : null;
+    const streak = (() => { try { return typeof rawStreak === "string" ? JSON.parse(rawStreak) : rawStreak; } catch { return null; } })();
+    const longestStreak = (streak && streak.longestStreak) || 0;
+
+    const transitionsSummary = transitions
+      .map((t) => t.transitionType)
+      .filter(Boolean)
+      .map((t) => t.replace(/_/g, " "))
+      .join(", ");
+
+    const prompt = `Write a Year in Review for this household. This is the most important brief Conductor generates all year.
+
+Data from ${year}:
+- Signals handled: ${totalRested} rested, ${totalLapsed} lapsed
+- Deadlines caught before slipping: ${deadlinesCaught}
+${topCaught ? `- Closest call: "${topCaught.description}" — caught ${topCaught.daysBeforeExpiry} day(s) before it lapsed` : ""}
+- Longest streak: ${longestStreak} consecutive days
+- Vault items handled: ${vaultHandled}
+${transitionsSummary ? `- Life transitions: ${transitionsSummary}` : ""}
+${mostActiveMonth ? `- Most active month: ${mostActiveMonth}` : ""}
+${quietestMonth && quietestMonth !== mostActiveMonth ? `- Quietest month: ${quietestMonth}` : ""}
+- Crew events touched: ${crewCount}
+
+Write 4-6 sentences. Warm, reflective, honest. Acknowledge what the household accomplished. Call out the most significant caught moment specifically if present. If the streak is impressive, honor it. If there were hard months, acknowledge them without dwelling. End with one sentence looking ahead.
+
+This should feel like something worth saving. Like a letter from someone who was paying attention all year. Never clinical. Never a list. Pure prose. Refer to the household in second person ("you" / "your"). Plain text, no markdown.`;
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        // Sonnet — full reasoning intelligence for the most important
+        // brief of the year. The cost is one-time per year per
+        // household, justified by the moment.
+        model: "claude-sonnet-4-6",
+        max_tokens: 600,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      console.error("[yearInReview] Anthropic error", response.status, errText.slice(0, 200));
+      return null;
+    }
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim();
+    if (!text) return null;
+
+    // Persist permanently — no TTL. Historical years remain
+    // retrievable via GET ?type=yearInReview&year=YYYY.
+    await redis.set(`household:${householdId}:yearInReview:${year}`, text);
+    return text;
+  } catch (err) {
+    console.error("Year in Review failed:", err?.message || err);
+    return null;
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -1048,7 +1210,7 @@ ${isSingleMember
     // for a warm one-paragraph reflection. Returns null on non-Sunday or
     // any failure — the field is always present in the response so the
     // mobile renderer can decide whether to show the section.
-    const [segments, transparency, weekInReview, monthInReview] = await Promise.all([
+    const [segments, transparency, weekInReview, monthInReview, yearInReview] = await Promise.all([
       tagBriefSegments(brief, tagSet),
       generateTransparency(brief, {
         resolvedToday,
@@ -1063,6 +1225,7 @@ ${isSingleMember
       }),
       generateWeekInReview(householdId),
       generateMonthInReview(householdId),
+      generateYearInReview(householdId),
     ]);
 
     // Write narrated signal snapshots into the shared briefedToday hash so the
@@ -1106,7 +1269,7 @@ ${isSingleMember
       await redis.expire(clearanceBriefedKey, 14 * 60 * 60);
     }
 
-    const clearanceResponse = { brief, segments, transparency, weekInReview, monthInReview, household: householdId, user: userName, isSingleMember };
+    const clearanceResponse = { brief, segments, transparency, weekInReview, monthInReview, yearInReview, household: householdId, user: userName, isSingleMember };
 
     if (userId) {
       await redis.set(

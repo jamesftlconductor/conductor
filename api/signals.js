@@ -1333,6 +1333,45 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, household: householdId, ...record });
     }
 
+    // Year in Review fetch — returns the persisted prose for the
+    // requested year, or null when none exists. Useful for the mobile
+    // "View past years" affordance on the Memory Journal.
+    if (queryType === "yearInReview") {
+      if (req.method !== "GET") {
+        res.setHeader("Allow", "GET");
+        return res.status(405).json({ error: "Method not allowed for yearInReview" });
+      }
+      const householdId = await resolveHouseholdId(req.query?.userId);
+      if (!householdId) return res.status(400).json({ error: "userId required" });
+      const yearParam = req.query?.year;
+      const year = yearParam ? parseInt(yearParam, 10) : null;
+      // No year → return list of years we have on file. Scan the
+      // yearInReview:* keys for this household; tiny set, fast match.
+      if (!year) {
+        const keys = [];
+        let cursor = "0";
+        do {
+          const [next, batch] = await redis.scan(cursor, {
+            match: `household:${householdId}:yearInReview:*`,
+            count: 100,
+          });
+          cursor = next;
+          if (batch?.length) keys.push(...batch);
+        } while (cursor !== "0" && cursor !== 0);
+        const years = keys
+          .map((k) => parseInt(k.split(":").pop(), 10))
+          .filter((n) => Number.isFinite(n))
+          .sort((a, b) => b - a);
+        return res.status(200).json({ household: householdId, years });
+      }
+      const text = await redis.get(`household:${householdId}:yearInReview:${year}`);
+      return res.status(200).json({
+        household: householdId,
+        year,
+        yearInReview: typeof text === "string" ? text : null,
+      });
+    }
+
     // Conductor question ack — fire-and-forget telemetry. Records
     // which question got which response so future versions can tune
     // generation. Dismissed/acknowledged tracking lives client-side
