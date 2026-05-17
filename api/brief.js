@@ -1378,6 +1378,115 @@ function synthesizeHouseholdState({
 // One-sentence editorial synthesis from the structured state. Same best-effort
 // failure model as transparency/theRead — any error returns null and the brief
 // still ships with synthesisNote unset.
+// Proactive question generator — one short curious question Conductor
+// raises about something quietly stalled. Returns a string or null.
+// Best-effort: any failure returns null so the brief still ships.
+async function generateConductorQuestion({
+  activeSignals,
+  vaultUpcoming,
+  patterns,
+  crewUpcoming,
+}) {
+  // Age old-active signals from their id (Date.now() at import time).
+  // Anything still active 7+ days later is fair game for "still
+  // moving forward?" framing.
+  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+  const stale = (activeSignals || [])
+    .filter((s) => {
+      const age = Date.now() - (s.id || 0);
+      const open = !s.state || s.state === "incoming" || s.state === "active";
+      return open && age > SEVEN_DAYS_MS;
+    })
+    .slice(0, 15)
+    .map((s) => ({
+      description: s.description || "Unknown",
+      sender: s.sender || null,
+      eta: s.eta || null,
+      ageDays: Math.round((Date.now() - (s.id || 0)) / (24 * 60 * 60 * 1000)),
+    }));
+  const vaultBucket = (vaultUpcoming || [])
+    .slice(0, 10)
+    .map((v) => ({ description: v.description, eta: v.eta }));
+  const patternsBucket = (patterns || [])
+    .slice(0, 8)
+    .map((p) => ({ sender: p.sender, type: p.type, interval: p.intervalDays }));
+  const crewBucket = (crewUpcoming || [])
+    .slice(0, 6)
+    .map((e) => ({ description: e.description, when: e.date || e.start }));
+
+  // If literally nothing on any axis, don't even spend a call.
+  if (
+    stale.length === 0 &&
+    vaultBucket.length === 0 &&
+    patternsBucket.length === 0 &&
+    crewBucket.length === 0
+  ) {
+    return null;
+  }
+
+  const prompt = `You are Conductor. Based on this household's signals, identify ONE thing worth asking about that hasn't been addressed.
+
+Look for:
+- Signals that have been active more than 7 days without resolution
+- Anticipated signals that haven't arrived (recurring patterns broken)
+- Vault items approaching without any related signal activity
+- Crew events coming up with no preparation signals
+- Anything in the household that seems quietly stalled
+
+Stale signals (7+ days active): ${JSON.stringify(stale)}
+Vault upcoming (within 60 days): ${JSON.stringify(vaultBucket)}
+Recurring patterns: ${JSON.stringify(patternsBucket)}
+Crew upcoming events: ${JSON.stringify(crewBucket)}
+
+Write ONE question maximum 15 words. Conversational, curious, never alarming. Examples of the right tone:
+"The HVAC estimate has been quiet — still moving forward?"
+"Mia's piano recital is in 10 days — anything to prepare?"
+"The Amazon Subscribe & Save hasn't arrived this month — worth checking?"
+"Your passport renewal has been on the radar — any progress?"
+
+If nothing genuinely worth asking about: return null. Never manufacture.
+
+Return JSON: { "question": string | null }`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim();
+    if (!text) return null;
+    // Allow either { "question": "..." } JSON or a bare quoted/plain
+    // string fallback. Strip code fences if Haiku wrapped it.
+    const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
+    try {
+      const parsed = JSON.parse(cleaned);
+      const q = parsed?.question;
+      if (typeof q === "string" && q.trim().length > 0) return q.trim();
+      return null;
+    } catch {
+      // Fallback: treat the raw text as the question if it looks like one.
+      if (cleaned.length > 0 && cleaned.length < 200 && cleaned.includes("?")) {
+        return cleaned.replace(/^["']|["']$/g, "");
+      }
+      return null;
+    }
+  } catch (err) {
+    console.warn("[conductorQuestion] failed:", err?.message || err);
+    return null;
+  }
+}
+
 async function generatePulseNote(state) {
   if (!state) return null;
 
@@ -3137,10 +3246,31 @@ ${isSingleMember
       // completely silent.
       backgroundRest,
     };
-    const [segments, transparency, theRead] = await Promise.all([
+    // allDeadlines holds vault items shaped like signals (consequence,
+    // eta, etc.). Filter to the 60-day window for the question prompt.
+    const SIXTY_DAYS_MS = 60 * 24 * 60 * 60 * 1000;
+    const vaultUpcoming = (allDeadlines || []).filter((v) => {
+      const ms = v.eta ? Date.parse(v.eta) : NaN;
+      return !isNaN(ms) && ms - Date.now() < SIXTY_DAYS_MS && ms > Date.now() - 24 * 60 * 60 * 1000;
+    });
+    // Patterns + crew upcoming feed the proactive-question prompt.
+    // Both are best-effort reads; failures fall through to empty.
+    const patternsForQ = await redis
+      .lrange(`household:${householdId}:patterns`, 0, -1)
+      .then((arr) => (arr || []).map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } }).filter(Boolean))
+      .catch(() => []);
+    const crewForQ = upcomingCelebrations || [];
+
+    const [segments, transparency, theRead, conductorQuestion] = await Promise.all([
       tagBriefSegments(brief, tagSignals),
       generateTransparency(brief, poolsForClaude),
       generateTheRead(brief, poolsForClaude),
+      generateConductorQuestion({
+        activeSignals,
+        vaultUpcoming,
+        patterns: patternsForQ,
+        crewUpcoming: crewForQ,
+      }),
     ]);
 
     // Track which signals Claude actually narrated this run so the next brief
@@ -3242,6 +3372,7 @@ ${isSingleMember
       handoff: handoff
         ? { signalId: handoff.signalId, message: handoff.message, type: handoff.type }
         : null,
+      conductorQuestion: conductorQuestion || null,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for
