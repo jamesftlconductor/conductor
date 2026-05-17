@@ -1091,10 +1091,13 @@ const TIME_UNITS = "day|days|week|weeks|month|months|year|years";
 // Window-phrase: paraphrased range like "in the next 3 days", "within the
 // next few weeks", "over the coming couple of days". The brief should use
 // the lifted parenthesized phrase or specific dates instead.
+// Number-or-quantifier slot is optional so the regex catches bare-unit
+// windows too: "over the next week", "in the coming month", "within the
+// next year" all match without a number between "next/coming" and the unit.
 const WINDOW_PHRASE_RE = new RegExp(
   "\\b(in|over|within|across|throughout)\\s+the\\s+(next|coming|upcoming)\\s+" +
-  `(${SPELLED_NUMBERS}|${QUANTIFIERS}|\\d+|a|an)` +
-  `\\s+(of\\s+)?(${TIME_UNITS})\\b`,
+  `(?:(${SPELLED_NUMBERS}|${QUANTIFIERS}|\\d+|a|an)\\s+(of\\s+)?)?` +
+  `(${TIME_UNITS})\\b`,
   "gi"
 );
 
