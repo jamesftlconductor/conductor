@@ -55,15 +55,33 @@ function senderLocalPart(from) {
 // (id of the oldest member) and thread metadata lives at
 // household:{id}:threads:{threadId}.
 
-const CITY_KEYWORDS = [
-  // Common travel destinations — extend as needed. Match is case-
-  // insensitive whole-word, so "Paris" matches "...Paris Louvre..." but
-  // not "parishioner".
-  "paris", "london", "tokyo", "new york", "nyc", "miami", "los angeles", "la",
-  "chicago", "boston", "seattle", "san francisco", "sf", "denver", "vegas",
-  "las vegas", "orlando", "dallas", "atlanta", "barcelona", "rome", "berlin",
-  "amsterdam", "madrid", "dubai", "singapore",
+// City keyword lists, split US vs international. Used both to extract
+// shared-entity matches and to enforce the "never thread a US signal
+// with an international one" rule.
+const US_CITIES = [
+  "new york", "nyc", "miami", "los angeles", "la", "chicago", "boston",
+  "seattle", "san francisco", "sf", "denver", "vegas", "las vegas",
+  "orlando", "dallas", "atlanta", "fort lauderdale", "ft lauderdale",
+  "houston", "phoenix", "philadelphia", "san diego", "austin",
+  "portland", "minneapolis", "tampa",
 ];
+const INTL_CITIES = [
+  "paris", "london", "tokyo", "barcelona", "rome", "berlin", "amsterdam",
+  "madrid", "dubai", "singapore", "nice", "montpellier", "montpelier",
+  "lyon", "marseille", "milan", "florence", "venice", "vienna", "prague",
+  "lisbon", "athens", "dublin", "edinburgh", "copenhagen", "stockholm",
+  "oslo", "munich", "frankfurt", "zurich", "geneva", "brussels", "cdg",
+  "charles de gaulle",
+];
+const CITY_KEYWORDS = [...US_CITIES, ...INTL_CITIES];
+const US_CITY_SET = new Set(US_CITIES);
+const INTL_CITY_SET = new Set(INTL_CITIES);
+
+function cityKind(city) {
+  if (US_CITY_SET.has(city)) return "us";
+  if (INTL_CITY_SET.has(city)) return "intl";
+  return null;
+}
 
 function descriptionKeywords(desc) {
   const lower = (desc || "").toLowerCase();
@@ -75,40 +93,120 @@ function descriptionKeywords(desc) {
   return hits;
 }
 
+// Flight numbers (IATA-ish): two letters or letter+digit + 1-4 digits.
+// AA123, B6234, UA1, F9567. Used as a high-specificity match — two
+// signals naming the same flight number always thread.
+const FLIGHT_NUMBER_THREAD_RE = /\b([A-Z]{2}|[A-Z]\d|\d[A-Z])\d{1,4}\b/g;
+function extractFlightNumbers(desc) {
+  if (!desc) return [];
+  const found = new Set();
+  FLIGHT_NUMBER_THREAD_RE.lastIndex = 0;
+  let m;
+  while ((m = FLIGHT_NUMBER_THREAD_RE.exec(desc)) !== null) {
+    found.add(m[0].toUpperCase());
+  }
+  return [...found];
+}
+
+// Coarse type families — used to enforce the "wildly different types
+// never thread unless same sender" rule. A `reservation` is split into
+// `travel-related` (description mentions a travel city) vs `local`
+// (no city marker) so a Paris hotel doesn't bucket with a neighborhood
+// dinner reservation.
+function typeFamily(signal) {
+  const t = String(signal.type || "").toLowerCase();
+  if (t === "travel" || t === "flight") return "travel";
+  if (t === "service" || t === "appointment") return "service";
+  if (t === "reservation") {
+    return descriptionKeywords(signal.description).size > 0
+      ? "travel-related"
+      : "local";
+  }
+  if (t === "package" || t === "delivery") return "package";
+  if (t === "deadline" || t === "subscription") return "admin";
+  return "other";
+}
+
+// Two type families are incompatible if they're broadly different
+// purposes (travel ↔ service, travel ↔ local, package ↔ travel, etc).
+// `same-sender` is the only override that lets cross-family pair up.
+const INCOMPATIBLE_PAIRS = new Set([
+  "travel|service", "service|travel",
+  "travel|local", "local|travel",
+  "travel|package", "package|travel",
+  "travel|admin", "admin|travel",
+  "service|local", "local|service",
+  "service|package", "package|service",
+]);
+function typesIncompatible(a, b) {
+  const fa = typeFamily(a);
+  const fb = typeFamily(b);
+  if (fa === fb) return false;
+  return INCOMPATIBLE_PAIRS.has(`${fa}|${fb}`);
+}
+
 // Decide whether two signals belong in the same thread.
+//
+// Order of operations:
+//   1. NEGATIVE rules — any one disqualifies the pair immediately.
+//   2. POSITIVE rules — any one passes if no negative blocked.
+//
+// Net: a thread requires shared sender + close ETA, OR a shared
+// high-specificity entity (city, flight number) + same continent +
+// compatible types.
 function isSameThread(newSignal, candidate) {
   if (!newSignal || !candidate) return false;
   if (newSignal.id === candidate.id) return false;
 
-  // Same sender within 30 days (id is Date.now() at import time, so
-  // this doubles as "imported within 30 days").
-  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
-  const newStamp = newSignal.id || Date.now();
-  const candStamp = candidate.id || 0;
   const senderNew = normalizeSenderForPattern(newSignal.sender);
   const senderCand = normalizeSenderForPattern(candidate.sender);
-  if (senderNew && senderCand && senderNew === senderCand
-      && Math.abs(newStamp - candStamp) < THIRTY_DAYS_MS) {
-    return true;
-  }
+  const sameSender = !!(senderNew && senderCand && senderNew === senderCand);
 
-  // ETA within 7 days of an existing signal from the same sender.
-  const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
   const newEta = newSignal.eta ? Date.parse(newSignal.eta) : NaN;
   const candEta = candidate.eta ? Date.parse(candidate.eta) : NaN;
-  if (!isNaN(newEta) && !isNaN(candEta) && senderNew && senderCand
-      && senderNew === senderCand && Math.abs(newEta - candEta) < SEVEN_DAYS_MS) {
-    return true;
-  }
+  const etaDelta =
+    !isNaN(newEta) && !isNaN(candEta) ? Math.abs(newEta - candEta) : Infinity;
 
-  // Shared destination/city keyword in description (covers cross-
-  // sender groupings like a hotel reservation + airport transfer + a
-  // dinner reservation, all tagged "Paris").
-  const kwNew = descriptionKeywords(newSignal.description);
-  const kwCand = descriptionKeywords(candidate.description);
-  for (const k of kwNew) {
-    if (kwCand.has(k)) return true;
-  }
+  const citiesNew = descriptionKeywords(newSignal.description);
+  const citiesCand = descriptionKeywords(candidate.description);
+  const sharedCity = [...citiesNew].some((c) => citiesCand.has(c));
+
+  // -------- NEGATIVE RULES --------
+
+  // N1: Both signals name cities, but none overlap → different trips.
+  if (citiesNew.size > 0 && citiesCand.size > 0 && !sharedCity) return false;
+
+  // N2: One signal references a US city, the other an international
+  // city → never thread (separate trips / different continents).
+  const kindsNew = new Set([...citiesNew].map(cityKind).filter(Boolean));
+  const kindsCand = new Set([...citiesCand].map(cityKind).filter(Boolean));
+  if (kindsNew.has("us") && kindsCand.has("intl")) return false;
+  if (kindsNew.has("intl") && kindsCand.has("us")) return false;
+
+  // N3: Wildly different type families → only same-sender overrides.
+  if (typesIncompatible(newSignal, candidate) && !sameSender) return false;
+
+  // -------- POSITIVE RULES --------
+
+  const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+  // P1: Same sender + ETA within 14 days. Replaces the old "same
+  // sender within 30d of import time" rule that grouped unrelated
+  // recurring touchpoints from the same vendor.
+  if (sameSender && etaDelta < FOURTEEN_DAYS_MS) return true;
+
+  // P2: Shared named entity (city) + ETA within 30 days. Cross-sender
+  // grouping for a single trip — hotel + dinner + transfer all
+  // tagged "Paris" within the same fortnight.
+  if (sharedCity && etaDelta < THIRTY_DAYS_MS) return true;
+
+  // P3: Shared flight number — unambiguous match. Two emails about
+  // AA123 are about the same flight regardless of sender/eta.
+  const flightsNew = extractFlightNumbers(newSignal.description);
+  const flightsCand = extractFlightNumbers(candidate.description);
+  if (flightsNew.some((f) => flightsCand.includes(f))) return true;
+
   return false;
 }
 
@@ -843,7 +941,7 @@ function safeParseSignal(raw) {
   }
 }
 
-export async function runImport(userId) {
+export async function runImport(userId, customQuery = null) {
   if (!userId) throw new Error("No userId provided");
 
   const accessToken = await getValidToken(userId);
@@ -852,7 +950,13 @@ export async function runImport(userId) {
   const fingerprintSetKey = `household:${householdId}:contentFingerprints`;
 
   const thirtyDaysAgo = Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000);
-  const query = `after:${thirtyDaysAgo} subject:(tracking OR shipped OR "your order" OR "order confirmed" OR "order shipped" OR delivery OR arriving OR "out for delivery" OR "return confirmed" OR reservation OR flight OR hotel OR appointment OR instacart OR doordash OR charge OR payment OR transaction OR receipt OR billing OR "subscription renewed" OR "auto-renewal" OR "amount due" OR statement OR invoice)`;
+  // Custom queries from POST body are used for targeted re-imports
+  // (e.g. surfacing a missed Paris flight email). When unset, falls
+  // back to the default 30d sweep. Targeted queries skip the
+  // `after:` window so older booking emails can be pulled in.
+  const query = customQuery && customQuery.trim().length > 0
+    ? customQuery
+    : `after:${thirtyDaysAgo} subject:(tracking OR shipped OR "your order" OR "order confirmed" OR "order shipped" OR delivery OR arriving OR "out for delivery" OR "return confirmed" OR reservation OR flight OR hotel OR appointment OR instacart OR doordash OR charge OR payment OR transaction OR receipt OR billing OR "subscription renewed" OR "auto-renewal" OR "amount due" OR statement OR invoice)`;
 
   const searchResponse = await fetch(
     `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=5`,
@@ -1245,14 +1349,14 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { userId } = req.body;
+  const { userId, query } = req.body;
 
   if (!userId) {
     return res.status(400).json({ error: "No userId provided" });
   }
 
   try {
-    const result = await runImport(userId);
+    const result = await runImport(userId, typeof query === "string" ? query : null);
     return res.status(200).json(result);
   } catch (error) {
     console.error("Import error:", error);
