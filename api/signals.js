@@ -1188,26 +1188,28 @@ export default async function handler(req, res) {
 
     if (req.method === "PATCH") {
       const body = req.body || {};
-      const { id, state, userId, notedAt, description, eta, status } = body;
+      const { id, state, userId, notedAt, description, eta, status, notes, confirmationNumber } = body;
 
       if (id === undefined || id === null) {
         return res.status(400).json({ error: "id is required" });
       }
 
-      // PATCH now accepts EITHER a state transition (existing lifecycle
-      // semantics) OR a field edit (description / eta / status), or both
-      // in one call. mobile FinaleSheet edit mode sends just the edit
-      // fields; resolve/hold flows send just state. State validation
-      // only fires when state is actually provided.
+      // PATCH accepts EITHER a state transition (existing lifecycle
+      // semantics) OR a field edit (description / eta / status / notes /
+      // confirmationNumber), or both in one call. FinaleSheet edit mode
+      // sends just the edit fields; resolve/hold flows send just state.
+      // Horizon's inline-edit affordances send notes/confirmationNumber.
       const stateProvided = state !== undefined;
       const hasDescription = typeof description === "string";
       const hasEta = "eta" in body; // allow null to clear
       const hasStatus = typeof status === "string";
-      const isEdit = hasDescription || hasEta || hasStatus;
+      const hasNotes = "notes" in body; // allow null/empty to clear
+      const hasConfirmation = "confirmationNumber" in body;
+      const isEdit = hasDescription || hasEta || hasStatus || hasNotes || hasConfirmation;
 
       if (!stateProvided && !isEdit) {
         return res.status(400).json({
-          error: "at least one of state, description, eta, or status is required",
+          error: "at least one of state, description, eta, status, notes, or confirmationNumber is required",
         });
       }
       if (stateProvided && !VALID_STATES.includes(state)) {
@@ -1223,6 +1225,8 @@ export default async function handler(req, res) {
         if (hasDescription) record.description = description;
         if (hasEta) record.eta = eta;
         if (hasStatus) record.status = status;
+        if (hasNotes) record.notes = notes === "" ? null : notes;
+        if (hasConfirmation) record.confirmationNumber = confirmationNumber === "" ? null : confirmationNumber;
       }
 
       const householdId = await resolveHouseholdId(userId);
