@@ -69,7 +69,14 @@ function firstSentence(text, max = 100) {
   return first;
 }
 
-async function sendExpoPush(token, title, body) {
+async function sendExpoPush(token, title, body, extras = {}) {
+  // extras may carry { categoryId, data }. categoryId routes to an
+  // iOS notification category whose action buttons (REST / HOLD /
+  // TRACK) the mobile app registers at launch; data is the payload
+  // the response listener uses to PATCH the signal.
+  const payload = { to: token, title, body, sound: "default" };
+  if (extras.categoryId) payload.categoryId = extras.categoryId;
+  if (extras.data && typeof extras.data === "object") payload.data = extras.data;
   const response = await fetch("https://exp.host/--/api/v2/push/send", {
     method: "POST",
     headers: {
@@ -77,7 +84,7 @@ async function sendExpoPush(token, title, body) {
       "Accept-Encoding": "gzip, deflate",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ to: token, title, body, sound: "default" }),
+    body: JSON.stringify(payload),
   });
   const data = await response.json().catch(() => ({}));
   // Expo always 200s on a well-formed request; per-message success lives in
@@ -98,6 +105,8 @@ export default async function handler(req, res) {
   if (type === "tracking") {
     const title = req.body?.title;
     const body = req.body?.body;
+    const signalId = req.body?.signalId ?? null;
+    const trackingKind = req.body?.kind || null; // "out-for-delivery" | "delivered" | "delayed" | "flight-delayed"
     if (!householdIdInput || !title || !body) {
       return res.status(400).json({ error: "tracking notify requires householdId, title, body" });
     }
@@ -108,7 +117,22 @@ export default async function handler(req, res) {
     for (const userId of members) {
       const token = await redis.get(`user:${userId}:expoPushToken`);
       if (!(typeof token === "string" && token.length)) continue;
-      const r = await sendExpoPush(token, title, body);
+      // Out-for-delivery is the one tracking transition where the
+      // user can usefully act from the lock-screen ("Got it ✓"
+      // resolves the package on arrival). Other tracking transitions
+      // get the same payload data but the PACKAGE_TRACKING category
+      // is harmless if the action isn't relevant — iOS just shows
+      // the buttons.
+      const r = await sendExpoPush(token, title, body, {
+        categoryId: "PACKAGE_TRACKING",
+        data: {
+          type: "tracking",
+          kind: trackingKind,
+          signalId,
+          userId,
+          householdId: householdIdInput,
+        },
+      });
       results.push({ userId, ok: r.ok });
       if (r.ok) sent++;
     }

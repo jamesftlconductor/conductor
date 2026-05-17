@@ -117,7 +117,13 @@ async function pushTrackingNotification(householdId, signal, kind, extra) {
     await fetch(`${BASE_URL}/api/notify?type=tracking`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ householdId, title, body }),
+      body: JSON.stringify({
+        householdId,
+        title,
+        body,
+        signalId: signal?.id ?? null,
+        kind,
+      }),
     });
   } catch (err) {
     console.warn("[track] notify failed:", err?.message || err);

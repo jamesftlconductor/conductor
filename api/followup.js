@@ -37,7 +37,13 @@ async function listHouseholds() {
   return map;
 }
 
-async function sendExpoPush(token, title, body) {
+async function sendExpoPush(token, title, body, extras = {}) {
+  // extras may carry { categoryId, data } so iOS shows the
+  // SIGNAL_FOLLOWUP action buttons (Done ✓ / Still open) and the
+  // mobile response listener can route the tap to PATCH the signal.
+  const payload = { to: token, title, body, sound: "default" };
+  if (extras.categoryId) payload.categoryId = extras.categoryId;
+  if (extras.data && typeof extras.data === "object") payload.data = extras.data;
   const response = await fetch("https://exp.host/--/api/v2/push/send", {
     method: "POST",
     headers: {
@@ -45,7 +51,7 @@ async function sendExpoPush(token, title, body) {
       "Accept-Encoding": "gzip, deflate",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ to: token, title, body, sound: "default" }),
+    body: JSON.stringify(payload),
   });
   const data = await response.json().catch(() => ({}));
   const ticket = data?.data;
@@ -143,7 +149,15 @@ export default async function handler(req, res) {
 
         const body = await generateFollowUpSentence(signal);
         for (const { userId, token } of tokens) {
-          const push = await sendExpoPush(token, "Quick check", body);
+          const push = await sendExpoPush(token, "Quick check", body, {
+            categoryId: "SIGNAL_FOLLOWUP",
+            data: {
+              type: "followup",
+              signalId: signal.id,
+              householdId: hid,
+              userId,
+            },
+          });
           if (push.ok) {
             sent++;
             await redis.set(`user:${userId}:lastNotification`, Date.now());
