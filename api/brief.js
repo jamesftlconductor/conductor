@@ -840,6 +840,27 @@ function classifyHealthState(healthContext) {
   return "normal";
 }
 
+// One-word condition label for the expanded Pulse card. Maps the open-meteo
+// WMO code to the small product vocabulary (Clear / Partly cloudy / Rain /
+// Storms / Snow / Foggy / Humid / Mixed). Humidity wins over Clear/Partly
+// cloudy when humidity is high — that matches the synthesis layer's framing.
+function conditionsLabel(weather) {
+  if (!weather) return null;
+  const { weatherCode, humidity } = weather;
+  if (weatherCode != null) {
+    if (weatherCode >= 95 && weatherCode <= 99) return "Storms";
+    if (weatherCode >= 51 && weatherCode <= 67) return "Rain";
+    if (weatherCode >= 80 && weatherCode <= 82) return "Rain";
+    if (weatherCode >= 71 && weatherCode <= 77) return "Snow";
+    if (weatherCode >= 45 && weatherCode <= 48) return "Foggy";
+    if (humidity != null && humidity >= 75 && weatherCode <= 3) return "Humid";
+    if (weatherCode <= 1) return "Clear";
+    if (weatherCode <= 3) return "Partly cloudy";
+  }
+  if (humidity != null && humidity >= 75) return "Humid";
+  return "Mixed";
+}
+
 function classifyWeatherState(weather, heatIndex) {
   if (!weather) return null;
   const { tempF, weatherCode, humidity } = weather;
@@ -1922,6 +1943,7 @@ ${isSingleMember
         theRead: null,
         pulse: null,
         pulseFlags: [],
+        pulseData: null,
         household: householdId,
         user: userName,
         isFirstRun: true,
@@ -2306,6 +2328,33 @@ ${isSingleMember
       await redis.expire(briefedThisWeekKey, 6 * 24 * 60 * 60);
     }
 
+    // Structured payload backing the expanded Pulse card on Ground. Raw
+    // fields only — mobile decides formatting, color thresholds, and which
+    // sections to render based on null-vs-present checks. Each leaf is the
+    // value from the underlying source (healthContext / weather snapshot)
+    // or null when that source is unavailable.
+    const pulseData = {
+      health: healthContext ? {
+        sleep: healthContext.sleep?.duration ?? null,
+        hrv: {
+          current: healthContext.hrv?.current ?? null,
+          baseline7d: healthContext.hrv?.baseline7d ?? null,
+        },
+        restingHR: healthContext.restingHR ?? null,
+        steps: healthContext.steps ?? null,
+        activeCalories: healthContext.activeCalories ?? null,
+      } : null,
+      weather: weather ? {
+        tempF: weather.tempF ?? null,
+        heatIndex: synthesisState.heatIndex,
+        humidity: weather.humidity ?? null,
+        conditions: conditionsLabel(weather),
+      } : null,
+      signalLoad: synthesisState.signalLoad,
+      urgentCount: synthesisState.urgentCount,
+      synthesisFlags: synthesisState.synthesisFlags,
+    };
+
     const briefResponse = {
       brief,
       segments,
@@ -2313,6 +2362,7 @@ ${isSingleMember
       theRead,
       pulse: synthesisState.synthesisNote,
       pulseFlags: synthesisState.synthesisFlags,
+      pulseData,
       household: householdId,
       user: userName,
       isFirstRun,
