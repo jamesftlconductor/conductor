@@ -349,6 +349,119 @@ function etaWithFriendly(raw) {
   return phrase ? `${friendly} (${phrase}) (raw: ${raw})` : `${friendly} (raw: ${raw})`;
 }
 
+// Week in Review — Sunday-evening reflection paragraph. Reads the
+// household memory log (signal lifecycle log written by signals.js on
+// every PATCH and by loadSignals on auto-expiry), buckets the last 7
+// days, computes a current streak, and asks Claude for one warm
+// paragraph. Returns null on non-Sunday or any failure — the response
+// always carries the field so the mobile renderer can decide whether
+// to render the section.
+async function generateWeekInReview(householdId) {
+  try {
+    // Sunday detection uses the user-facing timezone (America/New_York
+    // for the dev household). At 02:00 UTC Monday — when the clearance
+    // cron fires — it's Sunday 9-10pm ET, which is the right moment
+    // for the user to read a week-in-review. Intl.DateTimeFormat is
+    // timezone-aware regardless of the server's UTC clock.
+    const localWeekday = new Date().toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      weekday: "short",
+    });
+    if (localWeekday !== "Sun") return null;
+
+    const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - SEVEN_DAYS_MS;
+    const rawMemory = await redis.lrange(`household:${householdId}:memory`, 0, -1);
+    const entries = (rawMemory || [])
+      .map((v) => { try { return JSON.parse(v); } catch { return null; } })
+      .filter(Boolean)
+      .filter((e) => {
+        const ms = Date.parse(e.actionAt || "");
+        return !isNaN(ms) && ms >= cutoff;
+      });
+
+    // Bucket by action. "resolved" = rested; "expired" = lapsed; "held"
+    // means active — counts as carriedForward in week-level framing.
+    let rested = 0, lapsed = 0, carriedForward = 0, deadlinesCaught = 0;
+    for (const e of entries) {
+      if (e.action === "resolved") {
+        rested++;
+        if (e.type === "deadline") deadlinesCaught++;
+      } else if (e.action === "expired") {
+        lapsed++;
+      } else if (e.action === "held") {
+        carriedForward++;
+      }
+    }
+
+    // Streak: consecutive days ending today with at least one resolved.
+    // Bucket entries by local YYYY-MM-DD and walk back from today.
+    const restedDays = new Set();
+    for (const e of entries) {
+      if (e.action !== "resolved") continue;
+      const ms = Date.parse(e.actionAt || "");
+      if (isNaN(ms)) continue;
+      const d = new Date(ms);
+      const key = d.toLocaleDateString("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric", month: "2-digit", day: "numeric",
+      });
+      restedDays.add(key);
+    }
+    let streak = 0;
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
+      const key = d.toLocaleDateString("en-US", {
+        timeZone: "America/New_York",
+        year: "numeric", month: "2-digit", day: "numeric",
+      });
+      if (restedDays.has(key)) streak++;
+      else break;
+    }
+
+    // No memory at all → no review. A blank week is a real outcome but
+    // the paragraph would be hollow; the section quietly stays absent.
+    if (rested === 0 && lapsed === 0 && carriedForward === 0) return null;
+
+    const prompt = `Write a warm, honest one-paragraph Week in Review for this household. Cover:
+- How many signals were handled this week (${rested} rested, ${carriedForward} carried forward, ${lapsed} lapsed)
+- Any deadlines caught before they slipped (${deadlinesCaught} deadlines caught this week)
+- The streak if active: ${streak >= 2 ? `${streak} days running — nothing has slipped` : "(no notable streak this week)"}
+- One honest observation about how the week went
+- If the week was genuinely good: acknowledge it warmly
+- If the week was hard: acknowledge it without judgment
+- If there's something funny or ironic about the week: let it land with a light touch
+
+Rules: warm but not effusive. Honest. Maximum 4 sentences. Never clinical. This should feel like something worth reading. Plain text, no markdown. Never quote the raw numbers as bare digits in a clinical way ("${rested} signals rested this week" is fine; "${rested}/${rested + carriedForward + lapsed} resolution rate" is not). Refer to the household in second person — "you" / "your".`;
+
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 350,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      console.error("[weekInReview] Anthropic error", response.status, errText.slice(0, 200));
+      return null;
+    }
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim();
+    if (!text) return null;
+    return text;
+  } catch (err) {
+    console.error("Week in Review failed:", err?.message || err);
+    return null;
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -742,8 +855,13 @@ ${isSingleMember
       seen.add(key);
       return true;
     });
-    // Run segment tagging and transparency generation in parallel.
-    const [segments, transparency] = await Promise.all([
+    // Run segment tagging, transparency, and (Sunday-only) Week in Review
+    // in parallel. Week in Review reads household:{id}:memory for the last
+    // 7 days, computes resolution + lapse counts + streak, and asks Claude
+    // for a warm one-paragraph reflection. Returns null on non-Sunday or
+    // any failure — the field is always present in the response so the
+    // mobile renderer can decide whether to show the section.
+    const [segments, transparency, weekInReview] = await Promise.all([
       tagBriefSegments(brief, tagSet),
       generateTransparency(brief, {
         resolvedToday,
@@ -756,6 +874,7 @@ ${isSingleMember
         tomorrow: tomorrowEvents,
         horizon: horizonSignal,
       }),
+      generateWeekInReview(householdId),
     ]);
 
     // Write narrated signal snapshots into the shared briefedToday hash so the
@@ -799,7 +918,7 @@ ${isSingleMember
       await redis.expire(clearanceBriefedKey, 14 * 60 * 60);
     }
 
-    const clearanceResponse = { brief, segments, transparency, household: householdId, user: userName, isSingleMember };
+    const clearanceResponse = { brief, segments, transparency, weekInReview, household: householdId, user: userName, isSingleMember };
 
     if (userId) {
       await redis.set(

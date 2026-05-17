@@ -13,6 +13,14 @@
       "schedule": "0 11 * * *"
     },
     {
+      "path": "/api/midday",
+      "schedule": "0 17 * * *"
+    },
+    {
+      "path": "/api/notify?type=midday",
+      "schedule": "0 17 * * *"
+    },
+    {
       "path": "/api/notify?type=clearance",
       "schedule": "0 2 * * *"
     }

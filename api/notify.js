@@ -38,12 +38,17 @@ async function listHouseholds() {
 // resolve household from userId and return { brief: string, ... } — any
 // member's userId in a household yields the same household-level brief.
 async function fetchBriefText(userId, type) {
-  const path = type === "takeoff" ? "/api/brief" : "/api/clearance";
+  const path =
+    type === "takeoff" ? "/api/brief"
+    : type === "midday" ? "/api/midday"
+    : "/api/clearance";
   const url = `${BASE_URL}${path}?userId=${encodeURIComponent(userId)}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`brief fetch ${res.status}`);
   const data = await res.json();
-  return typeof data?.brief === "string" ? data.brief : "";
+  // /api/midday returns { midday, ... } not { brief, ... }; normalize.
+  const text = type === "midday" ? data?.midday : data?.brief;
+  return typeof text === "string" ? text : "";
 }
 
 // First sentence of the brief, clipped to 100 chars. Split on ". " is the
@@ -86,13 +91,17 @@ export default async function handler(req, res) {
   const type = req.query?.type || req.body?.type;
   const householdIdInput = req.query?.householdId || req.body?.householdId;
 
-  if (type !== "takeoff" && type !== "clearance") {
-    return res.status(400).json({ error: "type must be 'takeoff' or 'clearance'" });
+  if (type !== "takeoff" && type !== "clearance" && type !== "midday") {
+    return res.status(400).json({ error: "type must be 'takeoff', 'midday', or 'clearance'" });
   }
 
-  const title = type === "takeoff" ? "Takeoff" : "Clearance";
-  const fallback = type === "takeoff"
-    ? "Your Takeoff brief is ready."
+  const title =
+    type === "takeoff" ? "Takeoff"
+    : type === "midday" ? "Midday"
+    : "Clearance";
+  const fallback =
+    type === "takeoff" ? "Your Takeoff brief is ready."
+    : type === "midday" ? "Your midday check-in is ready."
     : "Your Clearance brief is ready.";
 
   try {
@@ -112,9 +121,19 @@ export default async function handler(req, res) {
       const tokensByUser = [];
       for (const userId of members) {
         const token = await redis.get(`user:${userId}:expoPushToken`);
-        if (typeof token === "string" && token.length) {
-          tokensByUser.push({ userId, token });
+        if (!(typeof token === "string" && token.length)) continue;
+        // Midday is opt-in: skip users who haven't toggled middayEnabled
+        // in Settings. Default-off means the firehose stays at twice-daily
+        // (Takeoff/Clearance) unless the user explicitly asks for the
+        // third touchpoint.
+        if (type === "midday") {
+          const prefsRaw = await redis.get(`user:${userId}:preferences`);
+          let prefs = null;
+          try { prefs = typeof prefsRaw === "string" ? JSON.parse(prefsRaw) : prefsRaw; }
+          catch { prefs = null; }
+          if (!prefs || prefs.middayEnabled !== true) continue;
         }
+        tokensByUser.push({ userId, token });
       }
 
       if (tokensByUser.length === 0) {
