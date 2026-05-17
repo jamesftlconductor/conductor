@@ -1079,6 +1079,93 @@ Maximum one sentence. No preamble. This is The Pulse.`;
   }
 }
 
+// ---------- post-generation sweep ----------
+
+// Spelled-out English numbers covering the practical day/week range. The
+// pattern rule in baseRules lists these as ineligible for paraphrased
+// duration phrases; the sweep enforces the same vocabulary deterministically.
+const SPELLED_NUMBERS = "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty";
+const QUANTIFIERS = "few|several|couple|handful|many|a few|a couple of";
+const TIME_UNITS = "day|days|week|weeks|month|months|year|years";
+
+// Window-phrase: paraphrased range like "in the next 3 days", "within the
+// next few weeks", "over the coming couple of days". The brief should use
+// the lifted parenthesized phrase or specific dates instead.
+const WINDOW_PHRASE_RE = new RegExp(
+  "\\b(in|over|within|across|throughout)\\s+the\\s+(next|coming|upcoming)\\s+" +
+  `(${SPELLED_NUMBERS}|${QUANTIFIERS}|\\d+|a|an)` +
+  `\\s+(of\\s+)?(${TIME_UNITS})\\b`,
+  "gi"
+);
+
+// Inter-signal gap phrase: "eleven days later", "5 days after", "a week
+// before". Bans paraphrased gaps between two future dates that already
+// stand on their own.
+const GAP_PHRASE_RE = new RegExp(
+  `\\b(${SPELLED_NUMBERS}|\\d+|a|${QUANTIFIERS})` +
+  `\\s+(${TIME_UNITS})` +
+  "\\s+(later|after|ahead|earlier|afterward|subsequently|thereafter|from now|down the line|down the road|out)\\b",
+  "gi"
+);
+
+// Banned weather-closer phrases — verbatim list from the weather rule. Any
+// match means weather appeared as a closing flourish rather than as load-
+// bearing context for a specific signal.
+const WEATHER_CLOSER_RE = /\b(clear skies( today| ahead)?|otherwise quiet weather|nothing weather-related|the weather'?s calm|the day is clear and warm|with the nice weather|given the calm forecast|weather looks fine)\b/gi;
+
+// Banned positive-health framings — verbatim from the strict health rule.
+// The brief stays silent on normal/strong health; only deficits surface.
+const POSITIVE_HEALTH_RE = /\b(your body (?:feels?|is|'s) strong|feeling strong|energy is good|in a strong window|strong recovery|recovery looks solid|good timing energy-wise|you're in a strong window)\b/gi;
+
+function dedupeCi(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const s of arr) {
+    const k = s.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(s);
+  }
+  return out;
+}
+
+function sweepBriefForViolations(brief) {
+  if (!brief || typeof brief !== "string") return [];
+  const violations = [];
+  const checks = [
+    ["window_phrase", WINDOW_PHRASE_RE],
+    ["gap_phrase", GAP_PHRASE_RE],
+    ["weather_closer", WEATHER_CLOSER_RE],
+    ["positive_health", POSITIVE_HEALTH_RE],
+  ];
+  for (const [rule, re] of checks) {
+    const m = brief.match(re);
+    if (m && m.length > 0) {
+      violations.push({ rule, matches: dedupeCi(m) });
+    }
+  }
+  return violations;
+}
+
+// Build a one-shot retry instruction the model receives appended to the
+// original userPrompt. Explicit failure list — names the exact phrase and
+// the rule it broke so the model can target the rewrite.
+function buildRetryAddendum(violations) {
+  const detail = violations
+    .map(
+      (v) =>
+        `- ${v.rule}: ${v.matches.map((m) => `"${m}"`).join(", ")}`
+    )
+    .join("\n");
+  return `
+
+=== RETRY ATTEMPT ===
+Your previous attempt at this brief contained these specific rule violations:
+${detail}
+
+Generate a new brief from scratch. The same rules apply — pay extra attention to the specific phrases flagged above. They MUST NOT appear in any form (paraphrase, synonym, or variant) in the new output. Substitute concrete dates or the lifted parenthesized phrases instead. Do not acknowledge this retry instruction in the brief itself.`;
+}
+
 // ---------- handler ----------
 
 // Side-channel: returns the most recent stored Takeoff and Clearance briefs.
@@ -2182,33 +2269,76 @@ ${isSingleMember
 
     const systemPrompt = `You are Conductor, a household intelligence layer. You write calm, trusted, personal morning briefs for ${userName}. Your voice is like a thought the reader was already having — never assistant-like, never listy, always prose.`;
 
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 500,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userPrompt }],
-      }),
-    });
+    // Generate-then-sweep loop. Prompt rules are a soft constraint; the
+    // model honors them most of the time but occasionally slips on
+    // window/gap phrasings, banned closers, or positive-health framings.
+    // After each generation, run a deterministic regex sweep against the
+    // known offender patterns. On violation, retry once with the offending
+    // phrases enumerated in the prompt. After MAX_ATTEMPTS, accept the
+    // last result regardless — a 5% degraded brief is still better than a
+    // 500 to the user, and the [brief] sweep logs surface the residual
+    // for offline tuning.
+    const MAX_ATTEMPTS = 2;
+    let brief = "";
+    let attempts = 0;
+    let lastViolations = [];
+    while (attempts < MAX_ATTEMPTS) {
+      attempts++;
+      const promptToUse = lastViolations.length > 0
+        ? userPrompt + buildRetryAddendum(lastViolations)
+        : userPrompt;
 
-    const data = await response.json();
-    if (!response.ok || !data?.content?.[0]?.text) {
-      console.error("[brief] Anthropic main-call non-content response", {
-        status: response.status,
-        type: data?.type,
-        errorType: data?.error?.type,
-        errorMessage: data?.error?.message,
-        stopReason: data?.stop_reason,
-        rawHead: JSON.stringify(data).slice(0, 400),
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 500,
+          system: systemPrompt,
+          messages: [{ role: "user", content: promptToUse }],
+        }),
       });
+
+      const data = await response.json();
+      if (!response.ok || !data?.content?.[0]?.text) {
+        console.error("[brief] Anthropic main-call non-content response", {
+          status: response.status,
+          type: data?.type,
+          errorType: data?.error?.type,
+          errorMessage: data?.error?.message,
+          stopReason: data?.stop_reason,
+          rawHead: JSON.stringify(data).slice(0, 400),
+        });
+        // Auth / billing / model errors aren't fixable by retry — break.
+        brief = data?.content?.[0]?.text || "";
+        break;
+      }
+
+      brief = data.content[0].text;
+      const violations = sweepBriefForViolations(brief);
+      if (violations.length === 0) {
+        if (attempts > 1) {
+          console.log(`[brief] sweep clean on retry attempt ${attempts}`);
+        }
+        lastViolations = [];
+        break;
+      }
+      console.log(
+        `[brief] sweep violations on attempt ${attempts}:`,
+        violations.map((v) => `${v.rule}=${v.matches.length}`).join(" ")
+      );
+      lastViolations = violations;
     }
-    const brief = (data && data.content && data.content[0] && data.content[0].text) || "";
+    if (lastViolations.length > 0) {
+      console.log(
+        `[brief] shipping after ${attempts} attempts with residual violations:`,
+        lastViolations.map((v) => `${v.rule}[${v.matches.join("|")}]`).join(" ; ")
+      );
+    }
 
     // Stash the most-recent generated brief at a stable key with a 48h TTL
     // so the Yesterday's Programme modal can always recover it. Naming is
