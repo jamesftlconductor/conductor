@@ -1,6 +1,7 @@
 import { Redis } from "@upstash/redis";
 import { runImport } from "./import.js";
 import { runCalendarSync } from "./calendar.js";
+import { runOuraSync } from "./oura-sync.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -66,6 +67,21 @@ export default async function handler(req, res) {
           await runCalendarSync(userId);
         } catch (err) {
           errors.push({ stage: "calendar", householdId, userId, message: err.message });
+        }
+      }
+
+      // Per-member Oura sync — only fires for users who have completed
+      // the OAuth flow (user:{id}:ouraTokens exists). runOuraSync is
+      // best-effort: token expiry triggers a refresh, individual
+      // endpoint failures (ring out of sync, network blip) leave the
+      // corresponding section null in the merged health snapshot.
+      for (const userId of members) {
+        try {
+          const hasTokens = await redis.exists(`user:${userId}:ouraTokens`);
+          if (!hasTokens) continue;
+          await runOuraSync(userId);
+        } catch (err) {
+          errors.push({ stage: "oura", householdId, userId, message: err.message });
         }
       }
 

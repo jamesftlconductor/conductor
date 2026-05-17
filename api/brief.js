@@ -1052,6 +1052,7 @@ function synthesizeHouseholdState({
     synthesisNote: null,           // populated by generatePulseNote after this returns
     pulseWord,
     locationContext: "fort_lauderdale",
+    oura: healthContext?.oura || null,
   };
 }
 
@@ -1069,6 +1070,32 @@ async function generatePulseNote(state) {
     ? `${state.healthState}, sleep ${state.sleepHours != null ? `${state.sleepHours}h` : "unknown"}, HRV ${state.hrvCurrent != null ? state.hrvCurrent : "?"} vs baseline ${state.hrvBaseline != null ? state.hrvBaseline : "?"}`
     : "not connected";
 
+  // Oura context — only present when the user has connected the ring
+  // AND the day's data has synced. Frames readiness as a tier so the
+  // model picks the right tonal vocabulary rather than echoing the
+  // raw 0-100 score (Pulse numeral ban still applies).
+  const oura = state.oura || null;
+  const ouraLine = oura
+    ? (() => {
+        const score = oura.readiness?.score;
+        const tier = score == null ? "unknown"
+          : score < 50 ? "low"
+          : score < 70 ? "moderate"
+          : score < 85 ? "good"
+          : "high";
+        const effPct = oura.sleep?.efficiency != null
+          ? `${oura.sleep.efficiency}%` : "unknown";
+        const deepMin = oura.sleep?.deep_sleep_duration != null
+          ? Math.round(oura.sleep.deep_sleep_duration / 60) + "m" : "unknown";
+        const tempContrib = oura.readiness?.contributors?.body_temperature;
+        const tempState = tempContrib == null ? "unknown"
+          : tempContrib < 70 ? "elevated"
+          : tempContrib < 85 ? "slightly elevated"
+          : "normal";
+        return `OURA READINESS: ${score ?? "?"}/100 — ${tier}\nSleep efficiency: ${effPct}\nDeep sleep: ${deepMin}\nTemperature: ${tempState}`;
+      })()
+    : null;
+
   const weatherLine = state.weatherState
     ? `${state.weatherState}, ${state.tempF != null ? `${state.tempF}°F` : "?"}, feels like ${state.heatIndex != null ? `${state.heatIndex}°F` : "?"}, humidity ${state.humidity != null ? `${state.humidity}%` : "?"}`
     : "unknown";
@@ -1082,6 +1109,7 @@ Health: ${healthLine}
 Weather: ${weatherLine}
 Signal load: ${state.signalLoad}, ${state.urgentCount} urgent
 Location: ${locationLabel}
+${ouraLine ? `\n${ouraLine}\n\nOura observations (use when readiness is notable, but follow the numeral-ban rule below — translate the tier, never echo the score):\n- Readiness low (under 50): 'Oura says recovery is low today', 'the ring says rest if you can'\n- Readiness moderate (50-69): 'recovery is moderate', 'solid but not peak'\n- Readiness high (85+): 'Oura says you're well recovered', 'the ring likes today'\n- Temperature elevated: 'body temperature is slightly up — worth watching'` : ""}
 
 Fort Lauderdale weather observations (use these when weather is relevant):
 - High humidity: 'feels like the inside of a greenhouse', 'heavy air today', 'the humidity has opinions'
