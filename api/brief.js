@@ -1386,6 +1386,118 @@ function synthesizeHouseholdState({
 // One-sentence editorial synthesis from the structured state. Same best-effort
 // failure model as transparency/theRead — any error returns null and the brief
 // still ships with synthesisNote unset.
+// First-anniversary detection. Reads every household member's
+// connectedAt timestamp from user:{uid}:profile and computes the
+// earliest. If today is exactly 365 days after that earliest moment
+// (ET date match), this is anniversary day for the household.
+// Returns:
+//   { isAnniversary, anniversaryYearKey, yearStats } when matching
+//   null otherwise
+// yearStats summarizes the memory log for the closing-sentence Haiku.
+async function detectFirstAnniversary(householdId, memberIds, memoryEntries) {
+  if (!Array.isArray(memberIds) || memberIds.length === 0) return null;
+  let earliest = null;
+  for (const uid of memberIds) {
+    try {
+      const raw = await redis.get(`user:${uid}:profile`);
+      const profile = typeof raw === "string" ? JSON.parse(raw) : raw;
+      const ts = profile && typeof profile.connectedAt === "number"
+        ? profile.connectedAt
+        : profile && typeof profile.connectedAt === "string"
+        ? Date.parse(profile.connectedAt)
+        : NaN;
+      if (Number.isFinite(ts)) {
+        if (earliest == null || ts < earliest) earliest = ts;
+      }
+    } catch {
+      // skip malformed
+    }
+  }
+  if (earliest == null) return null;
+
+  // ET-date comparison. Anniversary = (today's ET date) === (earliest +
+  // 365 days in ET). Computed via toLocaleDateString in the user-facing
+  // timezone so DST flips don't drift the match.
+  const toET = (ms) =>
+    new Date(ms).toLocaleDateString("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric", month: "2-digit", day: "2-digit",
+    });
+  const earliestPlus365 = earliest + 365 * 24 * 60 * 60 * 1000;
+  if (toET(Date.now()) !== toET(earliestPlus365)) return null;
+
+  // Stats for the closing-sentence prompt — pulled from memory log.
+  const entries = Array.isArray(memoryEntries) ? memoryEntries : [];
+  let totalRested = 0;
+  let deadlinesCaught = 0;
+  let totalLapsed = 0;
+  for (const e of entries) {
+    if (e.action === "resolved") {
+      totalRested++;
+      if (e.type === "deadline") deadlinesCaught++;
+    }
+    if (e.action === "expired" || e.action === "lapsed") totalLapsed++;
+  }
+
+  const year = new Date(earliest).toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+  });
+  return {
+    isAnniversary: true,
+    anniversaryYearKey: year,
+    yearStats: {
+      totalRested,
+      deadlinesCaught,
+      totalLapsed,
+      householdAgeDays: Math.round((Date.now() - earliest) / (24 * 60 * 60 * 1000)),
+    },
+  };
+}
+
+// Haiku call to write one warm closing sentence acknowledging the
+// year. Never says "Happy Anniversary". Returns string or null.
+async function generateAnniversaryClosing(yearStats) {
+  try {
+    const prompt = `Write ONE warm sentence acknowledging that this household has been using Conductor for exactly one year today.
+
+Stats:
+- Signals rested this year: ${yearStats.totalRested}
+- Deadlines caught before they slipped: ${yearStats.deadlinesCaught}
+- Signals that lapsed: ${yearStats.totalLapsed}
+- Household age: ${yearStats.householdAgeDays} days
+
+Make it feel earned and personal. Reference specific numbers when they're meaningful (e.g. ${yearStats.totalRested} signals handled, ${yearStats.deadlinesCaught} deadlines caught). Never say "Happy Anniversary" — that reads as greeting-card. Just acknowledge it honestly.
+
+Examples of the right tone:
+"One year with Conductor today — ${yearStats.totalRested} signals handled, ${yearStats.deadlinesCaught} deadlines caught before they slipped, and the household is still running."
+"Conductor has been watching your household for a year as of today. Quietly steady, mostly."
+
+Return only the sentence, no quotes, no preamble.`;
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim();
+    if (!text) return null;
+    return text.replace(/^["']|["']$/g, "").replace(/^Happy Anniversary[!.]?\s*/i, "");
+  } catch (err) {
+    console.warn("[anniversary] generation failed:", err?.message || err);
+    return null;
+  }
+}
+
 // Proactive question generator — one short curious question Conductor
 // raises about something quietly stalled. Returns a string or null.
 // Best-effort: any failure returns null so the brief still ships.
@@ -1710,9 +1822,17 @@ async function generatePulseNote(state) {
   };
   const weatherVocab = WEATHER_VOCAB[region] || WEATHER_VOCAB.generic;
 
+  // First-year anniversary acknowledgment — when present, the
+  // model is instructed to weave a warm one-line acknowledgment
+  // into the Pulse naturally, rather than tacking it on. Only
+  // active on the exact anniversary day.
+  const anniversaryLine = state.anniversaryYearStats
+    ? `ANNIVERSARY: Today marks exactly one year since this household connected to Conductor. Stats for the year: ${state.anniversaryYearStats.totalRested} signals handled, ${state.anniversaryYearStats.deadlinesCaught} deadlines caught before they slipped. Weave a quiet, warm acknowledgment into the Pulse — never "happy anniversary", just an honest recognition that they've been at this for a year. Earned, not effusive.`
+    : null;
+
   const prompt = `Given this household state, write one sentence that synthesizes what it means for today. Be specific, warm, and honest. Use the approved list of location-aware weather observations for ${locationLabel}. If a synthesis flag is active, lead with its implication — not the data behind it.
 
-Flags active: ${flagsLine}
+${anniversaryLine ? anniversaryLine + "\n\n" : ""}Flags active: ${flagsLine}
 Health: ${healthLine}
 Weather: ${weatherLine}
 Signal load: ${state.signalLoad}, ${state.urgentCount} urgent
@@ -3087,6 +3207,22 @@ ${isSingleMember
     // signal load / health state / weather state by hand. Pulse generation
     // is best-effort: if it fails, synthesisNote stays null, the prompt
     // still includes the structured state, and the brief still ships.
+    // Detect first-year anniversary BEFORE Pulse generation so the
+    // Pulse prompt can weave in a warm acknowledgment naturally on
+    // the day. memoryEntries is parsed downstream — for the
+    // anniversary stats we parse the raw list here directly.
+    const anniversaryMemEntries = (rawMemoryEntries || [])
+      .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+      .filter(Boolean);
+    const anniversary = await detectFirstAnniversary(
+      householdId,
+      rawMembers || [],
+      anniversaryMemEntries
+    ).catch((err) => {
+      console.warn("[anniversary] detector failed:", err?.message || err);
+      return null;
+    });
+
     const synthesisState = synthesizeHouseholdState({
       location: householdLocation,
       urgentForPrompt,
@@ -3100,6 +3236,7 @@ ${isSingleMember
       upcomingCelebrations,
       travelPrep,
     });
+    if (anniversary) synthesisState.anniversaryYearStats = anniversary.yearStats;
     synthesisState.synthesisNote = await generatePulseNote(synthesisState);
 
     const householdStateBlock = [
@@ -3570,8 +3707,28 @@ ${isSingleMember
       synthesisFlags: synthesisState.synthesisFlags,
     };
 
+    // Anniversary closer — append exactly once per anniversary year.
+    // The 48h TTL key guards against duplicate appends if the user
+    // refreshes the brief multiple times during the day.
+    let finalBrief = brief;
+    if (anniversary) {
+      try {
+        const ackKey = `household:${householdId}:anniversaryAcknowledged:${anniversary.anniversaryYearKey}`;
+        const already = await redis.get(ackKey);
+        if (!already) {
+          const closer = await generateAnniversaryClosing(anniversary.yearStats);
+          if (closer && typeof closer === "string") {
+            finalBrief = `${brief.trim()}\n\n${closer}`.trim();
+            await redis.set(ackKey, "1", { ex: 48 * 60 * 60 });
+          }
+        }
+      } catch (err) {
+        console.warn("[anniversary] closer failed:", err?.message || err);
+      }
+    }
+
     const briefResponse = {
-      brief,
+      brief: finalBrief,
       segments,
       transparency,
       theRead,
