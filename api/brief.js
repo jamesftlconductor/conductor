@@ -2,6 +2,7 @@ import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
 import { loadCamouflageRules, applyCamouflage } from "./signals.js";
 import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
+import { loadNetworkContext } from "./network.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -856,6 +857,42 @@ ${signalList}`,
 // inventory is absent or no rules fire. Merged into activeSignals
 // after the camouflage filter so they flow through bucketing the
 // same way real signals do.
+// Render the network context into the brief prompt. The model sees a
+// concise summary per connected household at whatever permission level
+// each connection granted. Default brief behavior is silence — the
+// rules instruct the model to surface network context only when there
+// is a meaningful change (a connection in heavy load, an emergency).
+function formatNetworkForPrompt(networkContext) {
+  if (!Array.isArray(networkContext) || networkContext.length === 0) {
+    return "No connected households";
+  }
+  const lines = [];
+  for (const c of networkContext) {
+    const hid = c.connectedHouseholdId;
+    const level = c.permissionLevel;
+    const s = c.summary || {};
+    if (level === "emergency_only") {
+      lines.push(`- ${hid} [${level}]: hasEmergency=${s.hasEmergency ? "true" : "false"}`);
+    } else if (level === "watchful") {
+      lines.push(
+        `- ${hid} [${level}]: signalLoad=${s.signalLoad || "?"}, urgent=${s.urgentCount ?? 0}`
+      );
+    } else {
+      const sig = (s.activeSignals || [])
+        .slice(0, 3)
+        .map((x) => x.description)
+        .filter(Boolean)
+        .join("; ");
+      lines.push(
+        `- ${hid} [${level}]: signalLoad=${s.signalLoad || "?"}, urgent=${
+          s.urgentCount ?? 0
+        }${sig ? `, active: ${sig}` : ""}`
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
 function inventoryDerivedSignals(inventory, today = new Date()) {
   if (!inventory || typeof inventory !== "object") return [];
   const signals = [];
@@ -1745,6 +1782,7 @@ export default async function handler(req, res) {
       rawCrew,
       rawMembers,
       rawInventory,
+      networkContext,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: merges per-user calendar slices, falls back to
@@ -1782,6 +1820,13 @@ export default async function handler(req, res) {
       // Used to derive proactive service signals (roof/HVAC/water
       // heater age, vehicle mileage milestones, HVAC filter cadence).
       redis.get(`household:${householdId}:inventory`),
+      // Network — connected households + per-permission summaries.
+      // Empty array when household has no connections. Brief renders a
+      // NETWORK section in the prompt only when this has entries.
+      loadNetworkContext(householdId).catch((err) => {
+        console.warn("[brief] network load failed:", err?.message || err);
+        return [];
+      }),
     ]);
     const isSingleMember = (rawMembers || []).length <= 1;
 
@@ -2711,6 +2756,9 @@ ${isSingleMember
       }, thumbs down: ${
         (rawFeedbackStats && rawFeedbackStats.clearance_down) || 0
       }.`,
+      ``,
+      `NETWORK (connected households — mention ONLY if there is a meaningful change worth surfacing, ONE sentence max, never daily; silent by default):`,
+      formatNetworkForPrompt(networkContext),
     ].join("\n");
 
     const baseRules = `RULES:
@@ -2739,6 +2787,7 @@ ${isSingleMember
 - Still in motion: if STILL IN MOTION has an item, you MAY include one quiet "still moving" mention (e.g. "the renewal is still in motion, due Thursday"). Do NOT include if the same signal was already covered in URGENT or NEAR WINDOW prose this brief, and skip it entirely if doing so would push the brief past 5 sentences. A clean omission is fine — this layer is optional.
 - Horizon signal: one sentence at the end, tonal shift to future-aware, specific and surprising
 - Horizon awareness: if HORIZON AWARENESS is populated, surface it as one quiet sentence near the end (a "by the way..." not a lead). If both HORIZON SIGNAL and HORIZON AWARENESS are populated, prefer HORIZON AWARENESS — at most one horizon-style sentence per brief total.
+- Network: NETWORK is silent by default. Mention a connected household ONLY if there is a meaningful change worth surfacing — an emergency_only connection showing hasEmergency=true, or a watchful/open connection in heavy signalLoad when prior briefs were clear. One sentence at most. Never daily, never as a routine layer. Never name the raw household ID — refer to "the connected household" or by relationship if it's been established elsewhere. If nothing is notable, OMIT the network entirely.
 - Feedback tuning: the FEEDBACK HISTORY counts reflect how prior briefs landed. If thumbs-down significantly outnumbers thumbs-up for this brief type (takeoff or clearance, depending on which you're writing), be more concise and specific — trim discretionary sentences, lean harder into the most concrete signals. If thumbs-up is high or both counts are low, maintain current voice. Never reference the feedback in the brief output.
 - If multiple layers are silent, the brief is shorter — that is correct and good
 - A quiet brief is a gift — end with confidence not apology
