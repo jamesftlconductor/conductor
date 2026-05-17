@@ -41,6 +41,265 @@ function senderLocalPart(from) {
   return match[1].toLowerCase().split("@")[0];
 }
 
+// ---------- financial transaction detection ----------
+
+// Financial-institution sender domains and subject keywords. Either signal
+// is enough to mark an email as financial; once routed through the
+// financial flow the email skips the shipping/order classifier so we don't
+// double-process (e.g., an Amex receipt isn't a "package" signal).
+const FINANCIAL_DOMAINS = new Set([
+  "chase.com", "bankofamerica.com", "wellsfargo.com", "citibank.com",
+  "capitalone.com", "discover.com", "amex.com", "americanexpress.com",
+  "usaa.com", "paypal.com", "venmo.com", "synchrony.com", "ally.com",
+]);
+const FINANCIAL_SUBJECT_TERMS = [
+  "charge", "payment", "transaction", "receipt", "statement", "invoice",
+  "subscription renewed", "auto-renewal", "auto renewal", "billing",
+  "your bill", "amount due",
+];
+
+function senderDomain(from) {
+  const match = from.match(/<([^>]+)>/) || from.match(/(\S+@\S+)/);
+  if (!match) return "";
+  const email = match[1].toLowerCase();
+  const at = email.indexOf("@");
+  if (at === -1) return "";
+  // Last two labels handle "billing.chase.com" → "chase.com".
+  const host = email.slice(at + 1);
+  const parts = host.split(".");
+  if (parts.length <= 2) return host;
+  return parts.slice(-2).join(".");
+}
+
+function isFinancialEmail(from, subject) {
+  const domain = senderDomain(from);
+  if (domain && FINANCIAL_DOMAINS.has(domain)) return true;
+  const subjLower = (subject || "").toLowerCase();
+  return FINANCIAL_SUBJECT_TERMS.some((term) => subjLower.includes(term));
+}
+
+async function extractTransaction(subject, from, emailText) {
+  const prompt = `Extract financial transaction from this email. Return JSON or null:
+{
+  "transactionType": "subscription_charge" | "bill" | "purchase" | "price_change" | "payment_confirmation" | "other",
+  "merchant": "string",
+  "amount": number | null,
+  "previousAmount": number | null,
+  "date": "YYYY-MM-DD",
+  "cardLast4": "string | null",
+  "isRecurring": boolean,
+  "priceChangeDetected": boolean
+}
+Return the literal word null (no JSON) if the email is purely promotional or contains no real transaction.
+
+Subject: ${subject}
+From: ${from}
+
+Email body:
+${emailText.substring(0, 2000)}`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 400,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!response.ok) {
+      const errText = await response.text().catch(() => "");
+      console.error("[financial] Anthropic error", response.status, errText.slice(0, 200));
+      return null;
+    }
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim() || "";
+    const stripped = text.replace(/```json|```/g, "").trim();
+    if (/^null$/i.test(stripped)) return null;
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    const tx = JSON.parse(match[0]);
+    if (!tx || typeof tx !== "object") return null;
+    // Minimum shape: merchant + some date or amount.
+    if (!tx.merchant || typeof tx.merchant !== "string") return null;
+    if (tx.amount == null && !tx.date) return null;
+    return tx;
+  } catch (err) {
+    console.error("[financial] extract failed:", err?.message || err);
+    return null;
+  }
+}
+
+// Anomaly detection against the last 90 days of stored transactions.
+// Returns an array of { kind, details } records. Empty array = nothing
+// notable about this transaction.
+function detectAnomalies(tx, history) {
+  const anomalies = [];
+  const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - NINETY_DAYS_MS;
+  const merchantLower = (tx.merchant || "").toLowerCase().trim();
+
+  const merchantHistory = (history || []).filter((h) => {
+    if (!h || (h.merchant || "").toLowerCase().trim() !== merchantLower) return false;
+    const ms = h.date ? Date.parse(h.date) : NaN;
+    return !isNaN(ms) && ms >= cutoff;
+  });
+
+  // price_change: model already flagged it OR prior amount differs.
+  if (tx.priceChangeDetected) {
+    anomalies.push({ kind: "price_change", details: { previousAmount: tx.previousAmount, newAmount: tx.amount } });
+  } else if (tx.amount != null && merchantHistory.length > 0) {
+    const priorAmounts = merchantHistory
+      .map((h) => h.amount)
+      .filter((a) => typeof a === "number");
+    if (priorAmounts.length > 0) {
+      const lastPrior = priorAmounts[0]; // history is newest-first via LPUSH
+      if (Math.abs(lastPrior - tx.amount) > 0.01 && tx.isRecurring) {
+        anomalies.push({
+          kind: "price_change",
+          details: { previousAmount: lastPrior, newAmount: tx.amount },
+        });
+      }
+      // unusual_charge: more than 2x typical for this merchant
+      const avg = priorAmounts.reduce((a, b) => a + b, 0) / priorAmounts.length;
+      if (avg > 0 && tx.amount > avg * 2) {
+        anomalies.push({
+          kind: "unusual_charge",
+          details: { amount: tx.amount, typical: Math.round(avg * 100) / 100 },
+        });
+      }
+    }
+  }
+
+  // new_subscription: recurring charge from a merchant with no recent history.
+  // The vault-overlap check happens in the caller (needs Redis access).
+  if (tx.isRecurring && merchantHistory.length === 0) {
+    anomalies.push({ kind: "new_subscription", details: { merchant: tx.merchant } });
+  }
+
+  return anomalies;
+}
+
+// Compose a signal for a financial anomaly. Type "financial" surfaces in
+// the brief alongside other signals; the description carries the
+// user-readable framing.
+function buildFinancialSignal(anomaly, tx) {
+  const merchant = tx.merchant || "Unknown merchant";
+  const amount = tx.amount != null ? `$${tx.amount}` : "unknown amount";
+  let description;
+  switch (anomaly.kind) {
+    case "price_change": {
+      const prev = anomaly.details.previousAmount;
+      const curr = anomaly.details.newAmount;
+      description = `${merchant} price changed`
+        + (prev != null && curr != null ? ` from $${prev} to $${curr}` : "");
+      break;
+    }
+    case "unusual_charge":
+      description = `Unusual charge: ${merchant} ${amount} (typical: $${anomaly.details.typical})`;
+      break;
+    case "new_subscription":
+      description = `New recurring charge detected: ${merchant} ${amount}`;
+      break;
+    default:
+      description = `${merchant} ${amount}`;
+  }
+  return {
+    id: Date.now() + Math.floor(Math.random() * 1000),
+    description,
+    type: "financial",
+    sender: merchant,
+    eta: tx.date || null,
+    state: "incoming",
+    source: "financial",
+    confidence: 8,
+    lastUpdate: new Date().toLocaleString(),
+    financial: {
+      anomaly: anomaly.kind,
+      amount: tx.amount ?? null,
+      previousAmount: anomaly.details.previousAmount ?? tx.previousAmount ?? null,
+      cardLast4: tx.cardLast4 || null,
+    },
+  };
+}
+
+// Vault auto-create for new_subscription anomalies. Returns the new
+// vault id when created, or null when an existing matching item was
+// updated (price_change path) or nothing was done.
+async function syncVaultFromTransaction(householdId, tx, anomalies) {
+  const vaultKey = `household:${householdId}:vault`;
+  const rawVault = await redis.lrange(vaultKey, 0, -1);
+  const items = [];
+  for (const r of rawVault) {
+    try { items.push(JSON.parse(r)); } catch { /* skip malformed */ }
+  }
+  const merchantLower = (tx.merchant || "").toLowerCase().trim();
+
+  // Find a matching vault item by provider name (case-insensitive).
+  let matchIndex = -1;
+  let matchItem = null;
+  for (let i = 0; i < items.length; i++) {
+    const provider = (items[i].provider || "").toLowerCase().trim();
+    if (provider && provider === merchantLower) {
+      matchIndex = i;
+      matchItem = items[i];
+      break;
+    }
+  }
+
+  const hasPriceChange = anomalies.some((a) => a.kind === "price_change");
+  const hasNewSubscription = anomalies.some((a) => a.kind === "new_subscription");
+
+  // price_change → update existing vault item amount + push priceHistory.
+  if (hasPriceChange && matchItem) {
+    const priorAmount = matchItem.amount || null;
+    matchItem.amount = tx.amount != null ? `$${tx.amount}` : matchItem.amount;
+    if (!Array.isArray(matchItem.priceHistory)) matchItem.priceHistory = [];
+    matchItem.priceHistory.push({
+      previous: priorAmount,
+      current: matchItem.amount,
+      detectedAt: new Date().toISOString(),
+      txDate: tx.date || null,
+    });
+    matchItem.lastUpdate = new Date().toLocaleString();
+    await redis.lset(vaultKey, matchIndex, JSON.stringify(matchItem));
+    console.log(
+      `[financial] vault price change: ${matchItem.provider} ${priorAmount} → ${matchItem.amount}`
+    );
+    return null;
+  }
+
+  // new_subscription with no existing match → create auto-detected vault item.
+  if (hasNewSubscription && !matchItem) {
+    const newItem = {
+      id: `vault_auto_${Date.now()}`,
+      description: `${tx.merchant} subscription`,
+      provider: tx.merchant,
+      category: "subscription",
+      renewalDate: null,
+      amount: tx.amount != null ? `$${tx.amount}` : null,
+      consequence: null,
+      confidence: "medium",
+      source: "auto-detected",
+      policyNumber: null,
+      handled: false,
+      handledAt: null,
+      priceHistory: [],
+      createdAt: new Date().toISOString(),
+    };
+    await redis.lpush(vaultKey, JSON.stringify(newItem));
+    console.log(`[financial] vault auto-create: ${newItem.description}`);
+    return newItem.id;
+  }
+
+  return null;
+}
+
 function isBounceFrom(from) {
   const lower = (from || "").toLowerCase();
   return BOUNCE_FROM_SUBSTRINGS.some((p) => lower.includes(p));
@@ -195,7 +454,7 @@ export async function runImport(userId) {
   const fingerprintSetKey = `household:${householdId}:contentFingerprints`;
 
   const thirtyDaysAgo = Math.floor((Date.now() - 30 * 24 * 60 * 60 * 1000) / 1000);
-  const query = `after:${thirtyDaysAgo} subject:(tracking OR shipped OR "your order" OR "order confirmed" OR "order shipped" OR delivery OR arriving OR "out for delivery" OR "return confirmed" OR reservation OR flight OR hotel OR appointment OR instacart OR doordash)`;
+  const query = `after:${thirtyDaysAgo} subject:(tracking OR shipped OR "your order" OR "order confirmed" OR "order shipped" OR delivery OR arriving OR "out for delivery" OR "return confirmed" OR reservation OR flight OR hotel OR appointment OR instacart OR doordash OR charge OR payment OR transaction OR receipt OR billing OR "subscription renewed" OR "auto-renewal" OR "amount due" OR statement OR invoice)`;
 
   const searchResponse = await fetch(
     `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=5`,
@@ -256,6 +515,54 @@ export async function runImport(userId) {
 
       if (!emailText) {
         emailText = `Subject: ${subject}\nFrom: ${from}`;
+      }
+
+      // Financial branch — runs before the shipping/order classifier so
+      // an Amex receipt doesn't get misclassified as a "package". When
+      // the email matches FINANCIAL_DOMAINS or one of the financial
+      // subject keywords, we extract the transaction, store it (LTRIM
+      // 500), run anomaly detection against the last 90 days of
+      // history, and create signals + vault items as warranted. The
+      // standard shipping classifier is skipped for this message.
+      if (isFinancialEmail(from, subject)) {
+        await redis.sadd(importedSetKey, message.id); // dedup like normal
+        const tx = await extractTransaction(subject, from, emailText);
+        if (!tx) {
+          console.log(`[financial] no transaction extracted from "${subject.slice(0, 60)}"`);
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        }
+        const txKey = `household:${householdId}:transactions`;
+        const recentTxRaw = await redis.lrange(txKey, 0, 199);
+        const history = [];
+        for (const r of recentTxRaw) {
+          try { history.push(JSON.parse(r)); } catch { /* skip malformed */ }
+        }
+        const stored = { ...tx, storedAt: Date.now(), messageId: message.id };
+        await redis.lpush(txKey, JSON.stringify(stored));
+        await redis.ltrim(txKey, 0, 499);
+
+        const anomalies = detectAnomalies(tx, history);
+
+        // Vault sync first so the new_subscription auto-create races
+        // against the same merchant being added by the email-sweep
+        // pass — whichever runs first wins, the other sees the match
+        // and skips.
+        await syncVaultFromTransaction(householdId, tx, anomalies);
+
+        // For each notable anomaly, push a "financial" signal so it
+        // surfaces in the brief alongside other near-window items.
+        for (const a of anomalies) {
+          const signal = buildFinancialSignal(a, tx);
+          await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
+          console.log(
+            `[financial] signal ${signal.id} ${a.kind}: ${signal.description}`
+          );
+        }
+
+        imported++;
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
       }
 
       console.log("Parsing:", subject);

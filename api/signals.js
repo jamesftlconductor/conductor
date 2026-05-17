@@ -1019,6 +1019,32 @@ export default async function handler(req, res) {
       return handleHealthRead(req, res);
     }
 
+    // Transactions — read-only view of household:{id}:transactions
+    // (written by api/import.js's financial branch). Most-recent first;
+    // limit defaults to 50, max 500 (matches the LTRIM cap).
+    if (queryType === "transactions") {
+      if (req.method !== "GET") {
+        res.setHeader("Allow", "GET");
+        return res.status(405).json({ error: "Method not allowed for transactions" });
+      }
+      const householdId = await resolveHouseholdId(req.query?.userId);
+      const requestedLimit = parseInt(req.query?.limit, 10);
+      const limit = Number.isFinite(requestedLimit) && requestedLimit > 0
+        ? Math.min(requestedLimit, 500) : 50;
+      const raw = await redis.lrange(`household:${householdId}:transactions`, 0, limit - 1);
+      const transactions = [];
+      for (const r of raw) {
+        try { transactions.push(JSON.parse(r)); } catch { /* skip malformed */ }
+      }
+      // Sort by date descending; storedAt fallback when date missing.
+      transactions.sort((a, b) => {
+        const da = a.date ? Date.parse(a.date) : (a.storedAt || 0);
+        const db = b.date ? Date.parse(b.date) : (b.storedAt || 0);
+        return (db || 0) - (da || 0);
+      });
+      return res.status(200).json({ household: householdId, transactions });
+    }
+
     // Camouflage — per-household filter rules. GET lists rules, POST
     // adds + scrubs matching active signals, DELETE removes a rule.
     if (queryType === "camouflage" || bodyType === "camouflage") {
