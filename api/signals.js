@@ -1333,6 +1333,28 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, household: householdId, ...record });
     }
 
+    // Conductor question ack — fire-and-forget telemetry. Records
+    // which question got which response so future versions can tune
+    // generation. Dismissed/acknowledged tracking lives client-side
+    // in AsyncStorage (per spec) so this endpoint is best-effort.
+    if (queryType === "conductorQuestion" || bodyType === "conductorQuestion") {
+      if (req.method !== "POST") {
+        res.setHeader("Allow", "POST");
+        return res.status(405).json({ error: "Method not allowed for conductorQuestion" });
+      }
+      const { userId: bodyUserId, question, response } = req.body || {};
+      const householdId = await resolveHouseholdId(bodyUserId);
+      if (!householdId) return res.status(400).json({ error: "userId required" });
+      const record = {
+        question: typeof question === "string" ? question : null,
+        response: response === "dismissed" ? "dismissed" : "acknowledged",
+        at: new Date().toISOString(),
+      };
+      await redis.lpush(`household:${householdId}:conductorQuestionLog`, JSON.stringify(record));
+      await redis.ltrim(`household:${householdId}:conductorQuestionLog`, 0, 99);
+      return res.status(200).json({ ok: true, household: householdId, ...record });
+    }
+
     // Auto-resolutions — surfaces what Conductor handled without
     // user action over the last 48h (default). Reads the memory log
     // for resolved/expired entries within the window. Source
