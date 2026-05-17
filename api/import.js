@@ -1,5 +1,10 @@
 import { Redis } from "@upstash/redis";
 import { getValidToken } from "./refresh.js";
+import {
+  extractTrackingNumbers,
+  parseAmazonDeliveryEmail,
+  trackPackage,
+} from "./carrier.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -121,6 +126,45 @@ function pickThreadSummary(signals, primaryKeyword) {
   }
   const sender = signals.map((s) => s.sender).filter(Boolean)[0];
   return sender ? `${sender} batch` : "Related signals";
+}
+
+// Locate a signal by id in the household's :signals list and write
+// the carrier-tracking result onto it. Used both by the just-imported
+// path and by the hourly track cron. Returns the freshly-updated
+// signal record, or null if no change applied.
+export async function applyTrackingUpdate(householdId, signal) {
+  if (!signal || !signal.trackingNumber) return null;
+  let tracking;
+  try {
+    tracking = await trackPackage(signal.trackingNumber);
+  } catch (err) {
+    console.warn(`[tracking] ${signal.trackingNumber} fetch failed:`, err?.message || err);
+    return null;
+  }
+  if (!tracking) return null;
+  const key = `household:${householdId}:signals`;
+  const raw = await redis.lrange(key, 0, -1);
+  for (let i = 0; i < raw.length; i++) {
+    const parsed = (() => { try { return typeof raw[i] === "string" ? JSON.parse(raw[i]) : raw[i]; } catch { return null; } })();
+    if (!parsed || parsed.id !== signal.id) continue;
+    const previousStatus = parsed.status || null;
+    parsed.carrier = tracking.carrier;
+    parsed.status = tracking.status;
+    if (tracking.eta) parsed.eta = tracking.eta;
+    parsed.trackingLocation = tracking.location || null;
+    parsed.trackingLastUpdate = tracking.lastUpdate || null;
+    parsed.trackingUpdatedAt = new Date().toISOString();
+    if (tracking.status === "Delivered" && parsed.state !== "resolved") {
+      parsed.state = "resolved";
+      parsed.resolvedAt = new Date().toISOString();
+    }
+    await redis.lset(key, i, JSON.stringify(parsed));
+    console.log(
+      `[tracking] ${signal.trackingNumber} (${tracking.carrier}): ${previousStatus || "?"} → ${tracking.status}`
+    );
+    return { signal: parsed, previousStatus, tracking };
+  }
+  return null;
 }
 
 async function detectAndStampThread(householdId, newSignal) {
@@ -1124,6 +1168,35 @@ ${emailText.substring(0, 1000)}`,
         console.error("[thread] detection error:", err?.message || err);
       }
 
+      // Tracking extraction — package-typed signals get scanned for
+      // carrier tracking numbers. The first hit stamps onto the
+      // signal so the cron and the mobile UI can surface live status.
+      // AMZL packages get their initial status from the email body
+      // since Amazon has no public tracking API.
+      if (signal.type === "package" && !signal.trackingNumber) {
+        try {
+          const hits = extractTrackingNumbers(`${subject || ""}\n${emailText || ""}`);
+          if (hits.length > 0) {
+            const { trackingNumber, carrier } = hits[0];
+            signal.trackingNumber = trackingNumber;
+            signal.carrier = carrier;
+            if (carrier === "AMZL") {
+              const amzl = parseAmazonDeliveryEmail(emailText || "");
+              if (amzl) {
+                signal.status = amzl.status;
+                if (amzl.note) signal.statusNote = amzl.note;
+                if (amzl.status === "Delivered") {
+                  signal.state = "resolved";
+                  signal.resolvedAt = new Date().toISOString();
+                }
+              }
+            }
+          }
+        } catch (err) {
+          console.error("[tracking] extraction error:", err?.message || err);
+        }
+      }
+
       await redis.lpush(signalsKey, JSON.stringify(signal));
       await redis.sadd(fingerprintSetKey, fp);
       imported++;
@@ -1142,6 +1215,18 @@ ${emailText.substring(0, 1000)}`,
         } catch (err) {
           console.error("[provider] extraction error:", err?.message || err);
         }
+      }
+
+      // Initial carrier hit for non-AMZL trackables. Best-effort, no
+      // await on the signal itself — the cron will pick it up on the
+      // next run if this call doesn't return anything useful right
+      // now. Skipped for AMZL since there's no API, and skipped when
+      // the trackPackage helper returns null (missing creds or
+      // unknown carrier).
+      if (signal.trackingNumber && signal.carrier && signal.carrier !== "AMZL") {
+        applyTrackingUpdate(householdId, signal).catch((err) =>
+          console.error("[tracking] initial fetch error:", err?.message || err)
+        );
       }
 
       await new Promise(r => setTimeout(r, 1000));

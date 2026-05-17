@@ -91,8 +91,32 @@ export default async function handler(req, res) {
   const type = req.query?.type || req.body?.type;
   const householdIdInput = req.query?.householdId || req.body?.householdId;
 
+  // Tracking notifications skip the brief-fetch path entirely —
+  // caller supplies the exact title/body to push to every member of
+  // a single household. Used by the /api/track cron when a package
+  // or flight status transition is worth surfacing.
+  if (type === "tracking") {
+    const title = req.body?.title;
+    const body = req.body?.body;
+    if (!householdIdInput || !title || !body) {
+      return res.status(400).json({ error: "tracking notify requires householdId, title, body" });
+    }
+    const all = await listHouseholds();
+    const members = all.get(householdIdInput) || [];
+    let sent = 0;
+    const results = [];
+    for (const userId of members) {
+      const token = await redis.get(`user:${userId}:expoPushToken`);
+      if (!(typeof token === "string" && token.length)) continue;
+      const r = await sendExpoPush(token, title, body);
+      results.push({ userId, ok: r.ok });
+      if (r.ok) sent++;
+    }
+    return res.status(200).json({ ok: true, type: "tracking", sent, results });
+  }
+
   if (type !== "takeoff" && type !== "clearance" && type !== "midday") {
-    return res.status(400).json({ error: "type must be 'takeoff', 'midday', or 'clearance'" });
+    return res.status(400).json({ error: "type must be 'takeoff', 'midday', 'clearance', or 'tracking'" });
   }
 
   const title =
