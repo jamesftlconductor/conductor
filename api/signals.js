@@ -1129,6 +1129,127 @@ export default async function handler(req, res) {
       return res.status(200).json({ household: householdId, transactions });
     }
 
+    // Providers — service-provider directory at
+    // household:{id}:providers (Redis hash keyed by normalized name).
+    // GET lists all providers; POST manually adds one. Auto-population
+    // happens in api/import.js for service-classified emails.
+    if (queryType === "providers" || bodyType === "providers") {
+      const householdId = await resolveHouseholdId(req.query?.userId || req.body?.userId);
+      const hashKey = `household:${householdId}:providers`;
+
+      if (req.method === "GET") {
+        const raw = await redis.hgetall(hashKey);
+        const providers = [];
+        if (raw && typeof raw === "object") {
+          for (const [key, value] of Object.entries(raw)) {
+            const parsed = safeJson(value);
+            if (parsed) providers.push({ ...parsed, _key: key });
+          }
+        }
+        return res.status(200).json({ household: householdId, providers });
+      }
+
+      if (req.method === "POST") {
+        const { userId, name, serviceType, phone, email, website, notes, estimateAmount } = req.body || {};
+        if (!userId) return res.status(400).json({ error: "userId required" });
+        if (!name || typeof name !== "string" || name.trim().length === 0) {
+          return res.status(400).json({ error: "name required" });
+        }
+        // Same normalization the import path uses — lowercase, strip
+        // entity suffixes, collapse whitespace, drop punctuation.
+        const normKey = name
+          .toLowerCase()
+          .replace(/[.,]/g, " ")
+          .replace(/\b(llc|inc|incorporated|co|corp|corporation|ltd|pllc|pa|pc|plc)\b/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!normKey) return res.status(400).json({ error: "invalid name" });
+
+        const now = new Date().toISOString();
+        const existingRaw = await redis.hget(hashKey, normKey);
+        const existing = safeJson(existingRaw);
+        const merged = {
+          ...(existing || {}),
+          name: name.trim(),
+          serviceType: serviceType || existing?.serviceType || "other",
+          phone: phone || existing?.phone || null,
+          email: email || existing?.email || null,
+          website: website || existing?.website || null,
+          notes: notes !== undefined ? (notes || null) : (existing?.notes || null),
+          estimateAmount: estimateAmount ?? existing?.estimateAmount ?? null,
+          firstSeen: existing?.firstSeen || now,
+          lastSeen: now,
+          source: existing?.source || "manual",
+        };
+        await redis.hset(hashKey, { [normKey]: JSON.stringify(merged) });
+        return res.status(200).json({ household: householdId, provider: { ...merged, _key: normKey } });
+      }
+
+      if (req.method === "DELETE") {
+        const key = req.query?.key || req.body?.key;
+        if (!key) return res.status(400).json({ error: "key required" });
+        await redis.hdel(hashKey, String(key));
+        return res.status(200).json({ removed: true });
+      }
+
+      res.setHeader("Allow", "GET, POST, DELETE");
+      return res.status(405).json({ error: "Method not allowed for providers" });
+    }
+
+    // Inventory — single JSON object at household:{id}:inventory.
+    // GET returns the stored object (or an empty default shape on
+    // first read); POST shallow-merges updates. Mobile inline-edit
+    // commits flow through here.
+    if (queryType === "inventory" || bodyType === "inventory") {
+      const householdId = await resolveHouseholdId(req.query?.userId || req.body?.userId);
+      const inventoryKey = `household:${householdId}:inventory`;
+      const DEFAULT_INVENTORY = {
+        roof: { material: null, yearInstalled: null, lastInspected: null },
+        hvac: { brand: null, yearInstalled: null, lastServiced: null, filterSize: null },
+        waterHeater: { yearInstalled: null, type: null },
+        electrical: { panelAmps: null, yearUpdated: null },
+        vehicles: [],
+        appliances: [],
+        homeBuiltYear: null,
+        squareFootage: null,
+        notes: null,
+      };
+
+      if (req.method === "GET") {
+        const raw = await redis.get(inventoryKey);
+        const inventory = safeJson(raw) || DEFAULT_INVENTORY;
+        // Merge defaults so newly-added fields appear in old documents.
+        const merged = { ...DEFAULT_INVENTORY, ...inventory };
+        return res.status(200).json({ household: householdId, inventory: merged });
+      }
+
+      if (req.method === "POST") {
+        const { userId, updates } = req.body || {};
+        if (!userId) return res.status(400).json({ error: "userId required" });
+        if (!updates || typeof updates !== "object") {
+          return res.status(400).json({ error: "updates object required" });
+        }
+        const raw = await redis.get(inventoryKey);
+        const existing = safeJson(raw) || DEFAULT_INVENTORY;
+        // Shallow-merge top-level keys. Sub-objects (roof, hvac,
+        // waterHeater, electrical) get nested merges so a partial
+        // patch doesn't nuke unrelated sub-fields.
+        const merged = { ...existing };
+        for (const [k, v] of Object.entries(updates)) {
+          if (v === null || typeof v !== "object" || Array.isArray(v)) {
+            merged[k] = v;
+          } else {
+            merged[k] = { ...(existing[k] || {}), ...v };
+          }
+        }
+        await redis.set(inventoryKey, JSON.stringify(merged));
+        return res.status(200).json({ household: householdId, inventory: merged });
+      }
+
+      res.setHeader("Allow", "GET, POST");
+      return res.status(405).json({ error: "Method not allowed for inventory" });
+    }
+
     // Location — per-household city/state/lat/lon/marketRegion. GET
     // returns the stored location, auto-detecting from the caller's
     // IP on first read. POST manually sets the location (Settings →

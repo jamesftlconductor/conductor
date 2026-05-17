@@ -41,6 +41,110 @@ function senderLocalPart(from) {
   return match[1].toLowerCase().split("@")[0];
 }
 
+// ---------- provider extraction ----------
+
+// Normalize a provider name into a stable Redis hash key. Lowercase,
+// strip common business-entity suffixes (LLC / Inc / Co / Corp / Ltd /
+// PLLC), collapse internal whitespace, drop punctuation. So "ABC Plumbing,
+// LLC", "abc plumbing", and "ABC Plumbing Inc." all dedupe to "abc plumbing".
+function normalizeProviderName(name) {
+  if (!name || typeof name !== "string") return "";
+  return name
+    .toLowerCase()
+    .replace(/[.,]/g, " ")
+    .replace(/\b(llc|inc|incorporated|co|corp|corporation|ltd|pllc|pa|pc|plc)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// Heuristic for "is this email from a service company?" — fires when the
+// classified type is "service" OR the from-address local part contains
+// service-y stems. Avoids running an extra Claude call on every email.
+function isLikelyServiceEmail(signal, from) {
+  if (signal?.type === "service") return true;
+  const local = (senderLocalPart(from) || "").toLowerCase();
+  const SERVICE_STEMS = [
+    "service", "support", "appointment", "scheduling", "tech",
+    "dispatch", "repair", "install",
+  ];
+  return SERVICE_STEMS.some((stem) => local.includes(stem));
+}
+
+async function extractProvider(subject, from, emailText) {
+  const prompt = `Extract the service-provider business from this email. Return JSON or the literal word null. JSON schema:
+{
+  "name": "business name (omit LLC/Inc suffix)",
+  "serviceType": "hvac" | "plumbing" | "electrical" | "roofing" | "painting" | "pool" | "lawn" | "pest" | "cleaning" | "appliance" | "handyman" | "other",
+  "phone": "string or null",
+  "email": "contact email or null",
+  "website": "url or null",
+  "lastServiceDate": "YYYY-MM-DD or null",
+  "estimateAmount": number | null
+}
+Return null if the email is from a generic marketplace (Yelp, Angi, Thumbtack) without a specific provider, or if there's no real business to record.
+
+Subject: ${subject}
+From: ${from}
+
+Email body:
+${emailText.substring(0, 1500)}`;
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 300,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim() || "";
+    const stripped = text.replace(/```json|```/g, "").trim();
+    if (/^null$/i.test(stripped)) return null;
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    const provider = JSON.parse(match[0]);
+    if (!provider?.name || typeof provider.name !== "string") return null;
+    return provider;
+  } catch (err) {
+    console.error("[provider] extract failed:", err?.message || err);
+    return null;
+  }
+}
+
+// Upsert a provider record into household:{id}:providers hash. Keyed
+// by normalized name so multiple emails from the same business dedupe.
+// Preserves firstSeen on update; bumps lastSeen and merges any fresh
+// fields the new email surfaced (e.g., a new phone or estimate).
+async function upsertProvider(householdId, provider) {
+  const key = normalizeProviderName(provider.name);
+  if (!key) return;
+  const hashKey = `household:${householdId}:providers`;
+  const existingRaw = await redis.hget(hashKey, key);
+  let existing = null;
+  if (existingRaw) {
+    try { existing = typeof existingRaw === "string" ? JSON.parse(existingRaw) : existingRaw; } catch { existing = null; }
+  }
+  const now = new Date().toISOString();
+  const merged = {
+    ...(existing || {}),
+    ...provider,
+    name: provider.name || existing?.name,
+    firstSeen: existing?.firstSeen || now,
+    lastSeen: now,
+  };
+  await redis.hset(hashKey, { [key]: JSON.stringify(merged) });
+  console.log(
+    `[provider] upserted ${householdId}/${key}: ${merged.name} (${merged.serviceType || "other"})`
+  );
+}
+
 // ---------- financial transaction detection ----------
 
 // Financial-institution sender domains and subject keywords. Either signal
@@ -751,6 +855,22 @@ ${emailText.substring(0, 1000)}`,
       await redis.lpush(signalsKey, JSON.stringify(signal));
       await redis.sadd(fingerprintSetKey, fp);
       imported++;
+
+      // Provider extraction — runs only when the signal looks like a
+      // service-company touchpoint (classified type "service" or sender
+      // local part contains service-y stems). One additional Haiku call
+      // per qualifying email; null/skip when the email is from a generic
+      // marketplace without a specific business.
+      if (isLikelyServiceEmail(signal, from)) {
+        try {
+          const provider = await extractProvider(subject, from, emailText);
+          if (provider) {
+            await upsertProvider(householdId, provider);
+          }
+        } catch (err) {
+          console.error("[provider] extraction error:", err?.message || err);
+        }
+      }
 
       await new Promise(r => setTimeout(r, 1000));
 
