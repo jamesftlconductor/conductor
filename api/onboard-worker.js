@@ -155,51 +155,98 @@ async function maybeFinalize(householdId) {
 // phrases like "Found your home insurance" or "5 service providers".
 // Stored at household:{id}:onboardReveal with 48h TTL so the mobile
 // app has a window to fetch and animate it before it ages out.
-async function buildOnboardReveal(householdId) {
+export async function buildOnboardReveal(householdId) {
   const [
     rawSignals,
     rawVault,
     rawCrew,
     rawCalendar,
-    rawProviders,
+    rawProvidersHash,
     rawHorizon,
+    memberIds,
   ] = await Promise.all([
     redis.lrange(`household:${householdId}:signals`, 0, -1).catch(() => []),
     redis.lrange(`household:${householdId}:vault`, 0, -1).catch(() => []),
     redis.get(`household:${householdId}:crew`).catch(() => null),
     redis.get(`household:${householdId}:calendar`).catch(() => null),
-    redis.lrange(`household:${householdId}:providers`, 0, -1).catch(() => []),
+    // Providers are stored as a Redis hash keyed by normalized
+    // provider name (see import.js upsertProvider). HGETALL returns
+    // an object map; values may be JSON strings or already-parsed
+    // objects depending on the Upstash client behavior.
+    redis.hgetall(`household:${householdId}:providers`).catch(() => null),
     redis.get(`household:${householdId}:horizon`).catch(() => null),
+    redis.smembers(`household:${householdId}:members`).catch(() => []),
   ]);
+
+  // Household member profiles — birthdays/anniversaries for the
+  // adults living in the home are stored on user:{uid}:profile, not
+  // on the crew layer. Pulled in parallel since we already know the
+  // member ids.
+  const memberProfiles = await Promise.all(
+    (memberIds || []).map(async (uid) => {
+      try {
+        const raw = await redis.get(`user:${uid}:profile`);
+        const p = safeJson(raw) || {};
+        return { userId: uid, name: p.name || uid, ...p };
+      } catch {
+        return null;
+      }
+    })
+  );
 
   const signals = (rawSignals || []).map(safeJson).filter(Boolean);
   const vault = (rawVault || []).map(safeJson).filter(Boolean);
-  const crewData = safeJson(rawCrew) || {};
-  const crew = [...(crewData.children || []), ...(crewData.pets || [])];
+  // Crew layer is a flat JSON array of {memberType, name, age,
+  // birthday?, anniversary?, upcomingEvents?, ...}. Earlier code
+  // assumed a {children:[], pets:[]} shape — wrong.
+  const crewParsed = safeJson(rawCrew);
+  const crew = Array.isArray(crewParsed) ? crewParsed : [];
+  const children = crew.filter((m) => m && m.memberType === "child");
+  const pets = crew.filter((m) => m && m.memberType === "pet");
   const calendar = (() => {
     const c = safeJson(rawCalendar);
     if (Array.isArray(c)) return c;
     if (c && Array.isArray(c.events)) return c.events;
     return [];
   })();
-  const providers = (rawProviders || []).map(safeJson).filter(Boolean);
+  // Hash → array of provider records.
+  const providers = [];
+  if (rawProvidersHash && typeof rawProvidersHash === "object") {
+    for (const v of Object.values(rawProvidersHash)) {
+      const p = safeJson(v);
+      if (p) providers.push(p);
+    }
+  }
   const horizon = safeJson(rawHorizon);
 
   const now = Date.now();
-  const SEVEN_DAYS = 7 * DAY_MS;
   const FOURTEEN_DAYS = 14 * DAY_MS;
+  const THIRTY_DAYS = 30 * DAY_MS;
 
   const active = signals.filter(
     (s) => !s.state || s.state === "incoming" || s.state === "active"
   );
 
-  // Top three signals by ETA proximity (sooner = more urgent), filtered
-  // to those within 14 days. Ignores no-ETA items — the reveal wants
-  // concrete time-bound things.
+  // ETA parsing: signals may carry "YYYY-MM-DD", "YYYY-MM-DD to
+  // YYYY-MM-DD" ranges, or "unknown". For the reveal we want the
+  // earliest concrete date — parse the leading 10 chars when the
+  // string starts with a date.
+  function parseSignalEta(eta) {
+    if (!eta || typeof eta !== "string") return NaN;
+    const head = eta.slice(0, 10);
+    const ms = Date.parse(head);
+    return isNaN(ms) ? NaN : ms;
+  }
+
+  // Window: 30 days for the reveal. This is a recognition moment
+  // ("here's what I found"), not an urgency view — a dinner 20 days
+  // out is exactly the kind of thing worth surfacing.
   const upcoming = active
-    .filter((s) => s.eta && !isNaN(Date.parse(s.eta)))
-    .filter((s) => Date.parse(s.eta) - now < FOURTEEN_DAYS && Date.parse(s.eta) > now - DAY_MS)
-    .sort((a, b) => Date.parse(a.eta) - Date.parse(b.eta));
+    .map((s) => ({ s, ms: parseSignalEta(s.eta) }))
+    .filter(({ ms }) => !isNaN(ms))
+    .filter(({ ms }) => ms - now < THIRTY_DAYS && ms > now - DAY_MS)
+    .sort((a, b) => a.ms - b.ms)
+    .map(({ s }) => s);
 
   const upcomingDeadlines = upcoming.slice(0, 3).map((s) => ({
     description: s.description,
@@ -211,29 +258,46 @@ async function buildOnboardReveal(householdId) {
     ? { description: upcoming[0].description, eta: upcoming[0].eta }
     : null;
 
-  // Birthdays from crew layer — anniversary entries within 14 days
-  // are also surfaced. The crew schema stores DOB on children/pets and
-  // anniversaries are optional on either.
+  // Birthdays come from three places:
+  //   1. crew[i].birthday / .anniversary (MM-DD format)
+  //   2. crew[i].upcomingEvents[] (rare — events with "birthday" word)
+  //   3. household member profiles (user:{uid}:profile.birthday)
+  // Each candidate produces a next-occurrence ms, filtered to 30 days.
   const birthdays = [];
-  for (const member of crew) {
-    const candidates = [
-      { kind: "birthday", date: member.dob || member.birthday, name: member.name },
-      { kind: "anniversary", date: member.anniversary, name: member.name },
-    ];
-    for (const c of candidates) {
-      if (!c.date || !c.name) continue;
-      // dob is typically YYYY-MM-DD; compute next occurrence.
-      const m = String(c.date).match(/(\d{4})-(\d{2})-(\d{2})/);
-      if (!m) continue;
-      const month = parseInt(m[2], 10) - 1;
-      const day = parseInt(m[3], 10);
-      const year = new Date().getFullYear();
-      let nextMs = new Date(year, month, day).getTime();
-      if (nextMs < now - DAY_MS) nextMs = new Date(year + 1, month, day).getTime();
-      if (nextMs - now < FOURTEEN_DAYS) {
-        birthdays.push({ name: c.name, kind: c.kind, when: new Date(nextMs).toISOString() });
-      }
+
+  function pushIfWithinWindow(name, kind, dateStr) {
+    if (!name || !dateStr) return;
+    // Accept "MM-DD" (crew) or "YYYY-MM-DD" (legacy).
+    let month, day;
+    const mmdd = String(dateStr).match(/^(\d{2})-(\d{2})$/);
+    const ymd = String(dateStr).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (mmdd) {
+      month = parseInt(mmdd[1], 10) - 1;
+      day = parseInt(mmdd[2], 10);
+    } else if (ymd) {
+      month = parseInt(ymd[2], 10) - 1;
+      day = parseInt(ymd[3], 10);
+    } else {
+      return;
     }
+    const year = new Date().getFullYear();
+    let nextMs = new Date(year, month, day).getTime();
+    if (nextMs < now - DAY_MS) nextMs = new Date(year + 1, month, day).getTime();
+    if (nextMs - now < THIRTY_DAYS) {
+      birthdays.push({ name, kind, when: new Date(nextMs).toISOString() });
+    }
+  }
+
+  for (const member of crew) {
+    if (!member || !member.name) continue;
+    pushIfWithinWindow(member.name, "birthday", member.birthday || member.dob);
+    pushIfWithinWindow(member.name, "anniversary", member.anniversary);
+  }
+  for (const profile of memberProfiles) {
+    if (!profile || !profile.name) continue;
+    const firstName = String(profile.name).split(/\s+/)[0];
+    pushIfWithinWindow(firstName, "birthday", profile.birthday);
+    pushIfWithinWindow(firstName, "anniversary", profile.anniversary);
   }
   birthdays.sort((a, b) => Date.parse(a.when) - Date.parse(b.when));
 
@@ -243,15 +307,17 @@ async function buildOnboardReveal(householdId) {
   const highlights = [];
   const vaultCategories = new Set();
   for (const v of vault) {
-    if (v.category) vaultCategories.add(v.category);
-    if (v.type) vaultCategories.add(v.type);
+    if (v.category) vaultCategories.add(String(v.category).toLowerCase());
+    if (v.type) vaultCategories.add(String(v.type).toLowerCase());
   }
-  if (vaultCategories.has("insurance") || vaultCategories.has("home_insurance")) {
-    highlights.push("Found your home insurance policy");
-  }
-  if (vaultCategories.has("auto_insurance")) {
-    highlights.push("Found your auto insurance");
-  }
+  const hasHomeInsurance = [...vaultCategories].some((c) =>
+    /^home[_-]?insurance|^insurance$/.test(c)
+  );
+  const hasAutoInsurance = [...vaultCategories].some((c) =>
+    /auto[_-]?insurance|car[_-]?insurance/.test(c)
+  );
+  if (hasHomeInsurance) highlights.push("Found your home insurance policy");
+  if (hasAutoInsurance) highlights.push("Found your auto insurance");
   if (vault.length >= 3) {
     highlights.push(`${vault.length} vault items pulled together`);
   }
@@ -260,8 +326,8 @@ async function buildOnboardReveal(householdId) {
       `${providers.length} service provider${providers.length === 1 ? "" : "s"} recognised`
     );
   }
-  if (crewData.children && crewData.children.length > 0) {
-    const names = crewData.children.map((c) => c.name).filter(Boolean);
+  if (children.length > 0) {
+    const names = children.map((c) => c.name).filter(Boolean);
     if (names.length > 0) {
       highlights.push(
         names.length === 1
@@ -270,8 +336,8 @@ async function buildOnboardReveal(householdId) {
       );
     }
   }
-  if (crewData.pets && crewData.pets.length > 0) {
-    const names = crewData.pets.map((p) => p.name).filter(Boolean);
+  if (pets.length > 0) {
+    const names = pets.map((p) => p.name).filter(Boolean);
     if (names.length > 0) {
       highlights.push(
         names.length === 1

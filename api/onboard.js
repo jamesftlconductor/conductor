@@ -1,5 +1,6 @@
 import { Redis } from "@upstash/redis";
 import { Client } from "@upstash/qstash";
+import { buildOnboardReveal } from "./onboard-worker.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -91,8 +92,24 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { userId } = req.body || {};
+  const { userId, action } = req.body || {};
   if (!userId) return res.status(400).json({ error: "Missing userId" });
+
+  // Recompile the reveal payload from the current data state without
+  // re-running the onboard jobs. Used to refresh the reveal after a
+  // reader-shape fix lands.
+  if (action === "compileReveal") {
+    const householdId = await resolveHouseholdId(userId);
+    try {
+      const reveal = await buildOnboardReveal(householdId);
+      const TTL = 48 * 60 * 60;
+      await redis.set(`household:${householdId}:onboardReveal`, JSON.stringify(reveal), { ex: TTL });
+      return res.status(200).json({ ok: true, householdId, reveal });
+    } catch (err) {
+      console.error("compileReveal failed:", err);
+      return res.status(500).json({ error: err?.message || String(err) });
+    }
+  }
 
   try {
     const householdId = await resolveHouseholdId(userId);
