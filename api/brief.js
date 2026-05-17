@@ -657,6 +657,14 @@ async function buildHouseholdNameMap(redis, householdId, requestingUserId) {
 // HOUSEHOLD so Claude can choose neutral framing. Single-member
 // households collapse every tag to YOURS since there is no one else.
 function ownershipTag(item, requestingUserId, nameMap, isSingleMember = false) {
+  // Crew attribution wins over userId — a signal explicitly tagged
+  // to "Mia" should read as "[MIA'S]" regardless of which household
+  // member's inbox brought it in. Single-member mode still
+  // suppresses external-name framing in favor of "you".
+  if (item && item.crewMemberId && !isSingleMember) {
+    const crewName = String(item.crewMemberId).trim();
+    if (crewName.length > 0) return `${crewName.toUpperCase()}'S`;
+  }
   if (isSingleMember) return "YOURS";
   if (!item || !item.userId) return "HOUSEHOLD";
   if (item.userId === requestingUserId) return "YOURS";

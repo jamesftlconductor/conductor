@@ -431,7 +431,49 @@ async function handleCrew(req, res) {
     return res.status(200).json({ ok: true, householdId, member: crew[updatedIndex] });
   }
 
-  res.setHeader("Allow", "GET, POST");
+  // PATCH — generic field updates for a named crew member. Used by
+  // the mobile bio editor (notes, prescriptions, doctors, signalTypes,
+  // photoUrl, etc.). Distinct from the POST path which only edits
+  // birthday/anniversary. memberName is matched case-insensitive,
+  // memberType is optional (helps disambiguate when names collide
+  // across child/pet).
+  if (req.method === "PATCH") {
+    const { userId, memberName, memberType, updates } = req.body || {};
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    if (!memberName) return res.status(400).json({ error: "memberName required" });
+    if (!updates || typeof updates !== "object") {
+      return res.status(400).json({ error: "updates object required" });
+    }
+    const householdId = await resolveHouseholdId(userId);
+    const crewKey = `household:${householdId}:crew`;
+    const rawCrew = await redis.get(crewKey);
+    const crew = Array.isArray(safeJson(rawCrew)) ? safeJson(rawCrew) : [];
+    let idx = -1;
+    for (let i = 0; i < crew.length; i++) {
+      const m = crew[i];
+      if (!m || !m.name) continue;
+      const nameMatch = m.name.toLowerCase().trim() === memberName.toLowerCase().trim();
+      const typeMatch = !memberType || m.memberType === memberType;
+      if (nameMatch && typeMatch) { idx = i; break; }
+    }
+    if (idx === -1) return res.status(404).json({ error: "Crew member not found" });
+    // Whitelisted updateable fields — avoid letting the client clobber
+    // memberType/name/birthday by accident.
+    const ALLOWED = [
+      "photoUrl", "notes", "prescriptions", "doctors",
+      "signalTypes", "senderPatterns", "lastGrooming",
+      "school", "activities", "upcomingEvents",
+    ];
+    for (const k of ALLOWED) {
+      if (Object.prototype.hasOwnProperty.call(updates, k)) {
+        crew[idx][k] = updates[k];
+      }
+    }
+    await redis.set(crewKey, JSON.stringify(crew));
+    return res.status(200).json({ ok: true, household: householdId, member: crew[idx] });
+  }
+
+  res.setHeader("Allow", "GET, POST, PATCH");
   return res.status(405).json({ error: "Method not allowed for crew" });
 }
 
@@ -1343,6 +1385,138 @@ export default async function handler(req, res) {
         [String(signalId)]: JSON.stringify(record),
       });
       return res.status(200).json({ ok: true, household: householdId, ...record });
+    }
+
+    // Crew photo upload — accepts a base64-encoded image, persists
+    // it to Vercel Blob, and patches the crew member record with
+    // the resulting public URL. Blob storage must be provisioned on
+    // the Vercel project (BLOB_READ_WRITE_TOKEN is auto-injected
+    // when Blob is attached). Returns { photoUrl } on success.
+    if (queryType === "crew-photo" || bodyType === "crew-photo") {
+      if (req.method !== "POST") {
+        res.setHeader("Allow", "POST");
+        return res.status(405).json({ error: "Method not allowed for crew-photo" });
+      }
+      const { userId, crewMemberName, memberType, photo } = req.body || {};
+      if (!userId) return res.status(400).json({ error: "userId required" });
+      if (!crewMemberName) return res.status(400).json({ error: "crewMemberName required" });
+      if (!photo || typeof photo !== "string") {
+        return res.status(400).json({ error: "photo (base64 string) required" });
+      }
+      let blobMod;
+      try {
+        blobMod = await import("@vercel/blob");
+      } catch (err) {
+        return res.status(500).json({ error: "Blob storage unavailable", message: err?.message });
+      }
+      const householdId = await resolveHouseholdId(userId);
+      // Strip data URL prefix if present (data:image/jpeg;base64,...).
+      const b64 = photo.replace(/^data:image\/[a-z]+;base64,/i, "");
+      let buffer;
+      try {
+        buffer = Buffer.from(b64, "base64");
+      } catch {
+        return res.status(400).json({ error: "Invalid base64 payload" });
+      }
+      const normalizedName = String(crewMemberName)
+        .toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      const blobKey = `crew/${householdId}/${normalizedName}-${Date.now()}.jpg`;
+      let putResult;
+      try {
+        putResult = await blobMod.put(blobKey, buffer, {
+          access: "public",
+          contentType: "image/jpeg",
+        });
+      } catch (err) {
+        console.error("[crew-photo] blob put failed:", err);
+        return res.status(500).json({ error: "Photo upload failed", message: err?.message });
+      }
+      const photoUrl = putResult?.url || null;
+      if (!photoUrl) return res.status(500).json({ error: "Blob returned no URL" });
+
+      // Patch the crew member record in place. Skip silently if no
+      // matching member exists yet — the photo is still uploaded and
+      // the caller can attach it on next sync.
+      try {
+        const crewKey = `household:${householdId}:crew`;
+        const rawCrew = await redis.get(crewKey);
+        const crew = Array.isArray(safeJson(rawCrew)) ? safeJson(rawCrew) : [];
+        const idx = crew.findIndex(
+          (m) =>
+            m &&
+            m.name &&
+            m.name.toLowerCase().trim() === crewMemberName.toLowerCase().trim() &&
+            (!memberType || m.memberType === memberType)
+        );
+        if (idx >= 0) {
+          crew[idx].photoUrl = photoUrl;
+          await redis.set(crewKey, JSON.stringify(crew));
+        }
+      } catch (err) {
+        console.warn("[crew-photo] crew update failed:", err?.message);
+      }
+      return res.status(200).json({ ok: true, household: householdId, photoUrl });
+    }
+
+    // Crew attribution — record that a signal belongs to a specific
+    // crew member, AND add the sender to that crew member's
+    // senderPatterns so future imports auto-attribute. Two-way bind.
+    if (queryType === "crew-attribution" || bodyType === "crew-attribution") {
+      if (req.method !== "POST") {
+        res.setHeader("Allow", "POST");
+        return res.status(405).json({ error: "Method not allowed for crew-attribution" });
+      }
+      const { userId, signalId, crewMemberName } = req.body || {};
+      if (!userId) return res.status(400).json({ error: "userId required" });
+      if (signalId == null) return res.status(400).json({ error: "signalId required" });
+      const householdId = await resolveHouseholdId(userId);
+
+      // 1. Stamp crewMemberId on the signal. Search :signals list,
+      //    then :deadlines for vault-derived items.
+      const sigKey = `household:${householdId}:signals`;
+      const rawSigs = await redis.lrange(sigKey, 0, -1);
+      let updatedSignal = null;
+      let updatedSender = null;
+      for (let i = 0; i < rawSigs.length; i++) {
+        const s = safeJson(rawSigs[i]);
+        if (!s || (s.id !== signalId && String(s.id) !== String(signalId))) continue;
+        if (crewMemberName) {
+          s.crewMemberId = crewMemberName;
+        } else {
+          delete s.crewMemberId;
+        }
+        await redis.lset(sigKey, i, JSON.stringify(s));
+        updatedSignal = s;
+        updatedSender = s.sender || null;
+        break;
+      }
+      if (!updatedSignal) {
+        return res.status(404).json({ error: "signalId not found" });
+      }
+
+      // 2. Add the sender to the crew member's senderPatterns so
+      //    future imports auto-attribute. Best-effort — skip if the
+      //    crew member can't be found by name.
+      if (crewMemberName && updatedSender) {
+        try {
+          const crewKey = `household:${householdId}:crew`;
+          const rawCrew = await redis.get(crewKey);
+          const crew = Array.isArray(safeJson(rawCrew)) ? safeJson(rawCrew) : [];
+          const idx = crew.findIndex(
+            (m) => m && m.name && m.name.toLowerCase().trim() === crewMemberName.toLowerCase().trim()
+          );
+          if (idx >= 0) {
+            const cur = Array.isArray(crew[idx].senderPatterns) ? crew[idx].senderPatterns : [];
+            if (!cur.includes(updatedSender)) {
+              crew[idx].senderPatterns = [...cur, updatedSender];
+              await redis.set(crewKey, JSON.stringify(crew));
+            }
+          }
+        } catch (err) {
+          console.warn("[crew-attribution] senderPatterns update failed:", err?.message);
+        }
+      }
+      return res.status(200).json({ ok: true, household: householdId, signal: updatedSignal });
     }
 
     // Year in Review fetch — returns the persisted prose for the

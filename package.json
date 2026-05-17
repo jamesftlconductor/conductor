@@ -12,6 +12,7 @@
   "dependencies": {
     "@upstash/qstash": "^2.10.1",
     "@upstash/redis": "^1.37.0",
+    "@vercel/blob": "^2.3.3",
     "@vercel/kv": "^3.0.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5"

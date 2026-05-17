@@ -1307,6 +1307,34 @@ ${emailText.substring(0, 1000)}`,
         }
       }
 
+      // Crew sender auto-attribution — check senderPatterns on every
+      // crew member. First match wins; the signal lands with
+      // crewMemberId stamped so the brief can prefix appropriately
+      // and the mobile UI knows which crew card to associate it with.
+      try {
+        const rawCrew = await redis.get(`household:${householdId}:crew`);
+        const crew = (() => {
+          if (!rawCrew) return [];
+          try { return Array.isArray(rawCrew) ? rawCrew : JSON.parse(rawCrew); } catch { return []; }
+        })();
+        const senderNorm = (signal.sender || "").toLowerCase().trim();
+        if (senderNorm && Array.isArray(crew)) {
+          for (const member of crew) {
+            const patterns = Array.isArray(member?.senderPatterns) ? member.senderPatterns : [];
+            const hit = patterns.some((p) => String(p || "").toLowerCase().trim() === senderNorm);
+            if (hit && member.name) {
+              signal.crewMemberId = member.name;
+              console.log(
+                `[crew] auto-attributed signal from ${signal.sender} → ${member.name}`
+              );
+              break;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[crew] auto-attribution error:", err?.message || err);
+      }
+
       await redis.lpush(signalsKey, JSON.stringify(signal));
       await redis.sadd(fingerprintSetKey, fp);
       imported++;
