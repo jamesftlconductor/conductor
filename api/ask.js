@@ -17,7 +17,11 @@ const redis = new Redis({
 export const config = { maxDuration: 30 };
 
 const ASK_TTL_S = 30 * 60;
-const ASK_MODEL = "claude-sonnet-4-20250514";
+// Spec called for claude-sonnet-4-20250514, but that ID returns
+// not_found_error from the Anthropic API — the current Sonnet 4 family
+// id is claude-sonnet-4-6. Swap to the live one so questions actually
+// answer.
+const ASK_MODEL = "claude-sonnet-4-6";
 
 // Fort Lauderdale for the dev household; same hardcoded coords brief.js
 // uses. Eventually per-household lookup.
