@@ -226,45 +226,84 @@ export async function trackFedEx(trackingNumber) {
 }
 
 // ---------- USPS ----------
+//
+// The legacy XML "Web Tools" API at secure.shippingapis.com was
+// retired Jan 25, 2026. Current path is OAuth 2.0 + REST at
+// apis.usps.com, identical pattern to UPS/FedEx — two creds
+// (Consumer Key + Consumer Secret) and a Bearer token cached in
+// Redis.
+
+async function getUSPSToken() {
+  const cached = await getCachedToken("usps");
+  if (cached) return cached;
+  const id = process.env.USPS_CONSUMER_KEY;
+  const secret = process.env.USPS_CONSUMER_SECRET;
+  if (!id || !secret) return null;
+  const res = await fetch("https://apis.usps.com/oauth2/v3/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: id,
+      client_secret: secret,
+    }),
+  });
+  if (!res.ok) {
+    console.warn(`[usps] token fetch ${res.status}`);
+    return null;
+  }
+  const data = await res.json();
+  if (!data.access_token) return null;
+  await setCachedToken("usps", data.access_token, parseInt(data.expires_in, 10));
+  return data.access_token;
+}
 
 export async function trackUSPS(trackingNumber) {
-  const apiKey = process.env.USPS_API_KEY;
-  if (!apiKey) return null;
-  // USPS XML "TrackV2" still in service; the modern OAuth API exists
-  // but requires a paid tier. The XML endpoint accepts USERID inline.
-  const xml = `<TrackRequest USERID="${apiKey}"><TrackID ID="${trackingNumber}"></TrackID></TrackRequest>`;
-  const url = `https://secure.shippingapis.com/ShippingAPI.dll?API=TrackV2&XML=${encodeURIComponent(xml)}`;
-  const res = await fetch(url);
+  const token = await getUSPSToken();
+  if (!token) return null;
+  const url = `https://apis.usps.com/tracking/v3/tracking/${encodeURIComponent(trackingNumber)}`;
+  const res = await fetch(url, {
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Accept": "application/json",
+    },
+  });
   if (!res.ok) {
     console.warn(`[usps] track ${trackingNumber} → ${res.status}`);
     return null;
   }
-  const body = await res.text();
-  // Lightweight XML parse — USPS returns a predictable structure.
-  const status = (body.match(/<Status>([^<]+)<\/Status>/) || [])[1] || "";
-  const summary = (body.match(/<TrackSummary>([\s\S]*?)<\/TrackSummary>/) || [])[1] || "";
-  const detailMatches = [...body.matchAll(/<TrackDetail>([\s\S]*?)<\/TrackDetail>/g)].map((m) => m[1]);
-  function extractTime(chunk) {
-    const date = (chunk.match(/<EventDate>([^<]+)<\/EventDate>/) || [])[1] || "";
-    const time = (chunk.match(/<EventTime>([^<]+)<\/EventTime>/) || [])[1] || "";
-    return date ? `${date} ${time}`.trim() : null;
+  const data = await res.json();
+  // USPS v3 response: trackingNumber, trackingEvents[], expectedDeliveryDate,
+  // statusCategory/statusSummary at the top level. Field names may carry
+  // minor variants across release — use first-defined fallbacks.
+  const events = Array.isArray(data.trackingEvents) ? data.trackingEvents : [];
+  const latest = events[0] || {};
+  const summaryText =
+    data.statusSummary || data.statusCategory || latest.eventType || latest.eventDescription || "";
+  function eventTime(e) {
+    if (!e) return null;
+    if (e.eventTimestamp) return e.eventTimestamp;
+    if (e.eventDate) return e.eventTime ? `${e.eventDate} ${e.eventTime}` : e.eventDate;
+    return null;
   }
-  function extractCity(chunk) {
-    return (chunk.match(/<EventCity>([^<]+)<\/EventCity>/) || [])[1] || null;
+  function eventCity(e) {
+    if (!e) return null;
+    return e.eventCity || e.city || e.location?.city || null;
   }
-  function extractEvent(chunk) {
-    return (chunk.match(/<Event>([^<]+)<\/Event>/) || [])[1] || "";
+  function eventDesc(e) {
+    if (!e) return "";
+    return e.eventType || e.eventDescription || e.description || "";
   }
   return {
     carrier: "USPS",
-    status: normalizeStatus(status || extractEvent(summary)),
-    eta: (body.match(/<ExpectedDeliveryDate>([^<]+)<\/ExpectedDeliveryDate>/) || [])[1] || null,
-    location: extractCity(summary),
-    lastUpdate: extractTime(summary),
-    events: detailMatches.slice(0, 5).map((d) => ({
-      status: extractEvent(d),
-      location: extractCity(d) || "",
-      timestamp: extractTime(d),
+    status: normalizeStatus(summaryText),
+    eta: data.expectedDeliveryDate || data.estimatedDeliveryDate || null,
+    location: eventCity(latest),
+    lastUpdate: eventTime(latest),
+    events: events.slice(0, 5).map((e) => ({
+      status: eventDesc(e),
+      location: eventCity(e) || "",
+      timestamp: eventTime(e),
     })),
   };
 }
