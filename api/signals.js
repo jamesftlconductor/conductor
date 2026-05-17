@@ -440,11 +440,23 @@ async function handleVault(req, res) {
   const key = `household:${householdId}:vault`;
 
   if (req.method === "GET") {
-    const raw = await redis.lrange(key, 0, -1);
+    const [raw, rawShared] = await Promise.all([
+      redis.lrange(key, 0, -1),
+      // Shared vault items pushed in from connected households via
+      // /api/network?action=share-vault. Flagged with isShared on
+      // the way out so the mobile UI can render the read-only
+      // "Shared with you" section.
+      redis.lrange(`household:${householdId}:sharedVault`, 0, -1).catch(() => []),
+    ]);
     let items = raw
       .map(parseSignal)
       .filter(Boolean)
       .filter((v) => !v.handled);
+    const sharedItems = (rawShared || [])
+      .map(parseSignal)
+      .filter(Boolean)
+      .map((s) => ({ ...s, isShared: true }));
+    items = [...items, ...sharedItems];
 
     // Optional search — case-insensitive substring across description,
     // provider, category, and notes.

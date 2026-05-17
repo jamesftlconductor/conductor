@@ -282,6 +282,108 @@ async function handleJoin(req, res) {
   });
 }
 
+// Vault sharing — copy a vault item from the requesting household
+// into a connected household's :sharedVault list. Validates that an
+// active connection exists between the two households before copying.
+//
+// Categories that read as family-shareable (insurance, emergency,
+// medical, legal, registration) are honored as-is. Anything else
+// still flows through — the caller chose to share it, no need to
+// gatekeep beyond connection presence.
+async function handleShareVault(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const { userId, vaultItemId, targetHouseholdId, permissionLevel } = req.body || {};
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  if (vaultItemId == null) return res.status(400).json({ error: "vaultItemId required" });
+  if (!targetHouseholdId) return res.status(400).json({ error: "targetHouseholdId required" });
+  const level = permissionLevel === "edit" ? "edit" : "view";
+
+  const sourceHouseholdId = await resolveHouseholdId(userId);
+  if (!sourceHouseholdId) return res.status(400).json({ error: "no household" });
+  if (sourceHouseholdId === targetHouseholdId) {
+    return res.status(400).json({ error: "Cannot share with your own household" });
+  }
+
+  // Validate the connection exists from source → target. We accept
+  // any permission level — sharing a vault item is opt-in per item,
+  // not gated by the connection's awareness level.
+  const connections = await loadConnections(sourceHouseholdId);
+  const linked = connections.some((c) => c.connectedHouseholdId === targetHouseholdId);
+  if (!linked) {
+    return res.status(400).json({ error: "Not connected to that household" });
+  }
+
+  // Find the vault item to copy.
+  const sourceVaultKey = `household:${sourceHouseholdId}:vault`;
+  const rawVault = await redis.lrange(sourceVaultKey, 0, -1);
+  let item = null;
+  for (const r of rawVault || []) {
+    const parsed = safeJson(r);
+    if (!parsed) continue;
+    if (parsed.id === vaultItemId || String(parsed.id) === String(vaultItemId)) {
+      item = parsed;
+      break;
+    }
+  }
+  if (!item) return res.status(404).json({ error: "vault item not found" });
+
+  // Look up source household name for the badge on the target side.
+  const sourceName =
+    (await redis.get(`household:${sourceHouseholdId}:name`)) || sourceHouseholdId;
+
+  const copy = {
+    ...item,
+    id: Date.now() + Math.floor(Math.random() * 1000),
+    sharedFrom: {
+      householdId: sourceHouseholdId,
+      householdName: sourceName,
+      sharedAt: new Date().toISOString(),
+      originalId: item.id,
+      permissionLevel: level,
+    },
+  };
+  await redis.lpush(`household:${targetHouseholdId}:sharedVault`, JSON.stringify(copy));
+
+  // Best-effort notification to the target household (no push if
+  // the type=tracking notify is unavailable — keeps the share path
+  // unblocked).
+  try {
+    await fetch("https://conductor-ivory.vercel.app/api/notify?type=tracking", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        householdId: targetHouseholdId,
+        title: "A vault item was shared with you",
+        body: item.description || "From a connected household",
+      }),
+    });
+  } catch {
+    // ignore
+  }
+
+  console.log(
+    `[network] vault share: ${sourceHouseholdId} → ${targetHouseholdId} item=${item.id}`
+  );
+  return res.status(200).json({ ok: true, sharedItemId: copy.id, sharedFrom: copy.sharedFrom });
+}
+
+async function handleSharedVault(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const { userId } = req.query || {};
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+  const raw = await redis.lrange(`household:${householdId}:sharedVault`, 0, -1);
+  const items = (raw || []).map(safeJson).filter(Boolean);
+  return res.status(200).json({ household: householdId, items, count: items.length });
+}
+
 async function handleDisconnect(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -342,5 +444,7 @@ export default async function handler(req, res) {
   if (action === "invite") return handleInvite(req, res);
   if (action === "join") return handleJoin(req, res);
   if (action === "disconnect") return handleDisconnect(req, res);
-  return res.status(404).json({ error: "Unknown action — use ?action=connect|status|invite|join|disconnect" });
+  if (action === "share-vault") return handleShareVault(req, res);
+  if (action === "shared-vault") return handleSharedVault(req, res);
+  return res.status(404).json({ error: "Unknown action — use ?action=connect|status|invite|join|disconnect|share-vault|shared-vault" });
 }
