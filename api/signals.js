@@ -1214,6 +1214,50 @@ export default async function handler(req, res) {
       return res.status(200).json({ household: householdId, transactions });
     }
 
+    // Handoff acknowledgment — POST to mark a handoff as covered
+    // by a household member. Suppresses the HANDOFF prompt line in
+    // subsequent briefs for ~36h (see brief.js ackedSignalIds).
+    if (queryType === "handoff" || bodyType === "handoff") {
+      if (req.method !== "POST") {
+        res.setHeader("Allow", "POST");
+        return res.status(405).json({ error: "Method not allowed for handoff" });
+      }
+      const { signalId, acknowledgedBy, userId: bodyUserId } = req.body || {};
+      if (!signalId) return res.status(400).json({ error: "signalId required" });
+      const householdId = await resolveHouseholdId(bodyUserId || acknowledgedBy);
+      if (!householdId) return res.status(400).json({ error: "Could not resolve household" });
+      const record = {
+        signalId: String(signalId),
+        acknowledgedBy: acknowledgedBy || bodyUserId || null,
+        acknowledgedAt: new Date().toISOString(),
+      };
+      await redis.hset(`household:${householdId}:handoffsAck`, {
+        [String(signalId)]: JSON.stringify(record),
+      });
+      return res.status(200).json({ ok: true, household: householdId, ...record });
+    }
+
+    // Streak — read household streakData. Returns the persisted
+    // counters even when zero so the mobile card can render an
+    // empty-state without a separate code path.
+    if (queryType === "streak") {
+      if (req.method !== "GET") {
+        res.setHeader("Allow", "GET");
+        return res.status(405).json({ error: "Method not allowed for streak" });
+      }
+      const householdId = await resolveHouseholdId(req.query?.userId);
+      if (!householdId) return res.status(400).json({ error: "userId required" });
+      const raw = await redis.get(`household:${householdId}:streakData`);
+      const data = safeJson(raw) || {
+        currentStreak: 0,
+        longestStreak: 0,
+        lastResolutionDate: null,
+        totalResolved: 0,
+        streakStartDate: null,
+      };
+      return res.status(200).json({ household: householdId, streak: data });
+    }
+
     // Threads — read thread metadata for a specific threadId. GET
     // returns the thread record plus the full signal objects for
     // each member. Mobile Hover / Finale use this for the

@@ -476,6 +476,150 @@ function detectConflicts({
   return conflicts;
 }
 
+// Handoff detection — surfaces situations where coordination is
+// needed but not a full conflict. A handoff is *one* member blocked
+// (calendar event, travel signal) when a service/delivery signal
+// requires presence and *another* member is free to cover it.
+//
+// Returns one handoff (or null). Briefs already lead with conflicts
+// and surface multiple of those; handoffs are more conversational —
+// "Sarah's out this afternoon; the plumber will need James home" —
+// and one per brief reads better than a list.
+//
+// Skips:
+//   - signals already acknowledged via /api/signals?type=handoff
+//   - cases where every member is blocked (that's a full conflict
+//     and detectConflicts handles it)
+//   - single-member households (no one to hand off to)
+function detectHandoffs({
+  activeSignals,
+  calendarEvents,
+  householdNameMap,
+  requestingUserId,
+  isSingleMember,
+  ackedSignalIds,
+}) {
+  if (isSingleMember) return null;
+  const memberIds = [
+    requestingUserId,
+    ...Array.from(householdNameMap?.keys() || []),
+  ].filter(Boolean);
+  if (memberIds.length < 2) return null;
+
+  const events = Array.isArray(calendarEvents) ? calendarEvents : [];
+  const blockingEvents = events.filter((e) =>
+    e.workConflictCheck === true ||
+    e.type === "work" ||
+    e.type === "travel" ||
+    eventClassifiedAs(e, ["work", "meeting", "call", "office", "flight", "trip"])
+  );
+  const memberWork = new Map(memberIds.map((id) => [id, []]));
+  for (const e of blockingEvents) {
+    const uid = e.userId;
+    if (!uid || !memberWork.has(uid)) continue;
+    memberWork.get(uid).push(e);
+  }
+
+  // A member also counts as unavailable when they have an active
+  // travel signal whose ETA overlaps the window — flight at 3pm
+  // blocks a 4pm plumber appointment for the traveler.
+  function memberTravelBlocks(uid, startMs, endMs) {
+    return activeSignals.some(
+      (s) =>
+        s.userId === uid &&
+        s.type === "travel" &&
+        (() => {
+          const t = parseDateLoose(s.eta)?.getTime();
+          return t != null && t >= startMs - 6 * HOUR_MS && t <= endMs + 6 * HOUR_MS;
+        })()
+    );
+  }
+
+  function memberBlockedInWindow(uid, startMs, endMs) {
+    const events = memberWork.get(uid) || [];
+    const calBlocked = events.some((e) => {
+      const s = parseDateLoose(e.start)?.getTime();
+      const eMs =
+        parseDateLoose(e.end)?.getTime() || (s ? s + HOUR_MS : null);
+      if (!s || !eMs) return false;
+      return s <= endMs && eMs >= startMs;
+    });
+    return calBlocked || memberTravelBlocks(uid, startMs, endMs);
+  }
+
+  function nameFor(uid) {
+    if (!uid) return null;
+    if (uid === requestingUserId) return "you";
+    return householdNameMap?.get(uid) || null;
+  }
+
+  for (const s of activeSignals) {
+    const requiresPresence =
+      s.type === "service" || s.status === "Out for Delivery";
+    if (!requiresPresence) continue;
+    if (ackedSignalIds && ackedSignalIds.has(String(s.id))) continue;
+    const eta = parseDateLoose(s.eta);
+    if (!eta) continue;
+    const offset = dayOffsetFromToday(eta);
+    if (offset !== 0 && offset !== 1) continue;
+
+    const winStart = eta.getTime() - 2 * HOUR_MS;
+    const winEnd = eta.getTime() + 2 * HOUR_MS;
+    const blocked = memberIds.filter((uid) =>
+      memberBlockedInWindow(uid, winStart, winEnd)
+    );
+    const free = memberIds.filter((uid) => !blocked.includes(uid));
+    // Need exactly one available member for a clean handoff (when
+    // everyone's free there's no need to coordinate; when no one's
+    // free it's a conflict).
+    if (blocked.length === 0 || free.length === 0) continue;
+
+    const ownerUid = s.userId || null;
+    const ownerBlocked = ownerUid ? blocked.includes(ownerUid) : false;
+
+    // Classification:
+    //   coverage_needed — signal owner is blocked, someone else is free
+    //   awareness       — unowned signal, only one member free
+    //   action_needed   — fall-back when owner cannot be inferred
+    let kind;
+    if (ownerUid && ownerBlocked) kind = "coverage_needed";
+    else if (!ownerUid) kind = "awareness";
+    else continue; // owner is free and we know it — no handoff needed
+
+    const blockedNames = blocked.map(nameFor).filter(Boolean);
+    const freeNames = free.map(nameFor).filter(Boolean);
+    const blockedLabel = blockedNames[0] || "someone";
+    const freeLabel = freeNames[0] || "someone";
+    const desc = s.description || "the appointment";
+    const timePart = offset === 0 ? "today" : "tomorrow";
+
+    let message;
+    if (kind === "coverage_needed") {
+      message = `${
+        blockedLabel === "you" ? "You are" : blockedLabel + " is"
+      } out ${timePart} when ${desc} arrives — ${
+        freeLabel === "you" ? "you'll" : freeLabel + " will"
+      } need to cover.`;
+    } else {
+      message = `${desc} is ${timePart} — ${
+        blockedLabel === "you" ? "you're" : blockedLabel + " is"
+      } unavailable, so ${
+        freeLabel === "you" ? "you'd" : freeLabel + " would"
+      } need to be there.`;
+    }
+
+    return {
+      type: kind,
+      signalId: String(s.id),
+      signal: s,
+      unavailableMember: { userId: ownerUid, name: blockedLabel },
+      availableMember: { userId: free[0], name: freeLabel },
+      message,
+    };
+  }
+  return null;
+}
+
 // Returns Map<userId, firstName> for every household member except the
 // requesting user (whose first name comes from the existing userName
 // resolution path). Uses the same scan pattern as sync.js and notify.js so
@@ -2597,6 +2741,38 @@ ${isSingleMember
       requestingUserId: userId,
     });
 
+    // Handoff detection — runs alongside conflicts but is structurally
+    // different: a handoff is a coordination prompt rather than a
+    // collision. Acked handoffs (the user tapped "I have this") are
+    // suppressed via the ackedSignalIds set, scoped to the morning of
+    // the appointment.
+    const ackHash = await redis
+      .hgetall(`household:${householdId}:handoffsAck`)
+      .catch(() => ({}));
+    const ackedSignalIds = new Set(
+      Object.keys(ackHash || {}).filter((k) => {
+        // ack record: { acknowledgedBy, acknowledgedAt }. We only honor
+        // an ack made in the last 36h so a stale ack from days ago
+        // doesn't permanently silence a recurring signal.
+        try {
+          const r = typeof ackHash[k] === "string" ? JSON.parse(ackHash[k]) : ackHash[k];
+          const ms = Date.parse(r?.acknowledgedAt || 0);
+          if (isNaN(ms)) return false;
+          return Date.now() - ms < 36 * HOUR_MS;
+        } catch {
+          return false;
+        }
+      })
+    );
+    const handoff = detectHandoffs({
+      activeSignals,
+      calendarEvents: Array.isArray(calendarEvents) ? calendarEvents : [],
+      householdNameMap,
+      requestingUserId: userId,
+      isSingleMember,
+      ackedSignalIds,
+    });
+
     const conflictLines =
       conflicts.length > 0
         ? conflicts
@@ -2695,6 +2871,9 @@ ${isSingleMember
       ``,
       `CONFLICTS DETECTED (surface these naturally and specifically — these are the most important things to mention):`,
       conflictLines,
+      ``,
+      `HANDOFF (one sentence, conversational; never use the word "handoff"; frame as natural household coordination — e.g. "Sarah is out this afternoon — the window cleaning at 2pm will need James to be home."):`,
+      handoff ? handoff.message : "None",
       ``,
       `URGENT (surface first if present):`,
       urgentForPrompt.length > 0 ? urgentForPrompt.map(formatSignal).join("\n") : "None",
@@ -3060,6 +3239,9 @@ ${isSingleMember
       user: userName,
       isFirstRun,
       isSingleMember,
+      handoff: handoff
+        ? { signalId: handoff.signalId, message: handoff.message, type: handoff.type }
+        : null,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for
