@@ -104,6 +104,62 @@ async function recordCaughtMoment(householdId, item, criterion, userId) {
   );
 }
 
+// Streak update. Fires on every state→resolved transition.
+// Counter math:
+//   - same day as last resolution    → totalResolved++ only
+//   - exactly yesterday              → totalResolved++, currentStreak++,
+//                                      longestStreak = max(...)
+//   - more than one day after last   → reset currentStreak to 1,
+//                                      stamp a fresh streakStartDate
+// Day boundaries use America/New_York to match the user-facing
+// clearance "this week" definition. Returns the post-update record.
+function todayETKey(date = new Date()) {
+  return date.toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric", month: "2-digit", day: "numeric",
+  });
+}
+
+function yesterdayETKey() {
+  const d = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  return todayETKey(d);
+}
+
+export async function updateStreak(householdId) {
+  const key = `household:${householdId}:streakData`;
+  let raw = await redis.get(key);
+  let data = null;
+  try { data = typeof raw === "string" ? JSON.parse(raw) : raw; } catch { data = null; }
+  if (!data || typeof data !== "object") {
+    data = {
+      currentStreak: 0,
+      longestStreak: 0,
+      lastResolutionDate: null,
+      totalResolved: 0,
+      streakStartDate: null,
+    };
+  }
+  const today = todayETKey();
+  const yest = yesterdayETKey();
+  data.totalResolved = (data.totalResolved || 0) + 1;
+  if (data.lastResolutionDate === today) {
+    // Already counted today — totalResolved bumped, streak untouched.
+  } else if (data.lastResolutionDate === yest) {
+    data.currentStreak = (data.currentStreak || 0) + 1;
+    data.lastResolutionDate = today;
+  } else {
+    // Either no prior or gap of 2+ days — fresh streak.
+    data.currentStreak = 1;
+    data.lastResolutionDate = today;
+    data.streakStartDate = today;
+  }
+  if ((data.currentStreak || 0) > (data.longestStreak || 0)) {
+    data.longestStreak = data.currentStreak;
+  }
+  await redis.set(key, JSON.stringify(data));
+  return data;
+}
+
 // Export for clearance.js to read the last-7-days slice.
 export async function loadRecentCaughtMoments(householdId, days = 7) {
   const raw = await redis.lrange(`household:${householdId}${CAUGHT_MOMENTS_KEY_SUFFIX}`, 0, -1);
@@ -1565,6 +1621,9 @@ export default async function handler(req, res) {
           if (state === "resolved") {
             const criterion = detectCaughtMoment(signals[index], { kind: "signal" });
             if (criterion) await recordCaughtMoment(householdId, signals[index], criterion, userId);
+            try { await updateStreak(householdId); } catch (err) {
+              console.warn("[streak] update failed:", err?.message || err);
+            }
           }
         }
         return res.status(200).json({ household: householdId, signal: signals[index] });
@@ -1607,6 +1666,9 @@ export default async function handler(req, res) {
           const item = { ...deadlines[index], type: deadlines[index].type || "deadline" };
           const criterion = detectCaughtMoment(item, { kind: "deadline" });
           if (criterion) await recordCaughtMoment(householdId, item, criterion, userId);
+          try { await updateStreak(householdId); } catch (err) {
+            console.warn("[streak] update failed:", err?.message || err);
+          }
         }
       }
       return res.status(200).json({ household: householdId, signal: deadlines[index] });

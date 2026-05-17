@@ -420,6 +420,31 @@ async function generateWeekInReview(householdId) {
       else break;
     }
 
+    // Persisted streakData lives at household:{id}:streakData and is
+    // updated by signals.js on every state→resolved transition. We
+    // surface its currentStreak alongside the in-memory streak above
+    // since the persisted counter captures cross-week continuity and
+    // hits the 14/30-day milestones the memory-window scan can't.
+    let persistedStreak = 0;
+    try {
+      const rawStreak = await redis.get(`household:${householdId}:streakData`);
+      const data = typeof rawStreak === "string" ? JSON.parse(rawStreak) : rawStreak;
+      persistedStreak = (data && Number(data.currentStreak)) || 0;
+    } catch {
+      // best-effort; fall back to memory-window streak
+    }
+    const streakForPrompt = Math.max(streak, persistedStreak);
+    let streakMilestone = null;
+    if (streakForPrompt >= 30) {
+      streakMilestone =
+        "A full month. Conductor has been watching and you've been handling things. That's the whole game.";
+    } else if (streakForPrompt >= 14) {
+      streakMilestone =
+        "Two weeks without anything slipping through. The household is running well.";
+    } else if (streakForPrompt >= 7) {
+      streakMilestone = "Seven days running — nothing has slipped this week.";
+    }
+
     // No memory at all → no review. A blank week is a real outcome but
     // the paragraph would be hollow; the section quietly stays absent.
     if (rested === 0 && lapsed === 0 && carriedForward === 0) return null;
@@ -439,7 +464,7 @@ async function generateWeekInReview(householdId) {
     const prompt = `Write a warm, honest one-paragraph Week in Review for this household. Cover:
 - How many signals were handled this week (${rested} rested, ${carriedForward} carried forward, ${lapsed} lapsed)
 - Any deadlines caught before they slipped (${deadlinesCaught} deadlines caught this week)
-- The streak if active: ${streak >= 2 ? `${streak} days running — nothing has slipped` : "(no notable streak this week)"}
+- The streak if active: ${streakMilestone ? streakMilestone : streakForPrompt >= 2 ? `${streakForPrompt} days running — nothing has slipped` : "(no notable streak this week)"}
 - One honest observation about how the week went
 - If the week was genuinely good: acknowledge it warmly
 - If the week was hard: acknowledge it without judgment
