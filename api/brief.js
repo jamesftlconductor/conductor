@@ -1186,6 +1186,35 @@ const NEAR_KEYWORDS_RE = /\b(today|tomorrow|tonight|this (?:morning|afternoon|ev
 // "December 5th", etc. Day-of-week alone is not matched (insufficient signal).
 const MONTH_DAY_RE = /\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sept?\.?|Oct\.?|Nov\.?|Dec\.?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/gi;
 
+// Bare ordinal day-of-month: "the 28th", "on the 5th", "by the 1st". The
+// model used this to slip a horizon closer past MONTH_DAY_RE in the
+// previous verification. Resolved to a date by picking the nearest future
+// occurrence — same month if day >= today's day-of-month, otherwise next
+// month. False positives in non-date contexts ("the 10th anniversary")
+// are acceptable retry collateral.
+const ORDINAL_DAY_RE = /\bthe\s+(\d{1,2})(?:st|nd|rd|th)\b/gi;
+
+// Resolve a bare ordinal ("the 28th") to days-from-today. Picks the
+// nearest future occurrence — same month if day >= today's day-of-month,
+// otherwise next month. Returns null for days outside 1-31 (which also
+// filters out matched ordinals 32+).
+function ordinalDayToDays(dayStr, today = new Date()) {
+  const day = parseInt(dayStr, 10);
+  if (!day || day < 1 || day > 31) return null;
+  const todayDay = today.getDate();
+  const year = today.getFullYear();
+  const month = today.getMonth();
+  const candidateMonth = day >= todayDay ? month : month + 1;
+  const target = new Date(year, candidateMonth, day);
+  if (isNaN(target.getTime())) return null;
+  // Date constructor silently rolls invalid days (Feb 30 → Mar 2). If the
+  // resulting day-of-month doesn't match the requested day, the month
+  // we picked doesn't have that day; treat as not-a-date.
+  if (target.getDate() !== day) return null;
+  const startOfToday = new Date(year, month, todayDay);
+  return Math.round((target.getTime() - startOfToday.getTime()) / 86400000);
+}
+
 // Returns the days-from-today for a {monthName, day} pair. Resolves
 // year ambiguity by picking whichever interpretation (current or next
 // calendar year) is closer to today — prevents "Jan 5" from being read
@@ -1253,6 +1282,18 @@ function checkHorizonCloserNearWindow(brief, today = new Date()) {
         const days = daysFromToday(md[1], md[2], today);
         if (days != null && days >= 0 && days <= 14) {
           evidence = `"${md[0]}" (${days}d)`;
+          break;
+        }
+      }
+    }
+
+    if (!evidence) {
+      ORDINAL_DAY_RE.lastIndex = 0;
+      let od;
+      while ((od = ORDINAL_DAY_RE.exec(sentence)) !== null) {
+        const days = ordinalDayToDays(od[1], today);
+        if (days != null && days >= 0 && days <= 14) {
+          evidence = `"${od[0]}" (${days}d)`;
           break;
         }
       }

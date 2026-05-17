@@ -34,6 +34,21 @@ const HORIZON_CLOSER_RE = /\b(worth watching|on the radar|conductor has its eye 
 const INLINE_DAYCOUNT_RE = /\bin\s+(\d+)\s+(day|days|week|weeks)\b/gi;
 const NEAR_KEYWORDS_RE = /\b(today|tomorrow|tonight|this (?:morning|afternoon|evening|week|weekend))\b/gi;
 const MONTH_DAY_RE = /\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sept?\.?|Oct\.?|Nov\.?|Dec\.?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/gi;
+const ORDINAL_DAY_RE = /\bthe\s+(\d{1,2})(?:st|nd|rd|th)\b/gi;
+
+function ordinalDayToDays(dayStr, today) {
+  const day = parseInt(dayStr, 10);
+  if (!day || day < 1 || day > 31) return null;
+  const todayDay = today.getDate();
+  const year = today.getFullYear();
+  const month = today.getMonth();
+  const candidateMonth = day >= todayDay ? month : month + 1;
+  const target = new Date(year, candidateMonth, day);
+  if (isNaN(target.getTime())) return null;
+  if (target.getDate() !== day) return null;
+  const startOfToday = new Date(year, month, todayDay);
+  return Math.round((target.getTime() - startOfToday.getTime()) / 86400000);
+}
 
 function daysFromToday(monthStr, dayStr, today) {
   const cleanMonth = monthStr.replace(/\.$/, "");
@@ -82,6 +97,14 @@ function horizonNearViolations(brief, today) {
       while ((md = MONTH_DAY_RE.exec(sentence)) !== null) {
         const days = daysFromToday(md[1], md[2], today);
         if (days != null && days >= 0 && days <= 14) { evidence = md[0]; break; }
+      }
+    }
+    if (!evidence) {
+      ORDINAL_DAY_RE.lastIndex = 0;
+      let od;
+      while ((od = ORDINAL_DAY_RE.exec(sentence)) !== null) {
+        const days = ordinalDayToDays(od[1], today);
+        if (days != null && days >= 0 && days <= 14) { evidence = od[0]; break; }
       }
     }
     if (evidence) out.push(`${closer[1]} → ${evidence}`);
@@ -150,6 +173,15 @@ const cases = [
   ["The Paris trip in 30 days is worth watching.", "CLEAN"],
   ["Conductor has its eye on the renewal in 95 days.", "CLEAN"],
   ["Worth watching: the September registration deadline.", "CLEAN"],
+
+  // Bare ordinal day-of-month near-window (TODAY=May 17)
+  ["Your Google Home renewal on the 28th is worth watching.", "horizon_near"],   // 11 days
+  ["The renewal on the 18th is worth watching.", "horizon_near"],                // 1 day
+  ["The renewal on the 17th is worth watching.", "horizon_near"],                // 0 days
+  ["The renewal on the 31st is worth watching.", "horizon_near"],                // 14 days
+  // Bare ordinal day-of-month past 14-day window — must stay CLEAN
+  ["The renewal on the 4th is worth watching.", "CLEAN"],                        // June 4 = 18 days
+  ["Conductor has its eye on the 1st of next month.", "CLEAN"],                  // June 1 = 15 days
 
   // Hydration / heavy-air nudges — must flag
   ["The air is thick today, so drink water throughout.", "hydration"],
