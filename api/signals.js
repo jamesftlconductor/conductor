@@ -1333,6 +1333,132 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, household: householdId, ...record });
     }
 
+    // Auto-resolutions — surfaces what Conductor handled without
+    // user action over the last 48h (default). Reads the memory log
+    // for resolved/expired entries within the window. Source
+    // 'tracking' (carrier auto-resolves) gets a wasAutomatic flag.
+    if (queryType === "autoResolutions") {
+      if (req.method !== "GET") {
+        res.setHeader("Allow", "GET");
+        return res.status(405).json({ error: "Method not allowed for autoResolutions" });
+      }
+      const householdId = await resolveHouseholdId(req.query?.userId);
+      if (!householdId) return res.status(400).json({ error: "userId required" });
+      const sinceParam = req.query?.since;
+      const sinceMs = sinceParam ? Date.parse(sinceParam) : NaN;
+      const windowStart = !isNaN(sinceMs)
+        ? sinceMs
+        : Date.now() - 48 * 60 * 60 * 1000;
+
+      const raw = await redis.lrange(`household:${householdId}:memory`, 0, -1);
+      const items = [];
+      for (const r of raw || []) {
+        try {
+          const e = typeof r === "string" ? JSON.parse(r) : r;
+          if (!e) continue;
+          if (e.action !== "resolved" && e.action !== "expired") continue;
+          const ms = Date.parse(e.actionAt || "");
+          if (isNaN(ms) || ms < windowStart) continue;
+          items.push({
+            signalId: e.signalId,
+            description: e.description,
+            sender: e.sender,
+            type: e.type,
+            action: e.action,
+            resolvedAt: e.actionAt,
+            wasAutomatic:
+              e.source === "tracking" ||
+              e.source === "cron" ||
+              e.source === "auto" ||
+              e.action === "expired",
+          });
+        } catch {
+          // skip malformed entry
+        }
+      }
+      return res.status(200).json({
+        household: householdId,
+        count: items.length,
+        items,
+      });
+    }
+
+    // Memory journal — full longitudinal view of the household's
+    // memory log, grouped by ET date. Caught moments are joined in
+    // from the dedicated list so the mobile screen can mark them
+    // with a brass border + badge.
+    if (queryType === "journal") {
+      if (req.method !== "GET") {
+        res.setHeader("Allow", "GET");
+        return res.status(405).json({ error: "Method not allowed for journal" });
+      }
+      const householdId = await resolveHouseholdId(req.query?.userId);
+      if (!householdId) return res.status(400).json({ error: "userId required" });
+      const days = Math.max(1, Math.min(180, parseInt(req.query?.days || "30", 10) || 30));
+      const windowStart = Date.now() - days * 24 * 60 * 60 * 1000;
+
+      const [rawMemory, rawStreak, rawCaught] = await Promise.all([
+        redis.lrange(`household:${householdId}:memory`, 0, -1),
+        redis.get(`household:${householdId}:streakData`),
+        redis.lrange(`household:${householdId}${CAUGHT_MOMENTS_KEY_SUFFIX}`, 0, -1),
+      ]);
+
+      // Build caught-moment lookup: a memory entry counts as a
+      // caught moment if a record exists in :caughtMoments within
+      // 72h of the entry's actionAt with a matching signalId.
+      const SEVENTY_TWO_H = 72 * 60 * 60 * 1000;
+      const caught = (rawCaught || [])
+        .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+        .filter(Boolean);
+
+      const byDate = new Map();
+      for (const r of rawMemory || []) {
+        let e;
+        try { e = typeof r === "string" ? JSON.parse(r) : r; } catch { continue; }
+        if (!e || !e.actionAt) continue;
+        const ms = Date.parse(e.actionAt);
+        if (isNaN(ms) || ms < windowStart) continue;
+        const dateKey = new Date(ms).toLocaleDateString("en-US", {
+          timeZone: "America/New_York",
+          year: "numeric", month: "2-digit", day: "numeric",
+        });
+        const isCaughtMoment = caught.some(
+          (c) =>
+            c &&
+            (c.id === e.signalId || String(c.id) === String(e.signalId)) &&
+            Math.abs(Date.parse(c.resolvedAt || "") - ms) < SEVENTY_TWO_H
+        );
+        const wasAutomatic =
+          e.source === "tracking" ||
+          e.source === "cron" ||
+          e.source === "auto" ||
+          e.action === "expired";
+        const enriched = {
+          signalId: e.signalId,
+          description: e.description,
+          sender: e.sender,
+          type: e.type,
+          action: e.action,
+          actionAt: e.actionAt,
+          userId: e.userId,
+          isCaughtMoment,
+          wasAutomatic,
+        };
+        if (!byDate.has(dateKey)) byDate.set(dateKey, []);
+        byDate.get(dateKey).push(enriched);
+      }
+
+      const sortedDays = [...byDate.entries()]
+        .sort((a, b) => Date.parse(b[0]) - Date.parse(a[0]))
+        .map(([date, entries]) => ({ date, entries }));
+
+      return res.status(200).json({
+        household: householdId,
+        days: sortedDays,
+        streakData: (() => { try { return typeof rawStreak === "string" ? JSON.parse(rawStreak) : rawStreak; } catch { return null; } })(),
+      });
+    }
+
     // Streak — read household streakData. Returns the persisted
     // counters even when zero so the mobile card can render an
     // empty-state without a separate code path.
