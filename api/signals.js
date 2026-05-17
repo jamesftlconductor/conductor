@@ -1,5 +1,6 @@
 import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
+import { detectOrLoadLocation, saveHouseholdLocation, loadHouseholdLocation } from "./location.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -1126,6 +1127,32 @@ export default async function handler(req, res) {
         return (db || 0) - (da || 0);
       });
       return res.status(200).json({ household: householdId, transactions });
+    }
+
+    // Location — per-household city/state/lat/lon/marketRegion. GET
+    // returns the stored location, auto-detecting from the caller's
+    // IP on first read. POST manually sets the location (Settings →
+    // Household → Location edit).
+    if (queryType === "location" || bodyType === "location") {
+      if (req.method === "GET") {
+        const householdId = await resolveHouseholdId(req.query?.userId);
+        const location = await detectOrLoadLocation(householdId, req);
+        return res.status(200).json({ household: householdId, location });
+      }
+      if (req.method === "POST") {
+        const { userId, city, state, lat, lon, timezone } = req.body || {};
+        if (!userId) return res.status(400).json({ error: "userId required" });
+        if (!city || !state) return res.status(400).json({ error: "city and state required" });
+        const householdId = await resolveHouseholdId(userId);
+        try {
+          const location = await saveHouseholdLocation(householdId, { city, state, lat, lon, timezone });
+          return res.status(200).json({ household: householdId, location });
+        } catch (err) {
+          return res.status(400).json({ error: err?.message || "save failed" });
+        }
+      }
+      res.setHeader("Allow", "GET, POST");
+      return res.status(405).json({ error: "Method not allowed for location" });
     }
 
     // Camouflage — per-household filter rules. GET lists rules, POST

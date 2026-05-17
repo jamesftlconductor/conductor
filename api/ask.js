@@ -8,6 +8,8 @@
 import { createHash } from "node:crypto";
 import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
+import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
+import { renderPricingForPrompt } from "./pricing.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -23,11 +25,9 @@ const ASK_TTL_S = 30 * 60;
 // answer.
 const ASK_MODEL = "claude-sonnet-4-6";
 
-// Fort Lauderdale for the dev household; same hardcoded coords brief.js
-// uses. Eventually per-household lookup.
-const WEATHER_LAT = 26.1224;
-const WEATHER_LON = -80.1373;
-const WEATHER_TIMEZONE = "America/New_York";
+// Per-household weather coords come from household:{id}:location now —
+// see fetchWeather below. The constants are only used as fallback when
+// detection failed entirely.
 const WEATHER_TIMEOUT_MS = 3000;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -46,16 +46,19 @@ async function resolveHouseholdId(userId) {
 
 // Best-effort weather pull. Returns null on any failure so the
 // question still gets answered without weather context.
-async function fetchWeather() {
+async function fetchWeather(location) {
+  const lat = location?.lat ?? LOCATION_FALLBACK.lat;
+  const lon = location?.lon ?? LOCATION_FALLBACK.lon;
+  const timezone = location?.timezone ?? LOCATION_FALLBACK.timezone;
   try {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), WEATHER_TIMEOUT_MS);
     const url =
       `https://api.open-meteo.com/v1/forecast` +
-      `?latitude=${WEATHER_LAT}&longitude=${WEATHER_LON}` +
+      `?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,relative_humidity_2m,precipitation,weathercode` +
       `&temperature_unit=fahrenheit` +
-      `&timezone=${encodeURIComponent(WEATHER_TIMEZONE)}`;
+      `&timezone=${encodeURIComponent(timezone)}`;
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(t);
     if (!res.ok) return null;
@@ -224,6 +227,11 @@ export default async function handler(req, res) {
   try {
     const householdId = await resolveHouseholdId(userId);
 
+    // Load location first so the weather fetch uses the household's
+    // actual coordinates and the pricing context picks the right
+    // market region.
+    const householdLocation = (await loadHouseholdLocation(householdId)) || LOCATION_FALLBACK;
+
     // Parallel context pull. Each source is independently best-effort —
     // a missing piece becomes "Not available" in the prompt rather than
     // a hard failure.
@@ -234,7 +242,7 @@ export default async function handler(req, res) {
       redis.lrange(`household:${householdId}:vault`, 0, -1),
       redis.get(`household:${householdId}:crew`),
       redis.get(`user:${userId}:health`),
-      fetchWeather(),
+      fetchWeather(householdLocation),
       loadHouseholdCalendar(redis, householdId),
       redis.lrange(`household:${householdId}:memory`, 0, 9),
     ]);
@@ -294,6 +302,13 @@ export default async function handler(req, res) {
       ``,
       `RECENT MEMORY (last 10 lifecycle events):`,
       memoryEntries.length > 0 ? memoryEntries.map(formatMemoryLine).join("\n") : "None",
+      ``,
+      `HOUSEHOLD LOCATION: ${householdLocation.city || "Unknown"}, ${householdLocation.state || ""} (market: ${householdLocation.marketRegion || "generic"})`,
+      ``,
+      // Pricing reference — embedded for questions about service costs.
+      // Uses the household's marketRegion so an LA question gets LA
+      // rates, NYC gets NYC, etc.
+      renderPricingForPrompt(householdLocation.marketRegion),
     ].join("\n");
 
     const systemPrompt = `You are Conductor, a household intelligence assistant. You have complete awareness of this household's signals, deadlines, health, weather, crew, and history. Answer questions directly from what you know. Never make things up. Never mention Claude or AI. Speak as Conductor in first person: "I can see that..." or "Based on what I'm watching..." or "Conductor has..." Maximum 3 sentences. Plain text only.

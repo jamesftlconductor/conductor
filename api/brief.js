@@ -1,6 +1,7 @@
 import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
 import { loadCamouflageRules, applyCamouflage } from "./signals.js";
+import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -10,10 +11,8 @@ const redis = new Redis({
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 
-// Fort Lauderdale for now; later we'll resolve per-household location.
-const WEATHER_LAT = 26.1224;
-const WEATHER_LON = -80.1373;
-const WEATHER_TIMEZONE = "America/New_York";
+// Default coords used only when location detection genuinely failed —
+// per-household coords come from household:{id}:location now.
 const WEATHER_TIMEOUT_MS = 3000;
 
 // ---------- helpers ----------
@@ -40,16 +39,22 @@ function classifyWeather(code, tempF) {
 // (network, timeout, malformed payload) so the brief still ships
 // without weather context. 3s timeout keeps the overall brief
 // latency bounded even when Open-Meteo is slow.
-async function fetchWeather() {
+async function fetchWeather(location) {
+  // Use the household's stored coordinates when available; fall back to
+  // the LOCATION_FALLBACK (Fort Lauderdale) so a household with no
+  // location set still gets weather context.
+  const lat = location?.lat ?? LOCATION_FALLBACK.lat;
+  const lon = location?.lon ?? LOCATION_FALLBACK.lon;
+  const timezone = location?.timezone ?? LOCATION_FALLBACK.timezone;
   try {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), WEATHER_TIMEOUT_MS);
     const url =
       `https://api.open-meteo.com/v1/forecast` +
-      `?latitude=${WEATHER_LAT}&longitude=${WEATHER_LON}` +
+      `?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,relative_humidity_2m,precipitation,weathercode` +
       `&temperature_unit=fahrenheit` +
-      `&timezone=${encodeURIComponent(WEATHER_TIMEZONE)}`;
+      `&timezone=${encodeURIComponent(timezone)}`;
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(t);
     if (!res.ok) return null;
@@ -944,6 +949,7 @@ function synthesizeHouseholdState({
   weather,
   upcomingCelebrations,
   travelPrep,
+  location,
 }) {
   const urgentCount = urgentForPrompt.length;
   const nearCount = nearForPrompt.length;
@@ -1052,7 +1058,13 @@ function synthesizeHouseholdState({
     synthesisFlags: flags,
     synthesisNote: null,           // populated by generatePulseNote after this returns
     pulseWord,
-    locationContext: "fort_lauderdale",
+    // Carry the household's marketRegion through to the Pulse prompt
+    // so the per-market vocabulary set fires correctly. Falls through
+    // to "south_florida" for backwards compatibility (test household).
+    locationContext: location?.marketRegion || "south_florida",
+    locationLabel: location?.city
+      ? `${location.city}, ${location.state}`
+      : "Fort Lauderdale, FL",
     oura: healthContext?.oura || null,
   };
 }
@@ -1101,9 +1113,64 @@ async function generatePulseNote(state) {
     ? `${state.weatherState}, ${state.tempF != null ? `${state.tempF}°F` : "?"}, feels like ${state.heatIndex != null ? `${state.heatIndex}°F` : "?"}, humidity ${state.humidity != null ? `${state.humidity}%` : "?"}`
     : "unknown";
 
-  const locationLabel = state.locationContext === "fort_lauderdale" ? "Fort Lauderdale" : "generic";
+  const locationLabel = state.locationLabel || "Fort Lauderdale, FL";
+  const region = state.locationContext || "south_florida";
 
-  const prompt = `Given this household state, write one sentence that synthesizes what it means for today. Be specific, warm, and honest. Use the approved list of location-aware weather observations for Fort Lauderdale. If a synthesis flag is active, lead with its implication — not the data behind it.
+  // Per-market weather phrase sets. The model picks from the block
+  // matching the household's marketRegion only — keeps a Boston brief
+  // from accidentally lifting "perfect South Florida morning."
+  const WEATHER_VOCAB = {
+    south_florida: `Fort Lauderdale / South Florida weather observations (use when weather is relevant):
+- High humidity: 'feels like the inside of a greenhouse', 'heavy air today', 'the humidity has opinions'
+- Afternoon storms: 'classic South Florida afternoon building', 'storms likely by 3pm', 'the sky will have thoughts later'
+- Extreme heat: 'proper South Florida heat today', 'the kind of heat that slows everything down'
+- Cold front: 'Fort Lauderdale cold front — practically sweater weather at 68°F'
+- Clear and mild: 'perfect South Florida morning', 'the good kind of Florida day'`,
+    nyc: `New York City weather observations (use when weather is relevant):
+- Heat wave: 'classic New York summer', 'the kind of heat that empties the city'
+- Cold snap: 'real New York cold today', 'the kind of cold that bites'
+- Snow: 'first proper snow of the season', 'the city is quiet under it'
+- Clear and crisp: 'one of those clean New York days', 'the kind of morning that justifies walking'
+- Heavy rain: 'soaking rain — pavement-river day', 'sideways rain across the avenues'`,
+    chicago: `Chicago weather observations (use when weather is relevant):
+- Wind: 'wind off the lake today', 'Chicago wind that goes through layers'
+- Cold: 'Chicago winter — dress for it', 'subzero day, plan accordingly'
+- Lake effect snow: 'lake effect coming through', 'thick snow off the water'
+- Mild summer: 'good Chicago summer day', 'the kind of weather the city was built for'
+- Heat humidity: 'sticky Chicago heat', 'the humidity sits between the buildings'`,
+    los_angeles: `Los Angeles weather observations (use when weather is relevant):
+- Heat: 'real LA heat today', 'dry heat — different than humid heat'
+- Marine layer: 'June Gloom morning', 'the marine layer is hanging on'
+- Fire weather: 'dry windy day — fire weather', 'Santa Anas blowing'
+- Rain (rare): 'rare LA rain — drive accordingly', 'the city forgets how to drive'
+- Perfect day: 'the kind of LA day the postcards promised'`,
+    seattle: `Seattle weather observations (use when weather is relevant):
+- Rain: 'the usual Seattle grey', 'steady Seattle drizzle'
+- Rare sun: 'rare Seattle sun — worth going outside', 'the kind of day you cancel plans to be outside'
+- Cold rain: 'cold rain coming through', 'damp through-and-through kind of day'
+- Wind storm: 'classic Pacific wind day', 'gusts off the Sound'
+- Mild summer: 'proper Pacific Northwest summer — short, golden'`,
+    boston: `Boston / New England weather observations (use when weather is relevant):
+- Snow: 'proper New England snow today', 'real winter day in Boston'
+- Cold: 'Boston cold that finds gaps in your coat'
+- Nor'easter: 'nor'easter coming in — batten down', 'the kind of storm Boston gets right'
+- Mild: 'one of those good New England days', 'crisp and clean'
+- Humid summer: 'Boston summer humidity — the air is thick today'`,
+    miami: `Miami / South Florida weather observations (use when weather is relevant):
+- High humidity: 'feels like the inside of a greenhouse', 'Miami air today'
+- Storms: 'storms building over the bay', 'classic afternoon rain'
+- Heat: 'real Miami heat', 'the kind of day made for AC'
+- Clear: 'perfect Miami morning'`,
+    generic: `General weather observations (use when weather is relevant — neutral, no regional flavor):
+- Hot: 'real heat today', 'the kind of day to take it slow'
+- Cold: 'cold day — bundle up if you're out'
+- Rain: 'steady rain coming through', 'pavement-glistening kind of day'
+- Storm: 'storm building'
+- Clear and mild: 'the good kind of day', 'one of those clean mornings'`,
+  };
+  const weatherVocab = WEATHER_VOCAB[region] || WEATHER_VOCAB.generic;
+
+  const prompt = `Given this household state, write one sentence that synthesizes what it means for today. Be specific, warm, and honest. Use the approved list of location-aware weather observations for ${locationLabel}. If a synthesis flag is active, lead with its implication — not the data behind it.
 
 Flags active: ${flagsLine}
 Health: ${healthLine}
@@ -1112,12 +1179,7 @@ Signal load: ${state.signalLoad}, ${state.urgentCount} urgent
 Location: ${locationLabel}
 ${ouraLine ? `\n${ouraLine}\n\nOura observations (use when readiness is notable, but follow the numeral-ban rule below — translate the tier, never echo the score):\n- Readiness low (under 50): 'Oura says recovery is low today', 'the ring says rest if you can'\n- Readiness moderate (50-69): 'recovery is moderate', 'solid but not peak'\n- Readiness high (85+): 'Oura says you're well recovered', 'the ring likes today'\n- Temperature elevated: 'body temperature is slightly up — worth watching'` : ""}
 
-Fort Lauderdale weather observations (use these when weather is relevant):
-- High humidity: 'feels like the inside of a greenhouse', 'heavy air today', 'the humidity has opinions'
-- Afternoon storms: 'classic South Florida afternoon building', 'storms likely by 3pm', 'the sky will have thoughts later'
-- Extreme heat: 'proper South Florida heat today', 'the kind of heat that slows everything down'
-- Cold front: 'Fort Lauderdale cold front — practically sweater weather at 68°F'
-- Clear and mild: 'perfect South Florida morning', 'the good kind of Florida day'
+${weatherVocab}
 
 If no synthesis flags are active and conditions are normal: write one quiet observation about the day ahead.
 If green_light: acknowledge it warmly — this is a good day.
@@ -1517,6 +1579,13 @@ export default async function handler(req, res) {
       }
     }
 
+    // Load location FIRST so weather fetch uses the household's actual
+    // coords. Falls through to LOCATION_FALLBACK inside fetchWeather
+    // when no location is stored — keeps unconfigured households on the
+    // historical Fort Lauderdale defaults rather than failing weather
+    // entirely.
+    const householdLocation = (await loadHouseholdLocation(householdId)) || LOCATION_FALLBACK;
+
     // Pull all sources in parallel
     const [
       rawSignals,
@@ -1557,9 +1626,9 @@ export default async function handler(req, res) {
       buildHouseholdNameMap(redis, householdId, userId),
       redis.hgetall(`household:${householdId}:feedbackStats`),
       // Best-effort. Returns null on any failure so the brief still
-      // ships without weather context. Hardcoded to Fort Lauderdale
-      // for now; will resolve per-household location later.
-      fetchWeather(),
+      // ships without weather context. Per-household coordinates from
+      // the location we loaded just before this Promise.all.
+      fetchWeather(householdLocation),
       // Crew layer (children + pets). Single JSON-string key written
       // by the onboard worker's Job 4. Filter for today/tomorrow
       // events happens after parse, downstream.
@@ -2388,6 +2457,7 @@ ${isSingleMember
     // is best-effort: if it fails, synthesisNote stays null, the prompt
     // still includes the structured state, and the brief still ships.
     const synthesisState = synthesizeHouseholdState({
+      location: householdLocation,
       urgentForPrompt,
       nearForPrompt,
       conflicts,
