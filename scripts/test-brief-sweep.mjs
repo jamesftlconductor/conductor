@@ -25,7 +25,66 @@ const WEATHER_CLOSER_RE = /\b(clear skies( today| ahead)?|otherwise quiet weathe
 
 const POSITIVE_HEALTH_RE = /\b(your body (?:feels?|is|'s) strong|feeling strong|energy is good|in a strong window|strong recovery|recovery looks solid|good timing energy-wise|you're in a strong window)\b/gi;
 
-function check(text) {
+const HORIZON_CLOSER_RE = /\b(worth watching|on the radar|conductor has its eye on this|watching for it|we'?ll flag it when it matters)\b/gi;
+const INLINE_DAYCOUNT_RE = /\bin\s+(\d+)\s+(day|days|week|weeks)\b/gi;
+const NEAR_KEYWORDS_RE = /\b(today|tomorrow|tonight|this (?:morning|afternoon|evening|week|weekend))\b/gi;
+const MONTH_DAY_RE = /\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sept?\.?|Oct\.?|Nov\.?|Dec\.?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/gi;
+
+function daysFromToday(monthStr, dayStr, today) {
+  const cleanMonth = monthStr.replace(/\.$/, "");
+  const day = parseInt(dayStr, 10);
+  if (isNaN(day)) return null;
+  const year = today.getFullYear();
+  const thisYear = new Date(`${cleanMonth} ${day}, ${year}`);
+  if (isNaN(thisYear.getTime())) return null;
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const startOfThisYear = new Date(thisYear.getFullYear(), thisYear.getMonth(), thisYear.getDate());
+  const diff = Math.round((startOfThisYear.getTime() - startOfToday.getTime()) / 86400000);
+  if (diff < -180) {
+    const nextYear = new Date(`${cleanMonth} ${day}, ${year + 1}`);
+    if (isNaN(nextYear.getTime())) return diff;
+    const startOfNextYear = new Date(nextYear.getFullYear(), nextYear.getMonth(), nextYear.getDate());
+    return Math.round((startOfNextYear.getTime() - startOfToday.getTime()) / 86400000);
+  }
+  return diff;
+}
+
+function horizonNearViolations(brief, today) {
+  if (!brief) return [];
+  const out = [];
+  const sentences = brief.split(/(?<=[.!?])\s+/);
+  for (const sentence of sentences) {
+    HORIZON_CLOSER_RE.lastIndex = 0;
+    const closer = HORIZON_CLOSER_RE.exec(sentence);
+    if (!closer) continue;
+
+    let evidence = null;
+    INLINE_DAYCOUNT_RE.lastIndex = 0;
+    let dc;
+    while ((dc = INLINE_DAYCOUNT_RE.exec(sentence)) !== null) {
+      const n = parseInt(dc[1], 10);
+      const days = dc[2].toLowerCase().startsWith("week") ? n * 7 : n;
+      if (days <= 14) { evidence = dc[0]; break; }
+    }
+    if (!evidence) {
+      NEAR_KEYWORDS_RE.lastIndex = 0;
+      const nk = NEAR_KEYWORDS_RE.exec(sentence);
+      if (nk) evidence = nk[0];
+    }
+    if (!evidence) {
+      MONTH_DAY_RE.lastIndex = 0;
+      let md;
+      while ((md = MONTH_DAY_RE.exec(sentence)) !== null) {
+        const days = daysFromToday(md[1], md[2], today);
+        if (days != null && days >= 0 && days <= 14) { evidence = md[0]; break; }
+      }
+    }
+    if (evidence) out.push(`${closer[1]} → ${evidence}`);
+  }
+  return out;
+}
+
+function check(text, today = new Date()) {
   WINDOW_PHRASE_RE.lastIndex = 0;
   GAP_PHRASE_RE.lastIndex = 0;
   WEATHER_CLOSER_RE.lastIndex = 0;
@@ -34,6 +93,7 @@ function check(text) {
   if (GAP_PHRASE_RE.test(text)) return "gap";
   if (WEATHER_CLOSER_RE.test(text)) return "weather";
   if (POSITIVE_HEALTH_RE.test(text)) return "health";
+  if (horizonNearViolations(text, today).length > 0) return "horizon_near";
   return "CLEAN";
 }
 
@@ -64,11 +124,25 @@ const cases = [
   ["The Google Home renewal follows on Thursday, May 28", "CLEAN"],
   ["Mia's field trip to Discovery Museum is tomorrow", "CLEAN"],
   ["renewing in 5 days", "CLEAN"],
+
+  // Horizon-closer eligibility — must match (near-window date with closer)
+  ["The Google Home renewal is on the radar due Thursday, May 28.", "horizon_near"],
+  ["The renewal is on the radar in 11 days.", "horizon_near"],
+  ["The renewal is on the radar tomorrow.", "horizon_near"],
+  ["The renewal is on the radar in 2 weeks.", "horizon_near"],
+  ["Worth watching: the appointment in 5 days.", "horizon_near"],
+  // Horizon-closer eligibility — must stay CLEAN when >14 days
+  ["The Paris trip in 30 days is worth watching.", "CLEAN"],
+  ["Conductor has its eye on the renewal in 95 days.", "CLEAN"],
+  ["Worth watching: the September registration deadline.", "CLEAN"],
 ];
+
+// Use a fixed reference date so month/day tests don't drift across days.
+const TODAY = new Date("2026-05-17T12:00:00");
 
 let pass = 0, fail = 0;
 for (const [text, expected] of cases) {
-  const got = check(text);
+  const got = check(text, TODAY);
   const ok = got === expected;
   if (ok) pass++; else fail++;
   const mark = ok ? "PASS" : "FAIL";

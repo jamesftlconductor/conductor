@@ -1116,6 +1116,103 @@ const GAP_PHRASE_RE = new RegExp(
 // bearing context for a specific signal.
 const WEATHER_CLOSER_RE = /\b(clear skies( today| ahead)?|otherwise quiet weather|nothing weather-related|the weather'?s calm|the day is clear and warm|with the nice weather|given the calm forecast|weather looks fine)\b/gi;
 
+// Approved horizon-closer phrases. Eligibility rule: ONLY when attached to
+// a signal >14 days out. We don't ban the phrase itself; we ban its use on
+// a near-window signal. The eligibility check parses the surrounding
+// sentence for a day-count or date.
+const HORIZON_CLOSER_RE = /\b(worth watching|on the radar|conductor has its eye on this|watching for it|we'?ll flag it when it matters)\b/gi;
+
+// Inline day-count: "in 11 days", "in 2 weeks", "in 1 day". Either bare or
+// wrapped in parentheses — both render correctly through this pattern
+// because \b sits at the (/)/digit boundary.
+const INLINE_DAYCOUNT_RE = /\bin\s+(\d+)\s+(day|days|week|weeks)\b/gi;
+
+// Near-keywords that imply within 14 days regardless of explicit dates.
+const NEAR_KEYWORDS_RE = /\b(today|tomorrow|tonight|this (?:morning|afternoon|evening|week|weekend))\b/gi;
+
+// Month + day-of-month date references. Catches "May 28", "Thursday, May 28",
+// "December 5th", etc. Day-of-week alone is not matched (insufficient signal).
+const MONTH_DAY_RE = /\b(January|February|March|April|May|June|July|August|September|October|November|December|Jan\.?|Feb\.?|Mar\.?|Apr\.?|Jun\.?|Jul\.?|Aug\.?|Sept?\.?|Oct\.?|Nov\.?|Dec\.?)\s+(\d{1,2})(?:st|nd|rd|th)?\b/gi;
+
+// Returns the days-from-today for a {monthName, day} pair. Resolves
+// year ambiguity by picking whichever interpretation (current or next
+// calendar year) is closer to today — prevents "Jan 5" from being read
+// as last January when written in December.
+function daysFromToday(monthStr, dayStr, today = new Date()) {
+  const cleanMonth = monthStr.replace(/\.$/, "");
+  const day = parseInt(dayStr, 10);
+  if (isNaN(day)) return null;
+  const year = today.getFullYear();
+  const thisYear = new Date(`${cleanMonth} ${day}, ${year}`);
+  if (isNaN(thisYear.getTime())) return null;
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const startOfThisYear = new Date(thisYear.getFullYear(), thisYear.getMonth(), thisYear.getDate());
+  const diff = Math.round((startOfThisYear.getTime() - startOfToday.getTime()) / 86400000);
+  // If more than ~180 days in the past, the writer probably means next year.
+  if (diff < -180) {
+    const nextYear = new Date(`${cleanMonth} ${day}, ${year + 1}`);
+    if (isNaN(nextYear.getTime())) return diff;
+    const startOfNextYear = new Date(nextYear.getFullYear(), nextYear.getMonth(), nextYear.getDate());
+    return Math.round((startOfNextYear.getTime() - startOfToday.getTime()) / 86400000);
+  }
+  return diff;
+}
+
+// Per-sentence eligibility check for horizon closers. Walks each sentence
+// that contains a closer phrase, looking for any of:
+//   1. Inline day-count <=14 ("in 11 days")
+//   2. Near-keyword ("today", "tomorrow", "this week", etc.)
+//   3. A parsed Month+Day date <=14 days from today
+// First near-window indicator wins; the closer phrase is flagged with the
+// specific evidence so the retry prompt can target the rewrite.
+function checkHorizonCloserNearWindow(brief, today = new Date()) {
+  if (!brief) return [];
+  const violations = [];
+  const sentences = brief.split(/(?<=[.!?])\s+/);
+  for (const sentence of sentences) {
+    HORIZON_CLOSER_RE.lastIndex = 0;
+    const closerMatch = HORIZON_CLOSER_RE.exec(sentence);
+    if (!closerMatch) continue;
+
+    let evidence = null;
+
+    INLINE_DAYCOUNT_RE.lastIndex = 0;
+    let dc;
+    while ((dc = INLINE_DAYCOUNT_RE.exec(sentence)) !== null) {
+      const n = parseInt(dc[1], 10);
+      const unit = dc[2].toLowerCase();
+      const days = unit.startsWith("week") ? n * 7 : n;
+      if (days <= 14) {
+        evidence = `"${dc[0]}" (${days}d)`;
+        break;
+      }
+    }
+
+    if (!evidence) {
+      NEAR_KEYWORDS_RE.lastIndex = 0;
+      const nk = NEAR_KEYWORDS_RE.exec(sentence);
+      if (nk) evidence = `"${nk[0]}"`;
+    }
+
+    if (!evidence) {
+      MONTH_DAY_RE.lastIndex = 0;
+      let md;
+      while ((md = MONTH_DAY_RE.exec(sentence)) !== null) {
+        const days = daysFromToday(md[1], md[2], today);
+        if (days != null && days >= 0 && days <= 14) {
+          evidence = `"${md[0]}" (${days}d)`;
+          break;
+        }
+      }
+    }
+
+    if (evidence) {
+      violations.push(`"${closerMatch[1]}" → ${evidence}`);
+    }
+  }
+  return violations;
+}
+
 // Banned positive-health framings — verbatim from the strict health rule.
 // The brief stays silent on normal/strong health; only deficits surface.
 const POSITIVE_HEALTH_RE = /\b(your body (?:feels?|is|'s) strong|feeling strong|energy is good|in a strong window|strong recovery|recovery looks solid|good timing energy-wise|you're in a strong window)\b/gi;
@@ -1146,6 +1243,11 @@ function sweepBriefForViolations(brief) {
     if (m && m.length > 0) {
       violations.push({ rule, matches: dedupeCi(m) });
     }
+  }
+  // Horizon-closer eligibility — context-aware, not a single regex.
+  const horizonMisuse = checkHorizonCloserNearWindow(brief);
+  if (horizonMisuse.length > 0) {
+    violations.push({ rule: "horizon_closer_near_window", matches: horizonMisuse });
   }
   return violations;
 }
