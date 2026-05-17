@@ -1,6 +1,6 @@
 import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
-import { loadCamouflageRules, applyCamouflage } from "./signals.js";
+import { loadCamouflageRules, applyCamouflage, loadRecentCaughtMoments } from "./signals.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -424,6 +424,18 @@ async function generateWeekInReview(householdId) {
     // the paragraph would be hollow; the section quietly stays absent.
     if (rested === 0 && lapsed === 0 && carriedForward === 0) return null;
 
+    // Caught moments — pick the single most-significant one of the
+    // week (smallest daysBeforeExpiry = closest call). One mention max
+    // in the Week in Review so the paragraph doesn't read like a
+    // highlight reel.
+    const recentCaughtMoments = await loadRecentCaughtMoments(householdId, 7);
+    let topCaught = null;
+    if (recentCaughtMoments.length > 0) {
+      topCaught = recentCaughtMoments
+        .slice()
+        .sort((a, b) => (a.daysBeforeExpiry ?? 99) - (b.daysBeforeExpiry ?? 99))[0];
+    }
+
     const prompt = `Write a warm, honest one-paragraph Week in Review for this household. Cover:
 - How many signals were handled this week (${rested} rested, ${carriedForward} carried forward, ${lapsed} lapsed)
 - Any deadlines caught before they slipped (${deadlinesCaught} deadlines caught this week)
@@ -432,6 +444,7 @@ async function generateWeekInReview(householdId) {
 - If the week was genuinely good: acknowledge it warmly
 - If the week was hard: acknowledge it without judgment
 - If there's something funny or ironic about the week: let it land with a light touch
+${topCaught ? `- Most significant caught moment this week: "${topCaught.description}"${topCaught.sender ? ` from ${topCaught.sender}` : ""} — handled with ${topCaught.daysBeforeExpiry} day(s) to spare. Include this as one warm sentence in the review.` : ""}
 
 Rules: warm but not effusive. Honest. Maximum 4 sentences. Never clinical. This should feel like something worth reading. Plain text, no markdown. Never quote the raw numbers as bare digits in a clinical way ("${rested} signals rested this week" is fine; "${rested}/${rested + carriedForward + lapsed} resolution rate" is not). Refer to the household in second person — "you" / "your".`;
 
@@ -736,6 +749,23 @@ export default async function handler(req, res) {
       })
       .join("\n");
 
+    // Caught moments — last 7 days of close-call resolutions. Formatted
+    // for the prompt; if any are within 72h of the deadline AND happened
+    // within today, the clearance brief acknowledges them warmly at the
+    // end. Conservative format so the model has the specifics but isn't
+    // tempted to embellish.
+    const recentCaughtMoments = await loadRecentCaughtMoments(householdId, 7);
+    const caughtMomentsSummary = recentCaughtMoments.length > 0
+      ? recentCaughtMoments
+          .map((cm) => {
+            const dayBeforeStr = cm.daysBeforeExpiry === 0
+              ? "same day"
+              : `${cm.daysBeforeExpiry}d before deadline`;
+            return `- ${cm.description}${cm.sender ? ` (${cm.sender})` : ""} — ${dayBeforeStr}, resolved ${cm.resolvedAt}`;
+          })
+          .join("\n")
+      : "None";
+
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -779,6 +809,9 @@ ${lastChanceSummary || "None"}
 On the household calendar tomorrow:
 ${tomorrowSummary || "None"}
 
+CAUGHT MOMENTS THIS WEEK (acknowledge warmly at end of clearance if a genuinely close call resolved today, maximum 1 sentence):
+${caughtMomentsSummary}
+
 FEEDBACK HISTORY: Takeoff thumbs up: ${
         (rawFeedbackStats && rawFeedbackStats.takeoff_up) || 0
       }, thumbs down: ${
@@ -809,6 +842,7 @@ ${isSingleMember
 - Never say you are looking for signals, watching for signals, or running sweeps
 - Never use the words: alert, monitor, scan, detect, pipeline, sweep, system, tracking
 - Simply say what you know. Never explain how you know it.
+- Caught moments: when the CAUGHT MOMENTS THIS WEEK section is non-empty AND a moment's resolvedAt is today, add at most ONE warm closing sentence acknowledging the close call. Example: "Conductor caught the Health Tech Nerds renewal before it lapsed — handled with 2 days to spare." Only mention if genuinely close (within 72 hours of deadline). Never manufactured — if today's moments are >72h from any deadline, omit. Warm, not boastful. Single sentence, never plural.
 - When mentioning a signal more than 14 days out, end that sentence with EXACTLY ONE of these approved phrases — no variations, no additions, no suffixes:
    * "worth watching"
    * "Conductor has its eye on this"

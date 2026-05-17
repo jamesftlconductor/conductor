@@ -39,6 +39,86 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // in its prior state before being acted on" — callers in PATCH must capture
 // the previous value before bumping lastUpdate; the auto-expire path can
 // pass the signal as-is since applyDefaultsAndExpiry doesn't touch it.
+// ---------- caught moments ----------
+//
+// When a signal/deadline is Rested close to its ETA/renewal, log a
+// "caught moment" — these surface warmly at the end of the clearance
+// brief and in the Sunday Week in Review. Three criteria:
+//   - Vault item handled within 72h of renewalDate
+//   - Signal rested within 48h of its ETA (in either direction —
+//     pre-deadline catch or just-past-deadline catch)
+//   - Conflict resolved (skipped in v1; needs pair tracking)
+const CAUGHT_MOMENTS_KEY_SUFFIX = ":caughtMoments";
+const CAUGHT_MOMENTS_CAP = 100;
+
+function detectCaughtMoment(item, opts = {}) {
+  // opts.kind: "signal" | "deadline" | "vault"
+  // Returns { type, daysBeforeExpiry } when criterion matches, else null.
+  if (!item) return null;
+  const now = Date.now();
+  const HOURS_72 = 72 * 60 * 60 * 1000;
+  const HOURS_48 = 48 * 60 * 60 * 1000;
+
+  if (opts.kind === "vault") {
+    const renewalMs = item.renewalDate ? Date.parse(item.renewalDate) : NaN;
+    if (isNaN(renewalMs)) return null;
+    const delta = renewalMs - now;
+    // Within 72h ahead of or 24h past renewal counts as a close call.
+    if (delta > -24 * 60 * 60 * 1000 && delta < HOURS_72) {
+      const daysBefore = Math.max(0, Math.round(delta / (24 * 60 * 60 * 1000)));
+      return { type: "deadline_close_call", daysBeforeExpiry: daysBefore };
+    }
+    return null;
+  }
+
+  // signal or deadline — look at ETA
+  const etaMs = item.eta ? Date.parse(item.eta) : NaN;
+  if (isNaN(etaMs)) return null;
+  const delta = etaMs - now;
+  if (Math.abs(delta) > HOURS_48) return null;
+  // Type tag: vault-deadline items typed "deadline" carry close-call;
+  // delivery/package types are "last-minute" framings.
+  const cmType =
+    item.type === "deadline" ? "deadline_close_call"
+    : (item.type === "delivery" || item.type === "package") ? "delivery_last_minute"
+    : "deadline_close_call";
+  const daysBefore = Math.max(0, Math.round(delta / (24 * 60 * 60 * 1000)));
+  return { type: cmType, daysBeforeExpiry: daysBefore };
+}
+
+async function recordCaughtMoment(householdId, item, criterion, userId) {
+  const key = `household:${householdId}${CAUGHT_MOMENTS_KEY_SUFFIX}`;
+  const record = {
+    id: Date.now(),
+    type: criterion.type,
+    description: item.description || "Unknown",
+    sender: item.sender || item.provider || null,
+    resolvedAt: new Date().toISOString(),
+    daysBeforeExpiry: criterion.daysBeforeExpiry,
+    userId: userId || null,
+  };
+  await redis.lpush(key, JSON.stringify(record));
+  await redis.ltrim(key, 0, CAUGHT_MOMENTS_CAP - 1);
+  console.log(
+    `[caught] ${criterion.type}: ${record.description} (${record.daysBeforeExpiry}d before)`
+  );
+}
+
+// Export for clearance.js to read the last-7-days slice.
+export async function loadRecentCaughtMoments(householdId, days = 7) {
+  const raw = await redis.lrange(`household:${householdId}${CAUGHT_MOMENTS_KEY_SUFFIX}`, 0, -1);
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+  const out = [];
+  for (const r of raw || []) {
+    try {
+      const parsed = JSON.parse(r);
+      const ms = parsed.resolvedAt ? Date.parse(parsed.resolvedAt) : NaN;
+      if (!isNaN(ms) && ms >= cutoff) out.push(parsed);
+    } catch { /* skip */ }
+  }
+  return out;
+}
+
 async function writeMemoryEntry(householdId, signal, action, userId) {
   let daysInSystem = null;
   if (signal && signal.lastUpdate) {
@@ -404,6 +484,11 @@ async function handleVault(req, res) {
         items[index].handled = true;
         items[index].handledAt = Date.now();
         await redis.lset(key, index, JSON.stringify(items[index]));
+        // Caught moment — vault items handled within 72h of their
+        // renewalDate. Same warm-acknowledgment surface as PATCH-side
+        // signal/deadline resolution.
+        const criterion = detectCaughtMoment(items[index], { kind: "vault" });
+        if (criterion) await recordCaughtMoment(householdId, items[index], criterion, req.body?.userId);
         return res.status(200).json({ ok: true, item: items[index] });
       }
 
@@ -1402,6 +1487,12 @@ export default async function handler(req, res) {
           const action = state === "resolved" ? "resolved" : "held";
           const memorySignal = { ...signals[index], lastUpdate: previousLastUpdate };
           await writeMemoryEntry(householdId, memorySignal, action, userId);
+          // Caught moment — only on resolved transitions; close-call to
+          // the signal's ETA.
+          if (state === "resolved") {
+            const criterion = detectCaughtMoment(signals[index], { kind: "signal" });
+            if (criterion) await recordCaughtMoment(householdId, signals[index], criterion, userId);
+          }
         }
         return res.status(200).json({ household: householdId, signal: signals[index] });
       }
@@ -1438,6 +1529,12 @@ export default async function handler(req, res) {
           type: deadlines[index].type || "deadline",
         };
         await writeMemoryEntry(householdId, memorySignal, action, userId);
+        // Caught moment — deadline items on resolved transition.
+        if (state === "resolved") {
+          const item = { ...deadlines[index], type: deadlines[index].type || "deadline" };
+          const criterion = detectCaughtMoment(item, { kind: "deadline" });
+          if (criterion) await recordCaughtMoment(householdId, item, criterion, userId);
+        }
       }
       return res.status(200).json({ household: householdId, signal: deadlines[index] });
     }
