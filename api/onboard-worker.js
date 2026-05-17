@@ -128,6 +128,175 @@ async function maybeFinalize(householdId) {
       horizonSignal: jobs.horizon?.selected || null,
     }),
   });
+
+  // Compile the reveal payload — what the mobile reveal screen shows
+  // when the user lands back in-app after onboarding completes.
+  // Reads from actual data sources rather than from job-summary
+  // numbers, since the numbers tell us "how many were found" but the
+  // reveal needs concrete items to name. Best-effort; failures don't
+  // block finalization.
+  try {
+    const reveal = await buildOnboardReveal(householdId);
+    if (reveal) {
+      const TTL = 48 * 60 * 60;
+      await redis.set(`household:${householdId}:onboardReveal`, JSON.stringify(reveal), {
+        ex: TTL,
+      });
+      console.log(`[onboard] reveal compiled for ${householdId}`);
+    }
+  } catch (err) {
+    console.warn(`[onboard] reveal compile failed for ${householdId}:`, err?.message || err);
+  }
+}
+
+// Build the post-onboard reveal payload from the data the jobs have
+// just written. The reveal is concrete — it lists 3 most-urgent
+// signals, 2 upcoming birthdays, crew first names, and a few highlight
+// phrases like "Found your home insurance" or "5 service providers".
+// Stored at household:{id}:onboardReveal with 48h TTL so the mobile
+// app has a window to fetch and animate it before it ages out.
+async function buildOnboardReveal(householdId) {
+  const [
+    rawSignals,
+    rawVault,
+    rawCrew,
+    rawCalendar,
+    rawProviders,
+    rawHorizon,
+  ] = await Promise.all([
+    redis.lrange(`household:${householdId}:signals`, 0, -1).catch(() => []),
+    redis.lrange(`household:${householdId}:vault`, 0, -1).catch(() => []),
+    redis.get(`household:${householdId}:crew`).catch(() => null),
+    redis.get(`household:${householdId}:calendar`).catch(() => null),
+    redis.lrange(`household:${householdId}:providers`, 0, -1).catch(() => []),
+    redis.get(`household:${householdId}:horizon`).catch(() => null),
+  ]);
+
+  const signals = (rawSignals || []).map(safeJson).filter(Boolean);
+  const vault = (rawVault || []).map(safeJson).filter(Boolean);
+  const crewData = safeJson(rawCrew) || {};
+  const crew = [...(crewData.children || []), ...(crewData.pets || [])];
+  const calendar = (() => {
+    const c = safeJson(rawCalendar);
+    if (Array.isArray(c)) return c;
+    if (c && Array.isArray(c.events)) return c.events;
+    return [];
+  })();
+  const providers = (rawProviders || []).map(safeJson).filter(Boolean);
+  const horizon = safeJson(rawHorizon);
+
+  const now = Date.now();
+  const SEVEN_DAYS = 7 * DAY_MS;
+  const FOURTEEN_DAYS = 14 * DAY_MS;
+
+  const active = signals.filter(
+    (s) => !s.state || s.state === "incoming" || s.state === "active"
+  );
+
+  // Top three signals by ETA proximity (sooner = more urgent), filtered
+  // to those within 14 days. Ignores no-ETA items — the reveal wants
+  // concrete time-bound things.
+  const upcoming = active
+    .filter((s) => s.eta && !isNaN(Date.parse(s.eta)))
+    .filter((s) => Date.parse(s.eta) - now < FOURTEEN_DAYS && Date.parse(s.eta) > now - DAY_MS)
+    .sort((a, b) => Date.parse(a.eta) - Date.parse(b.eta));
+
+  const upcomingDeadlines = upcoming.slice(0, 3).map((s) => ({
+    description: s.description,
+    eta: s.eta,
+    sender: s.sender || null,
+  }));
+
+  const mostUrgent = upcoming[0]
+    ? { description: upcoming[0].description, eta: upcoming[0].eta }
+    : null;
+
+  // Birthdays from crew layer — anniversary entries within 14 days
+  // are also surfaced. The crew schema stores DOB on children/pets and
+  // anniversaries are optional on either.
+  const birthdays = [];
+  for (const member of crew) {
+    const candidates = [
+      { kind: "birthday", date: member.dob || member.birthday, name: member.name },
+      { kind: "anniversary", date: member.anniversary, name: member.name },
+    ];
+    for (const c of candidates) {
+      if (!c.date || !c.name) continue;
+      // dob is typically YYYY-MM-DD; compute next occurrence.
+      const m = String(c.date).match(/(\d{4})-(\d{2})-(\d{2})/);
+      if (!m) continue;
+      const month = parseInt(m[2], 10) - 1;
+      const day = parseInt(m[3], 10);
+      const year = new Date().getFullYear();
+      let nextMs = new Date(year, month, day).getTime();
+      if (nextMs < now - DAY_MS) nextMs = new Date(year + 1, month, day).getTime();
+      if (nextMs - now < FOURTEEN_DAYS) {
+        birthdays.push({ name: c.name, kind: c.kind, when: new Date(nextMs).toISOString() });
+      }
+    }
+  }
+  birthdays.sort((a, b) => Date.parse(a.when) - Date.parse(b.when));
+
+  // Highlights — short lift-able phrases. Each only added if the
+  // underlying data is non-trivial. The mobile reveal screen renders
+  // them sequentially with a delay between each.
+  const highlights = [];
+  const vaultCategories = new Set();
+  for (const v of vault) {
+    if (v.category) vaultCategories.add(v.category);
+    if (v.type) vaultCategories.add(v.type);
+  }
+  if (vaultCategories.has("insurance") || vaultCategories.has("home_insurance")) {
+    highlights.push("Found your home insurance policy");
+  }
+  if (vaultCategories.has("auto_insurance")) {
+    highlights.push("Found your auto insurance");
+  }
+  if (vault.length >= 3) {
+    highlights.push(`${vault.length} vault items pulled together`);
+  }
+  if (providers.length > 0) {
+    highlights.push(
+      `${providers.length} service provider${providers.length === 1 ? "" : "s"} recognised`
+    );
+  }
+  if (crewData.children && crewData.children.length > 0) {
+    const names = crewData.children.map((c) => c.name).filter(Boolean);
+    if (names.length > 0) {
+      highlights.push(
+        names.length === 1
+          ? `Picked up on ${names[0]}`
+          : `Picked up on ${names.slice(0, -1).join(", ")} and ${names.slice(-1)}`
+      );
+    }
+  }
+  if (crewData.pets && crewData.pets.length > 0) {
+    const names = crewData.pets.map((p) => p.name).filter(Boolean);
+    if (names.length > 0) {
+      highlights.push(
+        names.length === 1
+          ? `Met ${names[0]} too`
+          : `Met ${names.slice(0, -1).join(", ")} and ${names.slice(-1)}`
+      );
+    }
+  }
+  if (horizon && (horizon.description || horizon.summary)) {
+    highlights.push("Surfaced one quiet item on the horizon");
+  }
+
+  return {
+    compiledAt: new Date().toISOString(),
+    signalsFound: signals.length,
+    activeSignals: active.length,
+    vaultItemsFound: vault.length,
+    crewMembersFound: crew.length,
+    calendarEventsFound: calendar.length,
+    providersFound: providers.length,
+    upcomingDeadlines,
+    mostUrgent,
+    birthdaysFound: birthdays.slice(0, 3),
+    highlights,
+  };
 }
 
 // Enqueue a single job. Mirrors the fan-out logic in api/onboard.js: prefer

@@ -71,11 +71,18 @@ async function readStatus(householdId) {
 export const config = { maxDuration: 30 };
 
 export default async function handler(req, res) {
-  // Status poll
+  // Status poll OR reveal fetch
   if (req.method === "GET") {
-    const { userId } = req.query;
+    const { userId, action } = req.query;
     if (!userId) return res.status(400).json({ error: "Missing userId" });
     const householdId = await resolveHouseholdId(userId);
+
+    if (action === "reveal") {
+      const raw = await redis.get(`household:${householdId}:onboardReveal`);
+      const reveal = safeJson(raw);
+      return res.status(200).json({ householdId, reveal });
+    }
+
     const status = await readStatus(householdId);
     return res.status(200).json({ householdId, status });
   }
