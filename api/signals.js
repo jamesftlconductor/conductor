@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
 import { detectOrLoadLocation, saveHouseholdLocation, loadHouseholdLocation } from "./location.js";
@@ -6,6 +7,41 @@ const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
+
+// Signed photo URLs — HMAC the (householdId, pathname, expiresAt)
+// tuple with a server-side secret. BLOB_READ_WRITE_TOKEN is a stable
+// per-store secret on Vercel; using it here means signatures are
+// only valid against the same Blob store that holds the photos.
+// Falls back to ANTHROPIC_API_KEY (also stable + Vercel-injected)
+// so dev environments without Blob can still smoke-test the path.
+const PHOTO_SIGNING_SECRET = () =>
+  process.env.BLOB_READ_WRITE_TOKEN ||
+  process.env.ANTHROPIC_API_KEY ||
+  "conductor-photo-secret";
+
+const PHOTO_TTL_MS = 60 * 60 * 1000;
+const PUBLIC_BASE = "https://conductor-ivory.vercel.app";
+
+function signPhotoToken(householdId, pathname, expiresAt) {
+  return crypto
+    .createHmac("sha256", PHOTO_SIGNING_SECRET())
+    .update(`${householdId}|${pathname}|${expiresAt}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+function signedPhotoUrl(householdId, pathname) {
+  const expiresAt = Date.now() + PHOTO_TTL_MS;
+  const sig = signPhotoToken(householdId, pathname, expiresAt);
+  const params = new URLSearchParams({
+    type: "crew-photo-fetch",
+    hid: householdId,
+    p: pathname,
+    e: String(expiresAt),
+    s: sig,
+  });
+  return `${PUBLIC_BASE}/api/signals?${params.toString()}`;
+}
 
 const VALID_STATES = ["incoming", "active", "resolved", "expired", "snoozed"];
 const DEFAULT_SNOOZE_MS = 24 * 60 * 60 * 1000;
@@ -339,6 +375,17 @@ async function handleCrew(req, res) {
         // malformed payload — return empty rather than 500
       }
     }
+    // Generate fresh signed photoUrls — 1-hour expiry, regenerated
+    // every GET so the mobile app gets a usable URL whenever it
+    // refreshes (focus, pull-to-refresh, etc.). Legacy public
+    // photoUrl values (from before the private-blob switch) are
+    // passed through untouched so older uploads still render.
+    crew = crew.map((m) => {
+      if (m && typeof m === "object" && m.photoBlobPathname) {
+        return { ...m, photoUrl: signedPhotoUrl(householdId, m.photoBlobPathname) };
+      }
+      return m;
+    });
     return res.status(200).json({ household: householdId, crew });
   }
 
@@ -1423,20 +1470,28 @@ export default async function handler(req, res) {
       const blobKey = `crew/${householdId}/${normalizedName}-${Date.now()}.jpg`;
       let putResult;
       try {
+        // Private blob — the returned URL requires the read token to
+        // fetch, so mobile can't use it directly. We store the
+        // pathname and serve a signed proxy URL via ?type=crew-photo-fetch
+        // (see signedPhotoUrl below). The Vercel Blob SDK does not
+        // currently expose a generateSignedUrl with expiresIn, so we
+        // implement HMAC-signed expiring URLs ourselves.
         putResult = await blobMod.put(blobKey, buffer, {
-          access: "public",
+          access: "private",
           contentType: "image/jpeg",
         });
       } catch (err) {
         console.error("[crew-photo] blob put failed:", err);
         return res.status(500).json({ error: "Photo upload failed", message: err?.message });
       }
-      const photoUrl = putResult?.url || null;
-      if (!photoUrl) return res.status(500).json({ error: "Blob returned no URL" });
+      const blobUrl = putResult?.url || null;
+      const pathname = putResult?.pathname || blobKey;
+      if (!blobUrl) return res.status(500).json({ error: "Blob returned no URL" });
 
-      // Patch the crew member record in place. Skip silently if no
-      // matching member exists yet — the photo is still uploaded and
-      // the caller can attach it on next sync.
+      // Patch the crew member record in place. We persist BOTH the
+      // raw blobUrl (server-side proxy fetches from this) and the
+      // pathname (used as the input to the HMAC signing). The
+      // photoUrl returned to clients is the signed proxy URL.
       try {
         const crewKey = `household:${householdId}:crew`;
         const rawCrew = await redis.get(crewKey);
@@ -1449,13 +1504,70 @@ export default async function handler(req, res) {
             (!memberType || m.memberType === memberType)
         );
         if (idx >= 0) {
-          crew[idx].photoUrl = photoUrl;
+          crew[idx].photoBlobUrl = blobUrl;
+          crew[idx].photoBlobPathname = pathname;
+          // Drop legacy public photoUrl if present — it's replaced
+          // by the signed proxy URL on subsequent GETs.
+          delete crew[idx].photoUrl;
           await redis.set(crewKey, JSON.stringify(crew));
         }
       } catch (err) {
         console.warn("[crew-photo] crew update failed:", err?.message);
       }
-      return res.status(200).json({ ok: true, household: householdId, photoUrl });
+      const signedUrl = signedPhotoUrl(householdId, pathname);
+      return res.status(200).json({ ok: true, household: householdId, photoUrl: signedUrl });
+    }
+
+    // Signed-URL proxy endpoint — validates HMAC + expiry, then
+    // streams the private blob bytes through with appropriate
+    // Content-Type. Token is a hex HMAC of (householdId + pathname +
+    // expiresAt) using BLOB_READ_WRITE_TOKEN as the secret. Anyone
+    // with a valid (un-expired) URL can fetch the photo — same
+    // semantics as cloud-provider signed URLs.
+    if (queryType === "crew-photo-fetch") {
+      const { hid, p: pathname, e: expiresAtStr, s: sig } = req.query || {};
+      if (!hid || !pathname || !expiresAtStr || !sig) {
+        return res.status(400).json({ error: "missing token params" });
+      }
+      const expiresAt = parseInt(String(expiresAtStr), 10);
+      if (!Number.isFinite(expiresAt)) return res.status(400).json({ error: "bad expiresAt" });
+      if (Date.now() > expiresAt) return res.status(410).json({ error: "URL expired" });
+      const expected = signPhotoToken(String(hid), String(pathname), expiresAt);
+      if (expected !== sig) return res.status(403).json({ error: "bad signature" });
+      // Resolve the blob to its current URL via head() — the URL is
+      // stable but head() also gives us the contentType.
+      let blobMod;
+      try {
+        blobMod = await import("@vercel/blob");
+      } catch (err) {
+        return res.status(500).json({ error: "Blob unavailable", message: err?.message });
+      }
+      let meta;
+      try {
+        meta = await blobMod.head(String(pathname));
+      } catch (err) {
+        console.error("[crew-photo-fetch] head failed:", err);
+        return res.status(404).json({ error: "blob not found" });
+      }
+      // For private blobs, fetching the URL server-side requires the
+      // token in the Authorization header. The SDK exposes the token
+      // via BLOB_READ_WRITE_TOKEN env (auto-injected on Vercel).
+      const token = process.env.BLOB_READ_WRITE_TOKEN;
+      let blobRes;
+      try {
+        blobRes = await fetch(meta.url, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+      } catch (err) {
+        return res.status(502).json({ error: "blob fetch failed", message: err?.message });
+      }
+      if (!blobRes.ok) {
+        return res.status(blobRes.status).json({ error: "blob fetch non-2xx" });
+      }
+      const arrayBuf = await blobRes.arrayBuffer();
+      res.setHeader("Content-Type", meta.contentType || "image/jpeg");
+      res.setHeader("Cache-Control", "private, max-age=3600");
+      return res.status(200).send(Buffer.from(arrayBuf));
     }
 
     // Crew attribution — record that a signal belongs to a specific
