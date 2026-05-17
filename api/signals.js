@@ -7,7 +7,8 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-const VALID_STATES = ["incoming", "active", "resolved", "expired"];
+const VALID_STATES = ["incoming", "active", "resolved", "expired", "snoozed"];
+const DEFAULT_SNOOZE_MS = 24 * 60 * 60 * 1000;
 const EXPIRY_MS = 24 * 60 * 60 * 1000;
 
 async function resolveHouseholdId(userId) {
@@ -900,6 +901,17 @@ function applyDefaultsAndExpiry(signal) {
   const wasIncoming = !signal.state || signal.state === "incoming";
   if (!signal.state) signal.state = "incoming";
 
+  // Snooze auto-rehydrate: when snoozedUntil has passed, flip state
+  // back to active so the signal re-enters brief pools naturally.
+  // Snooze is a temporary mute, not a lifecycle terminus.
+  if (signal.state === "snoozed" && signal.snoozedUntil) {
+    const untilMs = Date.parse(signal.snoozedUntil);
+    if (!isNaN(untilMs) && untilMs < Date.now()) {
+      signal.state = "active";
+      delete signal.snoozedUntil;
+    }
+  }
+
   let expiryReason = null;
 
   if (signal.state !== "resolved" && signal.state !== "expired" && signal.eta) {
@@ -1602,6 +1614,18 @@ export default async function handler(req, res) {
         applyEditFields(signals[index]);
         if (stateProvided) {
           signals[index].state = state;
+          if (state === "snoozed") {
+            // Default snooze window is 24h; client may override via
+            // explicit snoozedUntil in the request body.
+            const override = req.body?.snoozedUntil;
+            signals[index].snoozedUntil =
+              typeof override === "string" && override.length > 0
+                ? override
+                : new Date(Date.now() + DEFAULT_SNOOZE_MS).toISOString();
+          } else if (state !== "snoozed") {
+            // Transition out of snoozed clears the timestamp.
+            delete signals[index].snoozedUntil;
+          }
         }
         signals[index].lastUpdate = new Date().toLocaleString();
         if (typeof notedAt === "string" && notedAt.length > 0) {
