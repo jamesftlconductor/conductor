@@ -55,7 +55,7 @@ to manage anything. No one has homework.
 | Routing | Vercel serverless functions in `api/` |
 | Build artefact | `vite build` for the legacy admin UI |
 | Storage | Upstash Redis (REST API) |
-| Queue | Upstash QStash (used for the onboarding fan-out only) |
+| Queue | Upstash QStash (used for the onboarding fan-out) |
 | LLM | Anthropic API, `claude-haiku-4-5-20251001` |
 | Auth | Google OAuth (Gmail + Calendar read scopes) |
 | Push fan-out | Expo Push API (`https://exp.host/--/api/v2/push/send`) |
@@ -72,6 +72,7 @@ everything goes through `@upstash/redis` directly.
 | Routing | `expo-router` (file-system based) |
 | State persistence | `@react-native-async-storage/async-storage` |
 | Notifications | `expo-notifications` (Expo push tokens) |
+| OTA updates | `expo-updates` ^29.0.17 (EAS Update, `preview` channel) |
 | HealthKit | `@kingstinct/react-native-healthkit` v14 (Nitro Modules) |
 | Gestures | `react-native-gesture-handler` |
 | Animation | `react-native-reanimated` |
@@ -98,27 +99,30 @@ per-person data, `household:` for shared state.
 | Key | Type | Purpose |
 |---|---|---|
 | `user:{userId}:tokens` | string (JSON) | Google OAuth access + refresh tokens, expiry |
-| `user:{userId}:profile` | string (JSON) | Email, name, picture, connectedAt |
+| `user:{userId}:profile` | string (JSON) | Email, name, picture, connectedAt, **`birthday` (MM-DD)**, **`anniversary` (MM-DD)** |
 | `user:{userId}:household` | string | Household ID this user belongs to (default = userId itself) |
-| `user:{userId}:preferences` | string (JSON) | Settings-screen toggles, also diagnostic markers via shallow-merge |
+| `user:{userId}:preferences` | string (JSON) | Settings-screen toggles. Notable fields: `workCalendarName` (free-text calendar label), `flaggedCategories`, `horizonEnabled`, `horizonFrequency`, `healthContextEnabled` |
 | `user:{userId}:expoPushToken` | string | Most recent Expo push token from the device |
 | `user:{userId}:health` | string (JSON) | Latest HealthKit snapshot (sleep / HRV / steps / etc.) |
+| `user:{userId}:calendar` | string (JSON) | Per-user classified calendar events (merged at read time via `api/calendar-loader.js`) |
+| `user:{userId}:currentTakeoff` | string (JSON) | Cached takeoff brief response; ensures push body matches what the user sees in-app |
+| `user:{userId}:currentClearance` | string (JSON) | Same, for clearance |
 | `user:{userId}:lastNotification` | string (timestamp) | Last successful push delivery |
 
 `userId` is derived as `email.replace(/[@.]/g, "_")` in `callback.js` —
-e.g. `james_totalhome_gmail_com`. Emails are case-sensitive in Redis but
-Google normalizes to lowercase before issuing tokens, so collisions in
-practice are nil.
+e.g. `james_totalhome_gmail_com`.
 
 #### Per-household keys
 
 | Key | Type | Purpose | TTL |
 |---|---|---|---|
 | `household:{id}:signals` | LIST | Active signal records (LPUSH on import) | none |
-| `household:{id}:calendar` | string (JSON) | Cached classified calendar events | 24h |
+| `household:{id}:calendar` | string (JSON) | **Legacy** single-driver classified events; per-user keys are now primary | 24h |
 | `household:{id}:calendarLastSync` | string (timestamp) | Drives the per-household 23h calendar sync skip | none |
 | `household:{id}:deadlines` | LIST | Document deadlines harvested during onboarding | none |
-| `household:{id}:horizon` | string (JSON) | Current "horizon signal" pick + timestamp | none (7d freshness check) |
+| `household:{id}:vault` | LIST | Recurring obligations (subscriptions, registrations, insurance, leases, warranties, medical, memberships) — populated by Job 1 email-sweep + Job 3 five-pass vault sweep | none |
+| `household:{id}:crew` | string (JSON) | Children + pets + household-member records (each `{memberType, userId?, firstName, fullName, picture?, birthday?, anniversary?, …}`) | none |
+| `household:{id}:horizon` | string (JSON) | Current horizon signal pick + timestamp | none (7d freshness check) |
 | `household:{id}:briefed` | LIST | All signal IDs ever surfaced as horizon | none |
 | `household:{id}:briefedToday` | HASH | `{signalId → {status, state, ring}}` — mute lookup for repeated narration | 20h |
 | `household:{id}:morningBriefed` | HASH | Same shape, written by brief.js only | 26h |
@@ -127,256 +131,306 @@ practice are nil.
 | `household:{id}:briefedThisWeek` | SET | Horizon-awareness picks already used | 6d |
 | `household:{id}:memory` | LIST | Lifecycle memory log; trimmed to last 500 entries | none |
 | `household:{id}:importedMessages` | SET | Gmail messageIds dedup | none |
-| `household:{id}:contentFingerprints` | SET | Content-hash dedup (legacy + same-content-different-message catch) | none |
-| `household:{id}:members` | SET | Household members. Currently only invitees written (the inviter's membership is implied by `user:{id}:household`) | none |
-| `household:{id}:health` | string (JSON) | **Deprecated.** Old household-scoped health key — `user:{id}:health` is the source of truth |
-| `household:{id}:firstRun` | string ("true"/"false") | First-brief flag, drives the abbreviated firstRunRules path |
+| `household:{id}:contentFingerprints` | SET | Content-hash dedup | none |
+| `household:{id}:members` | SET | Household members. Currently only invitees written | none |
+| `household:{id}:firstRun` | string ("true"/"false") | First-brief flag, drives the abbreviated firstRunRules path | none |
+| `household:{id}:feedback` | LIST | Per-brief thumbs feedback entries (trimmed to last 200) | none |
+| `household:{id}:feedbackStats` | HASH | Four counters: `takeoff_up`, `takeoff_down`, `clearance_up`, `clearance_down` — read by brief.js / clearance.js to tune voice | none |
+| `household:{id}:onboardStatus` | HASH | Per-job onboarding status (state, startedAt, finishedAt, summary, `job:<emails|calendar|vault|crew|horizon>`) | none |
 
-#### Invite keys
+#### Suggestion + invite keys
 
 | Key | Type | Purpose | TTL |
 |---|---|---|---|
+| `signal:{signalId}:suggestion` | string (JSON) | One-sentence next-step suggestion produced by `/api/suggest`. Stable text on tap-twice + Hover prefetch | 12h |
 | `invite:{code}` | string (JSON) | `{householdId, createdBy, createdAt, expiresAt}` | 7d |
 
 ### Signal schema
 
-Source of truth for the shape of a signal. `import.js` writes new entries
-via `LPUSH`; `signals.js` PATCH/DELETE handlers update or remove.
-
 ```jsonc
 {
-  "id": 1778041216918,             // Date.now()-based; numeric for imports, "deadline_xxx" for deadlines
-  "messageId": "1850f...",         // Gmail messageId; used for dedup
+  "id": 1778041216918,
+  "messageId": "1850f...",
   "description": "London Sock Company delivery",
   "carrier": "FedEx",
   "trackingNumber": "...",
-  "status": "Out for Delivery",    // free-form Claude output
-  "eta": "2026-05-06T...",         // ISO string or null
+  "status": "Out for Delivery",
+  "eta": "2026-05-06T...",
   "sender": "London Sock Company",
-  "type": "delivery",              // ENUM (see §6)
+  "type": "delivery",
   "userId": "james_totalhome_gmail_com",
-  "source": "import",              // "import" | "onboard" | etc.
-  "lastUpdate": "5/6/2026, 4:30:47 AM",  // toLocaleString — bumped on PATCH
-  "state": "incoming",             // incoming | active | resolved | expired
-  "expiredAt": "...",              // set when state transitions to expired
-  "carriedForward": true,          // set by morning brief if survived clearance
-  "carriedForwardAt": 1778093260345
+  "source": "import",
+  "lastUpdate": "5/6/2026, 4:30:47 AM",
+  "state": "incoming",
+  "expiredAt": "...",
+  "carriedForward": true,
+  "carriedForwardAt": 1778093260345,
+  "notedAt": "2026-05-15T..."   // set by Horizon "Noted" PATCH
 }
 ```
 
-### Memory entry schema
+### Crew member schema (`household:{id}:crew` entries)
 
-Written by `signals.js` to `household:{id}:memory` on every state
-transition.
+```jsonc
+// Household member (auto-populated on join)
+{
+  "memberType": "member",
+  "userId": "sarahmae_rein_gmail_com",
+  "firstName": "Sarah",
+  "fullName": "Sarah Rein",
+  "email": "sarahmae.rein@gmail.com",
+  "picture": "https://lh3.googleusercontent.com/...",
+  "joinedAt": "2026-04-09T...",
+  "birthday": "05-24",        // MM-DD, mirrored from user profile
+  "anniversary": null
+}
+
+// Child (extracted by onboard Job 4 crew sweep)
+{
+  "memberType": "child",
+  "name": "Mia",
+  "age": 8,
+  "activities": [{ "name": "Soccer", "schedule": "Tue/Thu 5pm", "location": "Lincoln Park" }],
+  "school": { "name": "Roosevelt Elementary", "pickupTime": "3:15pm" },
+  "events": [{ "title": "Dentist", "date": "2026-05-22" }],
+  "birthday": "07-14"
+}
+
+// Pet
+{ "memberType": "pet", "name": "Rocco", "species": "dog", "breed": "Goldendoodle", "birthday": "03-02" }
+```
+
+### Vault item schema (`household:{id}:vault` entries)
 
 ```jsonc
 {
-  "signalId": 1778041216918,
-  "description": "London Sock Company delivery",
-  "type": "delivery",
-  "sender": "London Sock Company",
-  "eta": "2026-05-06T...",
-  "action": "resolved",            // "resolved" | "held" | "expired"
-  "actionAt": "2026-05-07T02:30:40.726Z",
-  "userId": "james_totalhome_gmail_com",
-  "source": "import",
-  "daysInSystem": 1                // age of the prior state at action time
+  "id": "vault_email_1778736607306_0",
+  "description": "Health Tech Nerds membership",
+  "provider": "Health Tech Nerds",
+  "category": "subscription",         // insurance, registration, subscription, lease, legal, warranty, medical, financial, membership, other
+  "renewalDate": "2026-05-20",        // YYYY-MM-DD
+  "amount": "$50",
+  "consequence": "Loses access to private community",
+  "confidence": "high",               // high | medium | low
+  "source": "email_sweep",            // or "five_pass" or "user_added"
+  "policyNumber": null,
+  "handled": false,
+  "handledAt": null
 }
 ```
 
 ### Health snapshot schema
 
-Written by mobile `syncHealthIfStale` to `user:{id}:health`.
-
 ```jsonc
 {
-  "sleep":          { "duration": 7.2, "efficiency": 0.91 },  // hours, asleep/inBed ratio
-  "hrv":            { "current": 42, "baseline7d": 50 },      // ms (SDNN)
-  "restingHR":      58,                                        // bpm
-  "steps":          3200,                                      // since midnight local
-  "activeCalories": 320,                                       // yesterday's total
-  "asOf":           1778093260345,                             // Date.now() at fetch time
-  "receivedAt":     1778093262100                              // server-stamped on POST
+  "sleep":          { "duration": 7.2, "efficiency": 0.91 },
+  "hrv":            { "current": 42, "baseline7d": 50 },
+  "restingHR":      58,
+  "steps":          3200,
+  "activeCalories": 320,
+  "asOf":           1778093260345,
+  "receivedAt":     1778093262100
 }
 ```
 
 ### Household model
 
-A household is a logical grouping. The household ID is a string — for the
-dev/test household it's `RangerOaks925`, but new households created via
-invite use the inviter's `userId` as the household ID by default (see
-`invite/[action].js:handleGenerate`).
+Membership has two sources of truth — `user:{id}:household` (canonical
+per-user pointer) and `household:{id}:members` (set, written only on
+invite-join). Code that enumerates members **scans `user:*:household`**
+since the scan reflects ground truth.
 
-Membership has two sources of truth:
-
-1. **`user:{id}:household` (per-user pointer)** — every user has one;
-   default value is their own userId, overwritten when they join via
-   invite. This is the canonical source.
-2. **`household:{id}:members` (set)** — written only by the invite-join
-   path. Incomplete (the original creator isn't in it). Used as an
-   optimistic lookup; the per-user pointer is authoritative.
-
-Code that needs to enumerate members (e.g. `sync.js`, `notify.js`,
-brief/clearance ownership tagging) **scans `user:*:household`** rather
-than reading the members set, since the scan reflects ground truth.
+`brief.js` and `clearance.js` additionally compute `isSingleMember =
+members.length <= 1` and return it on the response. When true, ownership
+tagging collapses to a single-person variant ("Always use 'you' and
+'your'. Never refer to any other household member by name.") and every
+signal is tagged `[YOURS]` regardless of stored `userId`.
 
 ---
 
 ## 4. API Endpoints
 
-15 serverless functions. Listed alphabetically.
+18 serverless functions. Listed alphabetically.
 
 ### `GET /api/auth?inviteCode=...`
 
-Starts the Google OAuth flow. The optional `inviteCode` rides through the
-OAuth `state` parameter as JSON `{inviteCode}` so it survives the redirect
-and is consumed by the callback.
+Starts the Google OAuth flow. Optional `inviteCode` rides through the
+OAuth `state` parameter so it survives the redirect.
 
 ### `GET /api/brief?userId=...`
 
-The morning Takeoff brief. Returns `{ brief, segments, household, user,
-isFirstRun }`. Internally:
+The morning Takeoff brief. Returns:
 
-1. Pulls signals, calendar, health, deadlines, briefedToday, briefedThisWeek,
-   clearanceBriefed, carriedForward, household member name map.
-2. Marks survivors of last night's clearance as `carriedForward`.
-3. Filters non-urgent pools through the briefedToday mute (skip narration
-   if status, state, and ring are all unchanged).
-4. Picks the HORIZON SIGNAL (15–90 day deadline) and HORIZON AWARENESS
-   (any outer-ring signal not seen this week).
-5. Renders prompt with ownership tags ([YOURS] / [NAME'S] / [HOUSEHOLD]).
-6. Tags clickable signal phrases via `tagBriefSegments` (Claude-driven).
-7. Writes `briefedToday` + `morningBriefed` for the next mute pass.
+```jsonc
+{
+  "brief":         "…",          // prose, 5 sentences standard / 7 in travel mode
+  "segments":      [...],        // {type:'text'|'signal', signalId, signalType}
+  "transparency":  "…" | null,   // 2nd Claude call: why this brief, what was omitted
+  "theRead":       "…" | null,   // 3rd Claude call: collapsible overflow, 1-3 sentences
+  "household":     "RangerOaks925",
+  "user":          "James",
+  "isFirstRun":    false,
+  "isSingleMember":false
+}
+```
+
+Internally: parallel data fetch → bucketing → prompt render → four
+parallel Claude calls (main brief + segment tagging + transparency + The
+Read). Response is cached to `user:{id}:currentTakeoff` so the
+takeoff push body and the app brief stay identical.
 
 ### `GET /api/calendar`, exported `runCalendarSync(userId)`
 
-Pulls the user's Google Calendar across all calendars, classifies each
-event with Claude (`type` ∈ household/work/personal/travel), caches
-classified events in `household:{id}:calendar` with a 24h TTL. Internal
-23h skip (`household:{id}:calendarLastSync`) prevents redundant runs.
+Pulls Google Calendar, classifies each event with Claude (`type` ∈
+household/work/personal/travel). **Work events are stripped to time
+blocks only** via `stripToTimeBlock()` — title, description, attendees,
+location, calendar name, eventType are dropped before persistence. Both
+the pre-tag path (work-calendar match by name or by `workCalendarName`
+preference, `outOfOffice`/`focusTime` event types) and the LLM-classified
+path route work events through the stripper. Storage is content-free; the
+LLM only sees the title transiently to classify.
+
+### `api/calendar-loader.js`
+
+Internal merger. Reads `user:{id}:calendar` for every household member,
+unions and dedupes, falls back to `household:{id}:calendar` for legacy
+unsynced households. Used by `brief.js` and `clearance.js`.
 
 ### `GET /api/callback`
 
 Google OAuth callback. Exchanges code for tokens, stores
-`user:{id}:tokens` + `user:{id}:profile`, consumes any invite (sets
-`user:{id}:household`, SADDs to `household:{id}:members`, deletes
-`invite:{code}`), fires onboarding via QStash (`/api/onboard`), redirects
-to `/api/success`.
+`user:{id}:tokens` + `user:{id}:profile`, consumes any invite. **On every
+join/auto-create/return, idempotently appends a `memberType: "member"`
+record to `household:{id}:crew`** (preserves prior Edit-modal updates).
+Fires onboarding via QStash, redirects to `/api/success`.
 
 ### `GET /api/clearance?userId=...`
 
-The evening brief. Buckets signals into resolvedToday / expiredToday /
-stillActive / carryingForward / urgent + near deadlines. Builds the
-LAST CHANCE pool (morningBriefed members still active + any signal on
-the Act Now ring). Writes `clearanceBriefed` SET (14h TTL) for tomorrow's
-brief to consume.
+The evening brief. Same shape as `/api/brief` (with `transparency` +
+`theRead` + `isSingleMember`). Buckets resolvedToday / expiredToday /
+stillActive / carryingForward / urgent + near deadlines. Builds LAST
+CHANCE from `morningBriefed` ∪ Act-Now ring. Writes `clearanceBriefed`
+(14h TTL). Response cached to `user:{id}:currentClearance`.
+
+### `POST /api/feedback`
+
+Records thumbs feedback from the brief screen. Body:
+`{userId, briefType: "takeoff"|"clearance", rating: "up"|"down", briefDate?}`.
+Appends to `household:{id}:feedback` (LTRIM to 200) and HINCRBYs the
+matching counter on `household:{id}:feedbackStats`. brief.js and
+clearance.js read the stats on every generation to tune voice.
 
 ### `POST /api/import`, exported `runImport(userId)`
 
-Pulls last 30 days of Gmail messages matching a curated subject filter,
-parses each via Claude into a structured signal, runs the post-parse
-quality gate (bounce sender → all-Unknown → promo keywords → promo
-sender), LPUSHes survivors into `household:{id}:signals`. Idempotent:
-two SETs (`importedMessages` by Gmail messageId, `contentFingerprints`
-by tracking-or-desc-hash) prevent duplicates across runs.
+Pulls last 30 days of Gmail, parses each via Claude, runs the post-parse
+quality gate, LPUSHes survivors. Two SETs (`importedMessages`,
+`contentFingerprints`) prevent duplicates.
 
-### `GET /api/invite/generate?userId=...`
+### `GET /api/invite/generate?userId=...` / `GET /api/invite/join?code=...`
 
-Creates a 10-hex-char code, stores `invite:{code}` with 7-day expiry,
-returns `{code, expiresAt, inviteUrl}`.
-
-### `GET /api/invite/join?code=...`
-
-Looks up the invite, validates expiry, redirects to `/api/auth?inviteCode=...`.
-Single-use semantics enforced by `callback.js` deleting the invite key
-after consumption.
+Invite-flow endpoints. Generate creates a 10-hex-char code with 7-day
+expiry. Join validates and redirects through OAuth.
 
 ### `GET|POST /api/notify?type=takeoff|clearance&householdId=...`
 
-Push fan-out. GET form is for Vercel cron; POST form is for manual triggers.
-Iterates households (one or all), generates a ≤100-char summary via Claude,
-fans out to each member's Expo push token. Takeoff body gets
-" Something from yesterday is still open." appended when `carriedForward`
-is non-empty. Treats success as `data.status === "ok"` (Expo's ticket-model
-truth) — not just HTTP 200.
+Push fan-out. Uses the cached `user:{id}:currentTakeoff` /
+`currentClearance` for the push body (first sentence of the actual brief
+that user will see in-app — no separate Claude call for body text).
+Treats success as `data.status === "ok"`.
 
 ### `POST /api/onboard`
 
-Onboarding kickoff. Enqueues a QStash job for `/api/onboard-worker`.
+Onboarding kickoff. **Fans out 4 parallel QStash messages**: `emails`,
+`calendar`, `vault`, `crew`. Each runs in its own 60s function
+invocation. `horizon` chains off `vault` completion since horizon reads
+`:vault`. Status lives in the `onboardStatus` Redis hash with per-job
+`job:<name>` fields so concurrent HSETs don't race.
 
 ### `POST /api/onboard-worker`
 
-QStash-driven heavy lift: deep email scan, calendar pull, deadline
-extraction, horizon picker. Writes to `household:{id}:deadlines`,
-`household:{id}:calendar`, etc. Sets `firstRun` flag.
+QStash-driven heavy lift. Dispatches on `job` field of the QStash payload.
+
+| Job | Output |
+|---|---|
+| `emails` | Deep Gmail scan → `:signals` |
+| `calendar` | `runCalendarSync(userId)` → `:user:{id}:calendar` |
+| `vault` | Five-pass Gmail extraction (insurance/registration/subscription/lease/warranty) → `:vault`. Pass prompts require category AND renewal-verb in subject. Full email bodies fetched + HTML-stripped. Word-overlap dedup (not substring includes). Per-pass observability logs |
+| `crew` | Pass 1: extract children + pets from email signatures + auto-replies. Pass 2: **birthday + anniversary Gmail pass** keyed on subjects — Claude extracts `{memberType, name, eventType, date (MM-DD, no year), age, notes}`. Three routing paths: A) name matches household member → write `user:{id}:profile.birthday`/`.anniversary`. B) matches existing crew member → patch field. C) new name → add crew record |
+| `horizon` | Pick one deadline 14–90 days out → `:horizon` |
 
 ### `POST /api/parse`
 
-**Alternate ingestion path.** Accepts raw email text in the body, filters
-with Claude (YES/NO is-this-a-real-signal), and parses if yes. Predates
-the `/api/import` Gmail-pull mechanism — used for webhook-driven
-ingestion (e.g. SendGrid Inbound Parse, mail forwarders). Currently still
-deployed; not the primary path.
+Alternate webhook ingestion path. YES/NO filter then parse.
 
 ### `GET /api/refresh?userId=...`, exported `getValidToken(userId)`
 
-Refreshes the Google access token if it's within 5 minutes of expiry.
-Used internally by `import.js` and `calendar.js`.
+Token refresh helper.
 
 ### `GET /api/signals?userId=...` and side-channel actions
 
-The signals CRUD endpoint with multiple action sub-routes via `?type=`.
-
 | Method + query | Purpose |
 |---|---|
-| `GET ?userId=...` | List active signals for the user's household |
+| `GET ?userId=...` | List active signals |
 | `GET ?type=memory&userId=...&limit=N` | Last N memory log entries |
-| `GET ?type=patterns&userId=...` | Aggregate counts: topSenders, typeBreakdown, peakDays |
-| `GET ?type=missedcues&userId=...` | Active signals where carriedForward=true OR lastUpdate >48h |
-| `GET ?type=preferences&userId=...` | Read user preferences object |
-| `POST ?type=preferences` | Shallow-merge preferences (also accepts expoPushToken, healthData) |
-| `PATCH` `{id, state, userId}` | Move signal to incoming/active/resolved/expired; writes memory log on resolved/active |
-| `DELETE` `{id, userId}` | Remove signal (rare) |
+| `GET ?type=patterns&userId=...` | topSenders / typeBreakdown / peakDays / averageResolutionTime / mostActiveCategory / quietestDay / householdAge |
+| `GET ?type=missedcues&userId=...` | carriedForward=true OR lastUpdate >48h, oldest-first |
+| `GET ?type=preferences&userId=...` | Read prefs object |
+| `POST ?type=preferences` | Shallow-merge prefs (accepts `expoPushToken`, `healthData`, `workCalendarName`) |
+| `GET ?type=vault&userId=...` | Vault items not handled, sorted by renewalDate asc |
+| `POST ?type=vault` action=`add\|handle\|delete` | Vault CRUD from the mobile Add modal + Handled button |
+| `GET ?type=crew&userId=...` | Crew records (children + pets + household members) |
+| `POST ?type=crew` | Update birthday/anniversary. Path A: `targetUserId` provided → write `user:{id}:profile` AND mirror to crew. Path B: `memberType + name` → update crew record only. MM-DD format validated |
+| `PATCH` `{id, state, userId, notedAt?}` | State transitions; writes memory log |
+| `DELETE` `{id, userId}` | Remove signal |
+
+### `POST /api/suggest`
+
+Per-signal next-action suggestion. Body:
+`{userId, signalId, signalType, description, sender, status, eta}`.
+Cache read on `signal:{signalId}:suggestion` (12h TTL) — short-circuits on
+hit. Otherwise one Haiku call with worked-example prompt (package /
+subscription / flight / appointment / registration patterns). Strips
+surrounding quotes. Returns `{suggestion, cached}`. `maxDuration: 15s`.
+Empty/failure paths return 502 — silent failure in the UI is intentional.
 
 ### `POST /api/sync`
 
 Daily orchestration. Scans `user:*:household`, runs `runImport(userId)`
-per member, runs `runCalendarSync(driverUserId)` once per household.
-Cron-fired twice daily at 11:00 + 01:00 UTC.
+per member, runs `runCalendarSync` per member.
 
 ### `GET /api/success`
 
-HTML success page after OAuth completes. Branches on the optional
-`householdId` query param to render either "You're connected" or
-"You've joined {householdId}'s household." All query values are
-HTML-escaped before render.
+HTML success page after OAuth.
 
 ---
 
 ## 5. Product Language
 
-The vocabulary that shows up in UI, prompts, and code. **Items in italics
-are conceptual / not yet implemented.**
-
 | Term | Meaning |
 |---|---|
-| **Takeoff** | Morning brief. Generated 6–12 sentences depending on first-run vs steady-state. |
-| **Clearance** | Evening brief. Reflective close-of-day. Surfaces the LAST CHANCE pool. |
-| **Hover** | The radar screen — three concentric rings with signals orbiting at their natural urgency. |
-| **Ground** | The brief screen (named because it's the on-the-ground view of the day). The file is `app/(tabs)/index.tsx`. |
-| **Finale** | The bottom-sheet detail view that appears when a signal is tapped on Hover. |
-| **Rest** | The Finale gesture that resolves a signal (state → "resolved"). |
-| **Hold** | The Finale gesture that keeps a signal active for later (state → "active"). |
-| **Signals** | Any actionable item the system has noticed — packages, appointments, deadlines, reservations. |
-| **Management in Motion** | The Hover screen header copy — what the radar represents. |
-| **Act Now** | Inner ring label. Signals due today or overdue. 0.6s pulse. |
-| **Approaching Fast** | Middle ring label. Next 7 days, after today. 1.5s pulse. |
-| **On the Horizon** | Outer ring label. >7 days out, plus signals with no ETA. 2.5s pulse. |
-| **Missed Cues** | Surfaces signals that have been carried forward or sat untouched >48h. Endpoint exists; UI does not yet. |
-| **LAST CHANCE** | A clearance-prompt section listing signals from this morning still unresolved at evening. |
-| **Carrying Forward** | Morning-brief acknowledgment that yesterday's LAST CHANCE items survived. |
-| ***Compass*** | *Conceptual / not yet implemented.* Reserved name — likely a navigational summary view (which signals point where) but no code references it. |
-| ***Programme*** | *Conceptual / not yet implemented.* Reserved name — possibly a multi-day planning surface, but no code references it. |
+| **Takeoff** | Morning brief |
+| **Clearance** | Evening brief |
+| **Hover** | The radar — three concentric rings |
+| **Ground** | The brief screen (`app/(tabs)/index.tsx`) |
+| **Finale** | Bottom-sheet detail view on Hover |
+| **Rest** | Finale gesture → resolved |
+| **Hold** | Finale gesture → active |
+| **Noted** | Horizon-screen gesture → active, with `notedAt` stamp |
+| **Signals** | Anything Conductor has noticed |
+| **Management in Motion** | Hover header (family view) |
+| **Act Now / Approaching Fast / On the Horizon** | Ring labels (0.6s / 1.5s / 2.5s pulse) |
+| **Missed Cues** | Carried-forward or >48h-untouched signals |
+| **LAST CHANCE** | Clearance section listing signals still unresolved at evening |
+| **Carrying Forward** | Morning acknowledgment that yesterday's LAST CHANCE survived |
+| **The Read** | Optional 1–3 sentence overflow context, collapsible below the brief on Ground |
+| **Crew** | Children + pets + household members layer |
+| **Vault** | Recurring obligations (subscriptions, registrations, insurance, etc.) |
+| **The Horizon** | Full-screen view of 14–90-day deadlines |
+| **Compass** | Household analytics — Pulse / Top Sources / Type Breakdown / Peak Days / Resolution Speed |
+| **Overwatch** | Radar-only summary view (Hover-adjacent) |
+| **Yesterday** | Modal view of recent resolutions / memory log |
+| **Programme** | Brief Schedule (Settings section, renamed) |
+| **Awareness** | Settings section header (formerly "Intelligence") covering work-calendar, childcare, health, flagged categories |
 
 ---
 
@@ -384,106 +438,115 @@ are conceptual / not yet implemented.**
 
 Maintained in two places that must stay in sync:
 
-- Backend: enforced as a strict enum in the brief/clearance segment-tagging
-  prompt (`api/brief.js`, `api/clearance.js`).
-- Mobile: `components/signalTypes.ts` defines `TYPE_META` with emoji + color.
+- Backend: enforced as a strict enum in segment-tagging.
+- Mobile: `components/signalTypes.ts` defines `TYPE_META`.
 
 | Type | Emoji | Color | Meaning |
 |---|---|---|---|
-| `package` | 📦 | `#60a5fa` | A physical thing arriving — order shipped, in transit |
-| `delivery` | 🚚 | `#7dd3fc` | Active delivery (out for delivery, attempted, etc.) |
-| `food` | 🍽 | `#f59e0b` | Restaurant orders, DoorDash, Instacart food |
-| `grocery` | 🛒 | `#a3e635` | Grocery delivery, Subscribe & Save |
-| `service` | 🔧 | `#86efac` | Home services — plumber, HVAC, cleaning |
-| `reservation` | 🗓 | `#f9a8d4` | Restaurant / hotel / venue bookings |
-| `appointment` | 📅 | `#c4b5fd` | Personal appointments — salon, doctor, spa |
-| `travel` | ✈️ | `#2dd4bf` | Flights, hotels, trip-related |
-| `deadline` | ⚠️ | `#fbbf24` | Document/renewal deadlines (synthesized during onboarding) |
-| `unknown` | 📍 | `#8a8780` | Type couldn't be classified but signal is real |
-| **`urgent` (mobile fallback)** | 🚨 | `#ef4444` | Reserved as the meta for unknown-type signals **on the inner ring only**. Middle/outer rings use the calm `📍 #8a8780` neutral fallback (`NEUTRAL_META`) instead. |
+| `package` | 📦 | `#60a5fa` | Physical thing arriving |
+| `delivery` | 🚚 | `#7dd3fc` | Active delivery |
+| `food` | 🍽 | `#f59e0b` | Restaurant / DoorDash / Instacart |
+| `grocery` | 🛒 | `#a3e635` | Grocery / Subscribe & Save |
+| `service` | 🔧 | `#86efac` | Home services |
+| `reservation` | 🗓 | `#f9a8d4` | Restaurant / hotel / venue |
+| `appointment` | 📅 | `#c4b5fd` | Salon / doctor / spa |
+| `travel` | ✈️ | `#2dd4bf` | Flights / hotels / trip-related |
+| `deadline` | ⚠️ | `#fbbf24` | Document / renewal deadlines |
+| `unknown` | 📍 | `#8a8780` | Real signal but unclassifiable |
+| `urgent` (inner-ring fallback) | 🚨 | `#ef4444` | Unknown-type **on inner ring only** (`metaForRing`) |
 
-The `metaForRing(s, ring)` helper in `signalTypes.ts` enforces the
-inner-ring-only rule for the urgent emoji.
+Horizon signals get `signalType: "deadline"` tagged when pushed to the
+segmenter pool. The segmenter coerces output signalTypes to the canonical
+pool type server-side and rejects cross-pool signalId borrowing (fixed
+in `cd474ef`).
 
 ---
 
 ## 7. Brief Architecture
 
-A brief is built in four layers, in order:
+A brief is built in four layers.
 
-### Layer 1: Data fetch (parallel)
+### Layer 1: Parallel data fetch
 
-```
-Promise.all([
-  signals (LRANGE),
-  calendar (GET, classified events),
-  health (GET, per-user),
-  horizon (GET, cached pick),
-  deadlines (LRANGE),
-  briefed (LRANGE, all-time horizon dedup),
-  preferences,
-  firstRun flag,
-  briefedToday hash (mute state),
-  briefedThisWeek set (horizon weekly cadence),
-  clearanceBriefed set (last night's LAST CHANCE),
-  carriedForward set,
-  household name map (for ownership tagging)
-])
-```
+Signals, calendar (per-user merge via `calendar-loader`), health, horizon,
+deadlines, vault, crew, briefed, preferences, firstRun, briefedToday,
+briefedThisWeek, clearanceBriefed, carriedForward, members, feedbackStats,
+weather, household name map.
 
 ### Layer 2: Bucketing
 
-Signals fan out into named pools, each subject to its own rules:
-
-- **URGENT** — `classifyUrgent(s)` matches; never muted, never delayed.
-- **NEAR WINDOW** — `isInNearWindow(s)`, urgent removed, `briefedToday`-mute applied.
+- **URGENT** — `classifyUrgent(s)`; never muted.
+- **NEAR WINDOW** — `isInNearWindow(s)`, urgent removed, briefedToday-mute applied.
 - **CHILDCARE** — calendar events classified as childcare/kids/school, next 48h.
-- **HOME REQUIREMENTS** — service signals due today/tomorrow, `briefedToday`-mute applied.
+- **HOME REQUIREMENTS** — service signals due today/tomorrow.
 - **FLAGGED CATEGORIES** — user-flagged `nearSignals` per category.
-- **HORIZON SIGNAL** — one deadline 15–90 days out (cached for 7 days).
-- **HORIZON AWARENESS** — one outer-ring signal (>14d) not in `briefedThisWeek`.
-- **CARRIED FORWARD** — signals with `carriedForward=true` from yesterday.
-- **HEALTH CONTEXT** — `user:{id}:health` snapshot, surfaced only when notable.
+- **HORIZON SIGNAL** — one deadline 15–90 days out (cached 7 days).
+- **HORIZON AWARENESS** — outer-ring signal not in `briefedThisWeek`.
+- **CARRIED FORWARD** — signals with `carriedForward=true`.
+- **HEALTH CONTEXT** — `user:{id}:health`, surfaced only when notable.
+- **TRAVEL PREP** — any `travel` signal with ETA within 72 hours. Composes:
+    - Closest imminent travel signal
+    - Accommodation: reservation with ETA in [travel − 24h, travel + 7d]
+    - Pre-departure deliveries: delivery/package between now and travel ETA
+    - Same-day conflicts: service/appointment within 12h before to 24h after the travel ETA
+    - Destination extracted via `AIRPORT_TO_CITY` map (3-letter codes) + "to / in <Capitalized City>" patterns, with stopword filter
+- **HOUSEHOLD BIRTHDAYS / ANNIVERSARIES** — loops `user:*:profile` for MM-DD matches in the next 14 days; renders in the prompt with relational framing ("Sarah's birthday is in 1 week").
 
 ### Layer 3: Prompt rendering
 
-`layeredContext` is a single multi-section template literal. Each pool is
-rendered with `formatSignal` / `formatEvent`, both of which prefix every
-line with the ownership tag (`[YOURS] / [NAME'S] / [HOUSEHOLD]`).
+`layeredContext` is a single multi-section template literal. Each pool
+prefixes every line with an ownership tag (`[YOURS] / [NAME'S] /
+[HOUSEHOLD]`). When `isSingleMember`, all tags collapse to `[YOURS]`.
 
-The system prompt is short and tonal:
+System prompt is short and tonal. User prompt is `layeredContext +
+baseRules`.
 
-> "You are Conductor, a household intelligence layer. You write calm,
-> trusted, personal morning briefs for {userName}. Your voice is like a
-> thought the reader was already having — never assistant-like, never
-> listy, always prose."
+### Layer 4: Four parallel Claude calls
 
-The user prompt is `layeredContext + baseRules` (or `firstRunRules` on
-the very first brief).
+After the main generation completes, three more calls fire in parallel:
 
-### Layer 4: Segment tagging
+1. **Segment tagging** — splits prose into `{type:'text'}` /
+   `{type:'signal', signalId, signalType}` for tappable underlines.
+   Server-side validation coerces signalType back to its canonical pool
+   type and rejects signalIds that didn't appear in the prompt's pool.
+2. **Transparency** — 2–4 sentences on why this brief was written this
+   way, what was included/omitted, what's being watched. Lift-don't-
+   compute applied to authoritative ETA phrases. Renders behind a "How
+   Conductor thought about this" link.
+3. **The Read** — 1–3 sentences of lower-urgency overflow context.
+   Returns literal `"NOTHING"` → null when there's nothing worth saying.
+   Renders behind a collapsible section below the brief on Ground.
 
-The generated brief is passed through `tagBriefSegments` — a second
-Claude call that splits the prose into `{type:'text'}` and
-`{type:'signal', signalId, signalType}` segments. The mobile app uses
-the segments to render colored, tappable underlines on phrases that
-refer to specific signals.
-
-After segments return, the IDs Claude actually narrated are written into
-`briefedToday` (20h TTL, mute) and `morningBriefed` (26h TTL, ledger).
+After tagging, IDs Claude actually narrated are written to `briefedToday`
+(20h TTL) and `morningBriefed` (26h TTL).
 
 ### Brief rules (the values that shape voice)
 
-The full rule list lives in `baseRules` inside `api/brief.js`. The
-spirit:
+Captured in `baseRules` inside `api/brief.js`. The non-obvious ones:
 
-- 5–6 sentences max, prose only.
-- Lead with urgent if present.
-- Health context: silent unless sleep <6h or HRV ≥15% below 7d baseline.
-  Never quote numbers — only contextual observations.
-- A quiet brief is a gift; end with confidence, not apology.
-- Dates are lifted verbatim from server-resolved friendly strings — Claude
-  never computes day-of-week or date arithmetic.
+- **Sentence cap**: 5 standard, **7 in travel-prep mode**.
+- **Lift-don't-compute** for dates and day-counts. Server emits the
+  authoritative ETA as a friendly string with `(in N days)` /
+  `(yesterday)` / `(already passed N days ago)` / `(in 2 weeks)` for clean
+  multiples of 7. Brief must lift the parenthesized phrase as a
+  contiguous substring, character-for-character, including the leading
+  word `"in"`. Past-dated phrases mean stale/outstanding or omit — never
+  forward-looking.
+- **No relative-duration phrasing between signals** ("five days later",
+  "a week away", "a week to think about that" — all banned as
+  paraphrases).
+- **Horizon closers** — exactly one phrase per use, no variations or
+  suffixes: `"worth watching"`, `"Conductor has its eye on this"`, `"on
+  the radar"`, `"watching for it"`, `"we'll flag it when it matters"`.
+  Threshold raised to 14 days. No `"as it gets closer"` tail. No
+  `"we're watching"` (Conductor is the subject).
+- **No weather closers** — banned: `"Clear skies today"`, `"Clear skies
+  ahead"`, `"Otherwise quiet weather"`, `"Nothing weather-related"`, `"The
+  weather's calm"`, `"weather looks fine"`. CRITICAL-level rule.
+- **No duplicate sentence about the same signal**.
+- **Health context**: silent unless sleep <6h or HRV ≥15% below 7d
+  baseline. Never quote numbers — only contextual observations.
+- **A quiet brief is a gift; end with confidence, not apology.**
 
 ---
 
@@ -498,244 +561,293 @@ spirit:
       incoming ────► active ────► resolved
           │                          ▲
           └──────► expired           │
-                  (auto, 24h         │
-                   past ETA)         │
+                  (auto)             │
                                      │
         (PATCH from Hover Finale ────┘
          Rest = resolved
-         Hold = active)
+         Hold = active
+         Noted = active w/ notedAt)
 ```
 
-| State | Source of transition | Memory log? |
-|---|---|---|
-| `incoming` | Default on import; never explicit | No |
-| `active` | PATCH from Finale Hold | Yes — `action: "held"` |
-| `resolved` | PATCH from Finale Rest | Yes — `action: "resolved"` |
-| `expired` | Auto-transition during `loadSignals` when ETA + 24h grace passes | Yes — `action: "expired"` |
+### Auto-expiry rules (in `loadSignals` on every GET)
+
+| Type | Window past ETA |
+|---|---|
+| Service / reservation / appointment | Immediate |
+| Food / grocery | 4h |
+| Package / delivery | 48h (bypassed if status === "Delivered") |
+| **Any incoming, no ETA** | **7d stale** |
+
+Every transition logs `console.log("auto-expired signal {id} type={type}
+reason=eta-past-{type}-window | incoming-no-eta-stale-7d")`.
 
 ### Carry-forward + Missed Cues
 
-The full daily loop:
-
-```
-Morning brief                         Evening clearance                 Next morning
-─────────────                         ────────────────                  ────────────
-narrate signals                       read morningBriefed               read clearanceBriefed
-write morningBriefed (26h)            ∪ Act-Now-ring signals            mark survivors carriedForward=true
-write briefedToday (20h)              = LAST CHANCE pool                add to carriedForward set (48h)
-                                      narrate as one calm sentence      brief CARRIED FORWARD section
-                                      write clearanceBriefed (14h)      Takeoff push appends
-                                                                        " Something from yesterday is still open."
-                                                                        if carriedForward non-empty
-```
-
-`/api/signals?type=missedcues` exposes the union of:
-- Signals with `carriedForward === true`
-- Signals where `lastUpdate` is >48h old
-
-Sorted oldest-first. Feeds the future Missed Cues screen.
+Same daily loop as before. `/api/signals?type=missedcues` returns the
+union of `carriedForward === true` and `lastUpdate >48h`, oldest-first.
+Mobile screen at `app/(tabs)/missed-cues.tsx` consumes it; entry points
+on Hover + Settings (with brass count badge when count > 0).
 
 ---
 
 ## 9. Household Model
 
-### The dev/test household
+`RangerOaks925` is the dev/test household. Two members:
+`james_totalhome_gmail_com`, `sarahmae_rein_gmail_com`.
 
-`RangerOaks925` is the household ID for development and ongoing testing.
-Two members:
-
-- `james_totalhome_gmail_com` (creator)
-- `sarahmae_rein_gmail_com` (member)
-
-The creator's membership is implicit via `user:{id}:household`. Sarah's
-membership exists in both `user:sarahmae_rein_gmail_com:household` and
-(when she joined via invite) `household:RangerOaks925:members`.
-
-### Default household for new users
-
-When `callback.js` writes `user:{userId}:tokens`, it does **not**
-explicitly set `user:{userId}:household` unless the user joined via
-invite. Endpoints that read household fall back to the userId itself:
-
-```js
-const householdId = (await redis.get(`user:${userId}:household`)) || userId;
-```
-
-So a brand-new user effectively forms a one-person household until they
-either send or accept an invite.
-
-### Data ownership
-
-- **Per-user data** (`user:{id}:*`) — tokens, profile, push token,
-  health, preferences. Never shared.
-- **Per-household data** (`household:{id}:*`) — signals, calendar,
-  memory, brief state. Shared among all members of the household.
-- **Signals carry `userId`** — used for ownership tagging in briefs
-  (`[YOURS]` vs `[SARAH'S]` vs `[HOUSEHOLD]`). The signal lives in the
-  shared household pool but is attributed to the specific member who
-  imported it.
+Default household for new users is their own userId. Joining via invite
+sets `user:{id}:household` to the inviter's household and `SADD`s to
+`household:{id}:members`. **`callback.js` also writes a
+`memberType: "member"` crew record on every join/auto-create/return**,
+preserving any Edit-modal updates.
 
 ---
 
 ## 10. Mobile App Screens
 
-### `app/(tabs)/index.tsx` — Ground (Takeoff/Clearance brief)
+### Tab routes — `app/(tabs)/`
 
-- The default tab. Renders the brief as flowing prose.
-- Brief endpoint chosen by hour-of-day (`<21` → `/api/brief`, else
-  `/api/clearance`).
-- Phrases that refer to specific signals are rendered as colored,
-  tappable inline underlines (driven by the `segments` array). Tap →
-  navigate to Hover with the signal pre-selected.
-- On mount, runs three async tasks: `checkConnection()` (verify
-  backend), `registerForPushNotifications()` (Expo token), and
-  `syncHealthIfStale()` (HealthKit snapshot, once per local day).
-- Swipe left → Hover.
+#### `index.tsx` — Ground
 
-### `app/(tabs)/hover.tsx` — Hover (radar)
+- Renders the brief as flowing prose. Greeting interpolates first name
+  from `data.user` ("Good morning, James.").
+- In-flow date appears below the brief, with a tap-to-open Yesterday link.
+- **Thumbs feedback row** (28px ✓/✗ buttons) sits between brief and
+  transparency link. Default 40%/40% opacity; tap sets selected → 100%,
+  other → 20%. Fire-and-forget POST to `/api/feedback`. Resets every
+  brief reload.
+- **Transparency link** → modal showing `data.transparency`.
+- **The Read** (when `data.theRead` is non-null) renders as a
+  collapsed-by-default section. Tap to expand, fades in/out.
+- Brief endpoint chosen by hour-of-day (`<21` → brief, else clearance).
+- Minimap top-left (moved from top-right). Date cluster top-right.
+- Signals with `signalId` segments render as tappable colored
+  underlines.
 
-- Three concentric rotating rings (outer 60s, middle 30s, inner 15s).
-- Signal dots orbit at angles derived from ETA — inner ring uses
-  hours-of-day around a 12-hour clock; middle uses day-of-week; outer
-  uses signal id.
-- Pulse durations are ring-determined: 0.6s / 1.5s / 2.5s.
-- Tap a dot → opens Finale (bottom sheet).
-- Bottom of screen: infinite legend wheel of signal types, tap to
-  filter.
-- Swipe right → back to Ground.
+#### `hover.tsx` — Hover
 
-### `app/(tabs)/settings.tsx` — Settings
+- Three concentric rings (60s / 30s / 15s rotation). Ring expansion uses
+  tap-and-hold (spring tension 200, friction 14). Reposition fade 150ms.
+- **Top-right view-mode toggle**: 👨‍👩‍👧 family / 👤 personal.
+  Persists in `AsyncStorage['hoverViewMode']`. Personal mode filters to
+  `userId === USER_ID` or unowned signals. Header text adapts —
+  "Management in Motion" in family, first-name + period ("James.") in
+  personal.
+- **+ Add Signal** lives inside the legend wheel (one of the nav items).
+  Opens `AddSignalSheet` for manual signal entry; freshly-added dot
+  pulses on the radar.
+- Infinite legend wheel doubles as nav: Compass, Horizon, Vault, Crew,
+  Missed Cues, Settings.
+- Below wheel: side-by-side "The Horizon" + "Missed Cues" links.
+- On mount: **prefetches `/api/suggest` for the top 3 ETA-ascending
+  signals** so FinaleSheet taps within the 12h cache window are instant.
 
-- Household section: ID display, "Invite a member" (opens iOS share
-  sheet with a generated invite URL), connected-accounts row.
-- Brief Schedule: Takeoff and Clearance times, hour-stepper modal.
-- Always Included: health context toggle, childcare toggle.
-- High Importance: per-category toggles (finance, travel, etc.) for
-  flagged categories.
-- Horizon Awareness: enabled toggle, frequency picker.
+#### `missed-cues.tsx`
 
-### `app/onboarding.tsx`
+- One row per missed-cue signal. Color-coded "X days unresolved" —
+  muted <48h, amber past 48h, brass past 7d.
+- Rest / Hold buttons optimistically remove the row.
 
-First-run onboarding flow. Pre-OAuth state (the Connect with Google
-button is also inline in `index.tsx` for users who arrive without a
-session).
+#### `settings.tsx`
 
-### `app/modal.tsx`
+- **Household** section: ID, "Invite a member", connected-accounts,
+  Crew row, Vault row (with brass count badge for items renewing
+  ≤90d), Missed Cues row (with count badge).
+- **Programme** (renamed from Brief Schedule): Takeoff + Clearance times.
+- **Awareness** (renamed from Intelligence): health-context toggle,
+  childcare toggle, **Work Calendar** TextInput
+  (persists `workCalendarName` preference).
+- **High Importance**: per-category toggles for flagged categories.
+- **Horizon Awareness**: enabled toggle, frequency picker, "View The
+  Horizon" row (gated on `horizonEnabled`).
 
-Generic modal route, available across the app.
+### Full-screen routes — `app/*.tsx` (registered on root Stack, `headerShown: false`)
+
+- `crew.tsx` — Household / Children / Pets sections. Household cards show
+  avatar from Google picture, "Connected · {date}", birthday/anniversary
+  display rows. Edit link → modal with MM-DD inputs that POSTs to
+  `/api/signals?type=crew` with `targetUserId`. Child cards include
+  activities, school, upcoming events.
+- `vault.tsx` — Sectioned by display category. Per-row color-coded "X
+  days" indicator (red <14, amber 14–60, brass 60–90, muted 90+),
+  confidence dot (sage high / orange med / muted low), Handled button.
+  Tap-to-expand cards (one at a time, LayoutAnimation 200ms easeInEaseOut)
+  showing consequence, source, confidence, policyNumber. Add modal with
+  horizontal category chip selector.
+- `horizon.tsx` — 14–90-day deadlines. Noted (state=active w/ notedAt) +
+  Rest buttons. "View Vault →" link above Back.
+- `compass.tsx` — Conditional render. <7d household age → "Compass gets
+  smarter with time." ≥7d → five cards: Household Pulse, Top Signal
+  Sources, Signal Type Breakdown (stacked resolved/held/expired), Peak
+  Days (Mon–Sun bar chart), Resolution Speed.
+- All four use top-left "← Return" link (single back affordance,
+  matching iOS pattern + back-swipe gesture).
 
 ### Components
 
-- `components/Minimap.tsx` — small overview component shown on the brief
-  screen.
-- `components/FinaleSheet.tsx` — the bottom sheet used on Hover for
-  signal detail (Rest / Hold gestures).
-- `components/HealthContext.ts` — `fetchHealthSnapshot()` + diagnostic
-  markers.
-- `components/signalTypes.ts` — `TYPE_META`, `LEGEND_ORDER`, `metaFor`,
-  `metaForRing`, `typeKeyFor`.
+- `Minimap.tsx`, `FinaleSheet.tsx`, `AddSignalSheet.tsx`,
+  `YesterdayModal.tsx`, `OverwatchView.tsx`, `HealthContext.ts`,
+  `signalTypes.ts`.
+
+### FinaleSheet (signal-tap modal)
+
+- Meta block → **NEXT STEP** muted label + brass italic suggestion text
+  from `/api/suggest` → Hold/Rest action buttons. "…" placeholder while
+  fetching. Silent failure leaves the section unmounted.
+- **Edit mode** for single-signal correction: tap an editable field →
+  inline TextInput → save PATCHes the signal back to the server.
+- Re-renders cleanly on tap-different-signal; in-flight fetches
+  cancelled via local `cancelled` flag.
+
+### Onboarding
+
+`app/onboarding.tsx` — first-run flow pre-OAuth.
 
 ---
 
-## 11. Roadmap
+## 11. OTA Update Pipeline
 
-### Built (verified working in production)
+EAS Update is wired and live as of `3dcc5df` (auto-installed by first
+`eas update` run) + `dd358cb` (channel mapping fix).
 
-- Daily sync orchestration (`/api/sync`) with 23h calendar cooldown.
-- Push notifications via Expo (twice-daily Takeoff/Clearance crons).
-- Apple HealthKit integration (sleep, HRV w/ 7d baseline, resting HR,
-  steps, active calories).
-- Brief signal-type enum (10 types) + mobile color map.
-- Full signal lifecycle: briefedToday mute, morningBriefed ledger,
-  clearance LAST CHANCE pool, carry-forward marking, CARRIED FORWARD
-  prompt section, Takeoff push suffix, missed-cues query.
-- Hover ring labels: ACT NOW / APPROACHING FAST / ON THE HORIZON.
-- Inner-ring-only urgent emoji (`metaForRing`).
-- Household invite flow (generate code → share sheet → join via OAuth).
-- Signal memory log + pattern aggregation stub.
-- Import-side noise filter (bounce senders, promo regex, all-Unknown
-  shells).
-- Per-recipient ownership tagging in briefs ([YOURS] / [NAME'S] /
-  [HOUSEHOLD]).
+- **`app.json`**: `runtimeVersion: { policy: "appVersion" }` ties OTA
+  compatibility to the app's marketing version. `updates: { url:
+  "https://u.expo.dev/04f4211f-..." }` is the EAS Update endpoint the
+  installed app polls on launch.
+- **`eas.json`**: preview profile carries `channel: "preview"` — earlier
+  builds without this field could not receive OTAs (the device polled
+  with no channel header and EAS returned nothing). **The eb4d78f3
+  build embedded no channel and cannot be retrofitted**; the next
+  preview build (`754a2432`, commit `dd358cb`) was the first
+  OTA-receiving binary in practice.
+- **`expo-updates`** ^29.0.17 is in `package.json`. Native modules built
+  in.
+- **Push OTA** from desktop: `eas update --branch preview --message
+  "..."` — applies to all installed `preview`-channel builds with a
+  matching `runtimeVersion`.
 
-### In progress (committed, awaiting next EAS build)
+### Sarah's install link (as of 2026-05-15)
 
-- Health diagnostic markers (`fddf5ce`) — investigating why
-  `user:{id}:health` is unset despite the sync wiring.
+- Build ID `754a2432-a010-478b-87af-402f4e919cfa`, commit `dd358cb`.
+- IPA: `https://expo.dev/artifacts/eas/fu3enqjybwBWAXCoYo6CCs.ipa`.
+- New mobile features past commit `dd358cb` (Crew Household section,
+  FinaleSheet suggestion, etc.) require a fresh preview build or — for
+  JS-only changes — an OTA push.
+
+---
+
+## 12. Roadmap
+
+### Built and verified in production (last two sessions)
+
+- **Suggestion engine** — POST `/api/suggest`, 12h Redis cache, Haiku-
+  generated per signal, surfaced in FinaleSheet + prefetched on Hover.
+- **Travel prep intelligence** — 72h pre-departure brief mode with
+  flight + accommodation + pre-departure deliveries + same-day conflicts
+  + destination extraction. Sentence cap lifts to 7 in travel mode.
+- **Crew screen + household members** — auto-populate on join, edit-
+  modal for birthday/anniversary, mobile screen with Household / Children
+  / Pets sections, two entry points (Hover wheel + Settings).
+- **Birthday + anniversary awareness** — Job 4 Gmail extraction pass,
+  `user:{id}:profile.birthday`/`.anniversary` fields drive the brief's
+  household-birthday loop, Edit modal POST path mirrors to crew record.
+- **Personal/family view toggle** on Hover — AsyncStorage-backed,
+  filters signals by ownership.
+- **Work calendar privacy** — `stripToTimeBlock()`, free-text
+  `workCalendarName` preference. Title/description/attendees/location
+  never persisted for work events.
+- **Email-confirmation signal updates** — reservation/appointment
+  parsers improved for confirmation emails.
+- **Brief quality rules**:
+  - Day-count and date lift-don't-compute (`(in N days)`, `(yesterday)`,
+    `(already passed N days ago)`, weeks-form for clean multiples of 7).
+  - Horizon-closer phrase whitelist + tighter 14d threshold.
+  - Banned weather-closer phrases.
+  - Banned inter-signal relative-duration phrases.
+  - Single-member household ownership collapse.
+  - Segmenter cross-pool signalId borrowing rejection.
+  - Auto-expiry: incoming + no ETA + age >7d.
+  - The Read (4th Claude call, collapsible overflow).
+  - Past-dated framing direction enforced.
+- **OTA pipeline** — `expo-updates` wired, `preview` channel mapping,
+  `runtimeVersion: appVersion` gating.
+- **Push body parity** — Notify uses cached `user:{id}:currentTakeoff`
+  first sentence so push and in-app brief read identically.
+- **Onboard fan-out** — 4 parallel QStash messages + horizon chain. Per-
+  job hash-backed status storage.
+- **Cron** — morning sync at 10:45 UTC, takeoff notify at 11:00 UTC (15-
+  min stagger eliminates the parallel-cron read race).
+- **Mobile vocabulary sweep** — Conductor language throughout (Programme,
+  Awareness, Crew, Vault, Compass, The Horizon, The Read, Overwatch,
+  Yesterday, Rest, Hold, Noted).
+- **New mobile full-screen routes** — Compass, Vault, Horizon, Crew.
+  Missed Cues as tab-bar-hidden route.
+- **Add Signal flow** — sheet inside Hover legend wheel, freshly-added
+  pulse on radar.
+- **Yesterday modal** + **Overwatch view** + **The Read collapsible** +
+  **thumbs feedback row** on Ground.
+- **FinaleSheet edit mode** for single-signal correction.
+- **HealthKit query option-shape fix** — kingstinct v14 expects
+  `{filter: {date: {startDate, endDate}}, limit}` not `{from, to, limit}`.
 
 ### Planned (named, not yet built)
 
-- **Missed Cues UI screen** in mobile — endpoint exists; no consumer.
-- **Compass** — undefined surface; reserved name.
-- **Programme** — undefined surface; reserved name.
-- **Multi-household onboarding polish** — invitee currently lands on a
-  generic success page; could carry richer first-brief context.
-- **Cron monitoring/alerting** — sync/notify cron failures are silent.
+- Sync cron self-healing for partial onboarding failures (vault/crew/
+  horizon don't re-run on subsequent syncs if they failed during
+  onboarding).
+- Multi-household onboarding polish.
+- Cron monitoring / alerting.
+- Importance-time peak-days bucket (currently bucketed on `actionAt`).
 
 ### Known issues / debt
 
-- The per-day signal-type peak-days bucket aggregates on `actionAt`
-  (when the user/system acted), not arrival time. Adding `importedAt` on
-  signals would give arrival-time peaks.
 - `clearance.js` and `brief.js` duplicate `classifyUrgent`,
-  `isInNearWindow`, `dayOffsetFromToday`, `withinNextDays`, `computeRing`,
-  `buildHouseholdNameMap`, `ownershipTag`. The duplication is deliberate
-  to keep file routing simple, but ring-shape consistency depends on
-  manual sync. Worth lifting into `api/_shared.js` next time the area is
-  touched.
-- Push registration removed the cache-gated dedup (always POSTs on every
-  app launch) for safety; cost is one round trip per cold start.
+  `isInNearWindow`, `dayOffsetFromToday`, `withinNextDays`,
+  `computeRing`, `buildHouseholdNameMap`, `ownershipTag`,
+  `daysFromTodayPhrase`. Worth lifting into `api/_shared.js` next time
+  the area is touched.
+- Push registration always POSTs on cold start (no cache-gated dedup).
 
 ---
 
-## 12. Costs
+## 13. Costs
 
-**No measured monthly burn data is available at the time of writing.**
-This section is a framework for what to track once costs are pulled.
+**No measured monthly burn data is available.** Framework for tracking:
 
-### What to track
+| Provider | Plan | Cost driver |
+|---|---|---|
+| Vercel | Pro | Function execution time, bandwidth |
+| Upstash Redis | Pay-as-you-go | Commands per month |
+| Anthropic | Claude Haiku 4.5 | Input + output tokens |
+| Apple Developer | $99/yr fixed | — |
+| Expo Push / EAS Update | Free tier | — |
+| Expo EAS Build | Free tier or paid | Build minutes |
 
-| Provider | Plan | Cost driver | Per-household impact |
-|---|---|---|---|
-| Vercel | Pro | Function execution time, bandwidth | Briefs are short-running; sync is the heaviest call (~30s per run × 2/day) |
-| Upstash Redis | Free → Pay-as-you-go | Commands per month | Each brief reads ~10 keys; each sync ~50–100 commands |
-| Anthropic | Claude Haiku 4.5 | Input + output tokens | Per brief: ~2 calls (generation + segment tagging), ~3K input tokens, ~600 output. Per import: 1 call per email parsed. |
-| Apple Developer | $99/year fixed | — | Required for iOS push + HealthKit |
-| Expo Push | Free | — | No cost; rate-limited only |
-| Expo EAS Build | Free tier or paid | Build minutes | ~20 min per iOS preview build |
-
-### Pricing model (not yet defined)
-
-The user-facing pricing model has not been set. Candidate framings worth
-exploring once cost data exists: per-household subscription, usage-based
-(N briefs/month), bundle with a trusted-services partner.
+Per brief: **4 Claude calls** (main + segment + transparency + The Read),
+~3K input + ~1.2K output tokens. Per import: 1 call per email parsed.
+Per signal tap: 0 calls on cache hit, 1 Haiku call on miss (12h TTL).
 
 ---
 
-## 13. Environment Variables
-
-All required server-side. No values shown — pull from Vercel Project
-Settings or `.env.local` (gitignored, ephemerally created via
-`vercel env pull`).
+## 14. Environment Variables
 
 | Variable | Used in |
 |---|---|
 | `UPSTASH_REDIS_REST_URL` | Every endpoint that touches Redis |
 | `UPSTASH_REDIS_REST_TOKEN` | Every endpoint that touches Redis |
-| `ANTHROPIC_API_KEY` | `brief.js`, `clearance.js`, `import.js`, `calendar.js`, `notify.js`, `parse.js`, `onboard-worker.js` |
+| `ANTHROPIC_API_KEY` | `brief.js`, `clearance.js`, `import.js`, `calendar.js`, `notify.js`, `parse.js`, `onboard-worker.js`, `suggest.js` |
 | `GOOGLE_CLIENT_ID` | `auth.js`, `callback.js`, `refresh.js` |
 | `GOOGLE_CLIENT_SECRET` | `callback.js`, `refresh.js` |
-| `QSTASH_TOKEN` | `onboard.js` (enqueues onboard-worker) |
-| `QSTASH_CURRENT_SIGNING_KEY` | `onboard-worker.js` (verifies QStash signature) |
-| `QSTASH_NEXT_SIGNING_KEY` | `onboard-worker.js` (rotation) |
+| `QSTASH_TOKEN` | `onboard.js` (4-message fan-out) |
+| `QSTASH_CURRENT_SIGNING_KEY` | `onboard-worker.js` |
+| `QSTASH_NEXT_SIGNING_KEY` | `onboard-worker.js` |
 
-Mobile-side, `app.json` carries the EAS `projectId` under
-`expo.extra.eas.projectId`. No other secrets are baked into the mobile
-build.
+Mobile: `app.json` carries `expo.extra.eas.projectId` and the OTA
+`updates.url`. No other secrets.
 
 ---
 
-## 14. Build Commands
+## 15. Build Commands
 
 ### Backend (from `C:\Users\james\conductor`)
 
@@ -749,39 +861,38 @@ build.
 | Tail recent logs | `vercel logs --since 1h --no-follow --no-branch` |
 | Filter logs by request | `vercel logs --query "POST /api/signals" --no-follow --no-branch` |
 
-The serverless functions in `api/` are not part of the Vite build — they
-deploy as-is.
+> **Verify deploys** before trusting behavioral tests: `vercel ls --prod`
+> should show a fresh deploy. Git pushes have been unreliable triggers;
+> use `vercel --prod --yes` if a push doesn't deploy.
 
 ### Mobile (from `C:\Users\james\conductor-mobile`)
 
 | Task | Command |
 |---|---|
-| Start dev client | `npm run start` (i.e. `expo start`) |
+| Start dev client | `npm run start` |
 | Lint | `npm run lint` |
-| iOS preview build (TestFlight-equivalent internal IPA) | `eas build --platform ios --profile preview` |
-| iOS development build (dev client, hot reload) | `eas build --platform ios --profile development` |
-| iOS production build (App Store submission) | `eas build --platform ios --profile production` |
+| iOS preview build (internal IPA) | `eas build --platform ios --profile preview` |
+| iOS dev client build | `eas build --platform ios --profile development` |
+| iOS production build | `eas build --platform ios --profile production` |
 | List recent builds | `eas build:list --platform ios --limit 5` |
 | Inspect credentials state | `eas credentials --platform ios` |
 | Confirm Expo login | `eas whoami` |
+| **Push an OTA update** | `eas update --branch preview --message "..."` |
+| List channels | `eas channel:list` |
 
-The `preview` profile is recommended for day-to-day testing — it builds
-a standalone IPA with internal distribution, includes the latest commit,
-and doesn't require TestFlight.
-
-### Cron schedule (from `vercel.json`)
+### Cron schedule (`vercel.json`)
 
 ```
-0 11 * * *   /api/sync                         # 6 AM ET (EST) — pre-Takeoff
-0 1  * * *   /api/sync                         # 8 PM ET (EST) — pre-Clearance
-0 12 * * *   /api/notify?type=takeoff          # 7 AM ET (EST)
-0 2  * * *   /api/notify?type=clearance        # 9 PM ET (EST)
+45 10 * * *   /api/sync                         # 6:45 AM ET — 15min before takeoff
+ 0 11 * * *   /api/notify?type=takeoff          # 7:00 AM ET
+ 0  1 * * *   /api/sync                         # 9:00 PM ET — pre-clearance
+ 0  2 * * *   /api/notify?type=clearance        # 10:00 PM ET
 ```
 
-All four crons run in fixed UTC. During EDT (mid-March through early
-November), they fire one hour later in local time.
+UTC throughout. EDT shifts schedules one hour later in local time.
 
 ---
 
-*Last updated against commit `b86dc9f` on backend and `fddf5ce` on
-mobile.*
+*Last updated against backend commit `0235d14` (Suggestion engine) and
+mobile commit `0819098` (FinaleSheet next-step). Sarah's deployed IPA is
+build `754a2432`, commit `dd358cb`.*

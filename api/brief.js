@@ -46,7 +46,7 @@ async function fetchWeather() {
     const url =
       `https://api.open-meteo.com/v1/forecast` +
       `?latitude=${WEATHER_LAT}&longitude=${WEATHER_LON}` +
-      `&current=temperature_2m,precipitation,weathercode` +
+      `&current=temperature_2m,relative_humidity_2m,precipitation,weathercode` +
       `&temperature_unit=fahrenheit` +
       `&timezone=${encodeURIComponent(WEATHER_TIMEZONE)}`;
     const res = await fetch(url, { signal: controller.signal });
@@ -56,10 +56,14 @@ async function fetchWeather() {
     const current = data?.current;
     if (!current || typeof current.temperature_2m !== "number") return null;
     const tempF = Math.round(current.temperature_2m);
+    const humidity = typeof current.relative_humidity_2m === "number"
+      ? Math.round(current.relative_humidity_2m)
+      : null;
     const isRaining = (current.precipitation ?? 0) > 0;
     const weatherCode = current.weathercode ?? 0;
     return {
       tempF,
+      humidity,
       isRaining,
       weatherCode,
       summary: classifyWeather(weatherCode, tempF),
@@ -792,6 +796,265 @@ ${signalList}`,
   } catch (err) {
     console.error("Segment tagging failed:", err);
     return fallback;
+  }
+}
+
+// ---------- synthesis ----------
+
+// NOAA Rothfusz heat-index formula. Valid for T >= 80°F. Below that the
+// "feels-like" temperature is just the air temperature. Returns rounded F.
+function computeHeatIndex(tempF, humidity) {
+  if (tempF == null || humidity == null) return null;
+  if (tempF < 80) return Math.round(tempF);
+  const T = tempF;
+  const R = humidity;
+  const HI =
+    -42.379 +
+    2.04901523 * T +
+    10.14333127 * R -
+    0.22475541 * T * R -
+    0.00683783 * T * T -
+    0.05481717 * R * R +
+    0.00122874 * T * T * R +
+    0.00085282 * T * R * R -
+    0.00000199 * T * T * R * R;
+  return Math.round(HI);
+}
+
+function classifySignalLoad({ urgentCount, nearCount, conflictsCount, carriedForwardCount }) {
+  if (urgentCount >= 3 || (urgentCount >= 2 && nearCount >= 5) || conflictsCount >= 2) return "heavy";
+  if (urgentCount >= 1 || nearCount >= 3 || conflictsCount >= 1) return "moderate";
+  if (nearCount >= 1 || carriedForwardCount >= 1) return "light";
+  return "clear";
+}
+
+function classifyHealthState(healthContext) {
+  if (!healthContext) return null;
+  const sleep = healthContext.sleep?.duration ?? null;
+  const hrv = healthContext.hrv?.current ?? null;
+  const baseline = healthContext.hrv?.baseline7d ?? null;
+  const hrvRatio = (hrv != null && baseline) ? hrv / baseline : null;
+  if ((sleep != null && sleep < 5) || (hrvRatio != null && hrvRatio < 0.75)) return "poor";
+  if ((sleep != null && sleep < 6) || (hrvRatio != null && hrvRatio < 0.85)) return "low";
+  if ((sleep == null || sleep >= 7.5) && (hrvRatio == null || hrvRatio >= 1.0)) return "strong";
+  return "normal";
+}
+
+function classifyWeatherState(weather, heatIndex) {
+  if (!weather) return null;
+  const { tempF, weatherCode, humidity } = weather;
+  if (weatherCode != null && weatherCode >= 95 && weatherCode <= 99) return "stormy";
+  if (heatIndex != null && heatIndex >= 105) return "extreme";
+  if (tempF != null && tempF >= 100) return "extreme";
+  if (tempF != null && tempF >= 88) return "hot";
+  if (humidity != null && humidity >= 75) return "humid";
+  return "clear";
+}
+
+// Outdoor-service heuristic: service-type signal whose description matches
+// work that happens outside. Drives heat_caution and storm_plus_outdoor flags.
+const OUTDOOR_SERVICE_REGEX = /\b(lawn|yard|landscap|garden|pest|exterminator|exterior|roof|gutter|pool|tree|window\s*clean|power\s*wash|pressure\s*wash|hvac|a\/?c|hardscap)\b/i;
+function isOutdoorService(s) {
+  if (!s || s.type !== "service") return false;
+  return OUTDOOR_SERVICE_REGEX.test(s.description || "");
+}
+function outdoorServiceOnOffset(s, allowedOffsets) {
+  if (!isOutdoorService(s)) return false;
+  const eta = parseDateLoose(s.eta);
+  if (!eta) return false;
+  return allowedOffsets.includes(dayOffsetFromToday(eta));
+}
+
+// Deterministic synthesis pass. Reads every pool the brief has already
+// bucketed and reduces to a structured state object that drives both the
+// pulse-note Claude call and the editorial framing of the main brief.
+function synthesizeHouseholdState({
+  urgentForPrompt,
+  nearForPrompt,
+  conflicts,
+  carriedForwardSignals,
+  activeSignals,
+  allDeadlines,
+  healthContext,
+  weather,
+  upcomingCelebrations,
+  travelPrep,
+}) {
+  const urgentCount = urgentForPrompt.length;
+  const nearCount = nearForPrompt.length;
+  const conflictsCount = conflicts.length;
+  const carriedForwardCount = carriedForwardSignals.length;
+
+  const signalLoad = classifySignalLoad({
+    urgentCount, nearCount, conflictsCount, carriedForwardCount,
+  });
+  const healthState = classifyHealthState(healthContext);
+  const heatIndex = weather ? computeHeatIndex(weather.tempF, weather.humidity) : null;
+  const weatherState = classifyWeatherState(weather, heatIndex);
+
+  const sleepHours = healthContext?.sleep?.duration ?? null;
+  const hrvCurrent = healthContext?.hrv?.current ?? null;
+  const hrvBaseline = healthContext?.hrv?.baseline7d ?? null;
+  const tempF = weather?.tempF ?? null;
+  const humidity = weather?.humidity ?? null;
+
+  const flags = [];
+
+  if (
+    (healthState === "low" || healthState === "poor") &&
+    (weatherState === "hot" || weatherState === "humid" || weatherState === "extreme") &&
+    heatIndex != null && heatIndex > 95
+  ) flags.push("dehydration_risk");
+
+  if (signalLoad === "heavy" && (healthState === "low" || healthState === "poor")) {
+    flags.push("high_stress_load");
+  }
+
+  if (sleepHours != null && sleepHours < 6 && urgentCount >= 2) {
+    flags.push("fatigue_plus_demands");
+  }
+
+  if (
+    healthState === "strong" &&
+    (signalLoad === "light" || signalLoad === "clear") &&
+    conflictsCount === 0
+  ) flags.push("green_light");
+
+  if (healthState === "poor" && signalLoad === "light" && urgentCount === 0) {
+    flags.push("rest_now");
+  }
+
+  if (travelPrep) flags.push("travel_prep");
+
+  if ((upcomingCelebrations || []).some((c) => c.days === 0)) {
+    flags.push("birthday_today");
+  }
+
+  // deadline_critical — any vault item with renewalDate within 48h, regardless
+  // of whether it's already in the urgent pool. The flag is a tone signal, not
+  // a routing rule.
+  const deadlineCritical = (allDeadlines || []).some((d) => {
+    const eta = parseDateLoose(d.eta);
+    if (!eta) return false;
+    const hours = (eta.getTime() - Date.now()) / HOUR_MS;
+    return hours >= 0 && hours <= 48;
+  });
+  if (deadlineCritical) flags.push("deadline_critical");
+
+  if (
+    heatIndex != null && heatIndex > 100 &&
+    activeSignals.some((s) => outdoorServiceOnOffset(s, [0]))
+  ) flags.push("heat_caution");
+
+  if (
+    weatherState === "stormy" &&
+    activeSignals.some((s) => outdoorServiceOnOffset(s, [0, 1]))
+  ) flags.push("storm_plus_outdoor");
+
+  let pulseWord;
+  if (urgentCount >= 1 && (signalLoad === "heavy" || flags.includes("high_stress_load"))) {
+    pulseWord = "urgent";
+  } else if (flags.includes("rest_now")) {
+    pulseWord = "recovery";
+  } else if (signalLoad === "heavy") {
+    pulseWord = "heavy";
+  } else if (signalLoad === "moderate") {
+    pulseWord = "full";
+  } else if (signalLoad === "clear" && healthState === "strong") {
+    pulseWord = "clear";
+  } else if (signalLoad === "light") {
+    pulseWord = "light";
+  } else {
+    pulseWord = "steady";
+  }
+
+  return {
+    signalLoad,
+    urgentCount,
+    conflicts: conflicts.map((c) => ({
+      type: c.type,
+      reason: c.reason || null,
+      description: c.signal?.description || c.item?.description || null,
+    })),
+    healthState,
+    weatherState,
+    heatIndex,
+    sleepHours,
+    hrvCurrent,
+    hrvBaseline,
+    tempF,
+    humidity,
+    synthesisFlags: flags,
+    synthesisNote: null,           // populated by generatePulseNote after this returns
+    pulseWord,
+    locationContext: "fort_lauderdale",
+  };
+}
+
+// One-sentence editorial synthesis from the structured state. Same best-effort
+// failure model as transparency/theRead — any error returns null and the brief
+// still ships with synthesisNote unset.
+async function generatePulseNote(state) {
+  if (!state) return null;
+
+  const flagsLine = state.synthesisFlags.length > 0
+    ? state.synthesisFlags.join(", ")
+    : "none";
+
+  const healthLine = state.healthState
+    ? `${state.healthState}, sleep ${state.sleepHours != null ? `${state.sleepHours}h` : "unknown"}, HRV ${state.hrvCurrent != null ? state.hrvCurrent : "?"} vs baseline ${state.hrvBaseline != null ? state.hrvBaseline : "?"}`
+    : "not connected";
+
+  const weatherLine = state.weatherState
+    ? `${state.weatherState}, ${state.tempF != null ? `${state.tempF}°F` : "?"}, feels like ${state.heatIndex != null ? `${state.heatIndex}°F` : "?"}, humidity ${state.humidity != null ? `${state.humidity}%` : "?"}`
+    : "unknown";
+
+  const locationLabel = state.locationContext === "fort_lauderdale" ? "Fort Lauderdale" : "generic";
+
+  const prompt = `Given this household state, write one sentence that synthesizes what it means for today. Be specific, warm, and honest. Use the approved list of location-aware weather observations for Fort Lauderdale. If a synthesis flag is active, lead with its implication — not the data behind it.
+
+Flags active: ${flagsLine}
+Health: ${healthLine}
+Weather: ${weatherLine}
+Signal load: ${state.signalLoad}, ${state.urgentCount} urgent
+Location: ${locationLabel}
+
+Fort Lauderdale weather observations (use these when weather is relevant):
+- High humidity: 'feels like the inside of a greenhouse', 'heavy air today', 'the humidity has opinions'
+- Afternoon storms: 'classic South Florida afternoon building', 'storms likely by 3pm', 'the sky will have thoughts later'
+- Extreme heat: 'proper South Florida heat today', 'the kind of heat that slows everything down'
+- Cold front: 'Fort Lauderdale cold front — practically sweater weather at 68°F'
+- Clear and mild: 'perfect South Florida morning', 'the good kind of Florida day'
+
+If no synthesis flags are active and conditions are normal: write one quiet observation about the day ahead.
+If green_light: acknowledge it warmly — this is a good day.
+If dehydration_risk: lead with practical action, not alarm.
+If high_stress_load: acknowledge the weight without adding to it.
+
+Maximum one sentence. No preamble. This is The Pulse.`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 120,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim() || "";
+    if (!text) return null;
+    return text.replace(/^["'“”]+|["'“”]+$/g, "").trim();
+  } catch (err) {
+    console.error("Pulse generation failed:", err?.message || err);
+    return null;
   }
 }
 
@@ -1657,6 +1920,8 @@ ${isSingleMember
         // First-run is deliberately starved; no overflow context to
         // surface beyond the welcome brief itself.
         theRead: null,
+        pulse: null,
+        pulseFlags: [],
         household: householdId,
         user: userName,
         isFirstRun: true,
@@ -1724,8 +1989,48 @@ ${isSingleMember
             .join("\n")
         : "None";
 
+    // Synthesis layer — read every bucketed pool, reduce to a structured
+    // household-state object, then issue one Haiku call for The Pulse. The
+    // state object gets surfaced verbatim at the top of the brief prompt so
+    // the model can take editorial cues from it without re-deriving the
+    // signal load / health state / weather state by hand. Pulse generation
+    // is best-effort: if it fails, synthesisNote stays null, the prompt
+    // still includes the structured state, and the brief still ships.
+    const synthesisState = synthesizeHouseholdState({
+      urgentForPrompt,
+      nearForPrompt,
+      conflicts,
+      carriedForwardSignals,
+      activeSignals,
+      allDeadlines,
+      healthContext,
+      weather,
+      upcomingCelebrations,
+      travelPrep,
+    });
+    synthesisState.synthesisNote = await generatePulseNote(synthesisState);
+
+    const householdStateBlock = [
+      `HOUSEHOLD STATE TODAY:`,
+      `Signal load: ${synthesisState.signalLoad}`,
+      `Health: ${synthesisState.healthState || "not connected"}`,
+      `Weather: ${synthesisState.weatherState || "unknown"}${
+        synthesisState.tempF != null ? `, ${synthesisState.tempF}°F` : ""
+      }`,
+      `Synthesis flags: ${
+        synthesisState.synthesisFlags.length > 0
+          ? synthesisState.synthesisFlags.join(", ")
+          : "none"
+      }`,
+      `The Pulse: ${synthesisState.synthesisNote || "(unavailable)"}`,
+      ``,
+      `Use this household state to inform the editorial judgment of the brief. A high_stress_load day calls for a calmer, more focused brief. A green_light day allows a slightly warmer opening. A dehydration_risk day warrants a mention of the weather in context. Let the synthesis flags guide the tone and emphasis — but never mention the flags explicitly.`,
+    ].join("\n");
+
     const layeredContext = [
       `Today is ${today}.`,
+      ``,
+      householdStateBlock,
       ``,
       `TRAVEL PREP (within 72 hours — when this layer is non-empty, lead with it):`,
       travelPrep ? formatTravelPrepBlock() : "None",
@@ -1994,6 +2299,8 @@ ${isSingleMember
       segments,
       transparency,
       theRead,
+      pulse: synthesisState.synthesisNote,
+      pulseFlags: synthesisState.synthesisFlags,
       household: householdId,
       user: userName,
       isFirstRun,
