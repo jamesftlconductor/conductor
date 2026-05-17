@@ -2755,6 +2755,13 @@ ${isSingleMember
         restingHR: healthContext.restingHR ?? null,
         steps: healthContext.steps ?? null,
         activeCalories: healthContext.activeCalories ?? null,
+        // Oura subset passed through verbatim — mobile decides which
+        // metrics to surface in the expanded card.
+        oura: healthContext.oura ? {
+          readinessScore: healthContext.oura.readiness?.score ?? null,
+          deepSleepSeconds: healthContext.oura.sleep?.deep_sleep_duration ?? null,
+          temperatureContrib: healthContext.oura.readiness?.contributors?.body_temperature ?? null,
+        } : null,
       } : null,
       weather: weather ? {
         tempF: weather.tempF ?? null,

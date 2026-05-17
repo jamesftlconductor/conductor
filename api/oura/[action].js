@@ -97,9 +97,29 @@ async function handleCallback(req, res) {
   return res.status(302).end();
 }
 
+async function handleStatus(req, res) {
+  const { userId } = req.query || {};
+  if (!userId || typeof userId !== "string") {
+    return res.status(400).json({ error: "userId required" });
+  }
+  const exists = await redis.exists(`user:${userId}:ouraTokens`);
+  return res.status(200).json({ connected: exists > 0 });
+}
+
+async function handleDisconnect(req, res) {
+  const { userId } = req.query || req.body || {};
+  if (!userId || typeof userId !== "string") {
+    return res.status(400).json({ error: "userId required" });
+  }
+  await redis.del(`user:${userId}:ouraTokens`);
+  return res.status(200).json({ disconnected: true });
+}
+
 export default async function handler(req, res) {
   const action = req.query?.action;
   if (action === "auth") return handleAuth(req, res);
   if (action === "callback") return handleCallback(req, res);
+  if (action === "status") return handleStatus(req, res);
+  if (action === "disconnect") return handleDisconnect(req, res);
   return res.status(404).json({ error: "Unknown action" });
 }
