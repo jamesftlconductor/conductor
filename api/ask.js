@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
 import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
-import { renderPricingForPrompt } from "./pricing.js";
+import { getMarketRates, renderRatesForPrompt } from "./pricing.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -143,6 +143,74 @@ function formatCalendarLine(ev) {
   return `- ${title} | ${start}`;
 }
 
+function formatProviderLine(p) {
+  if (!p) return null;
+  const name = p.name || "Unknown";
+  const service = p.serviceType || "service";
+  const phone = p.phone ? ` · ${p.phone}` : "";
+  const last = p.lastServiceDate ? ` · last used ${p.lastServiceDate}` : "";
+  return `- ${name} (${service})${phone}${last}`;
+}
+
+function formatInventoryBlock(inv) {
+  if (!inv || typeof inv !== "object") return "Not provided";
+  const lines = [];
+  if (inv.homeBuiltYear || inv.squareFootage) {
+    const built = inv.homeBuiltYear ? `built ${inv.homeBuiltYear}` : "";
+    const size = inv.squareFootage ? `${inv.squareFootage} sq ft` : "";
+    lines.push(`- home: ${[built, size].filter(Boolean).join(", ")}`);
+  }
+  if (inv.roof && Object.values(inv.roof).some(Boolean)) {
+    const r = inv.roof;
+    const parts = [];
+    if (r.material) parts.push(r.material);
+    if (r.yearInstalled) parts.push(`installed ${r.yearInstalled}`);
+    if (r.lastInspected) parts.push(`last inspected ${r.lastInspected}`);
+    lines.push(`- roof: ${parts.join(", ")}`);
+  }
+  if (inv.hvac && Object.values(inv.hvac).some(Boolean)) {
+    const h = inv.hvac;
+    const parts = [];
+    if (h.brand) parts.push(h.brand);
+    if (h.yearInstalled) parts.push(`installed ${h.yearInstalled}`);
+    if (h.lastServiced) parts.push(`last serviced ${h.lastServiced}`);
+    if (h.filterSize) parts.push(`filter ${h.filterSize}`);
+    lines.push(`- hvac: ${parts.join(", ")}`);
+  }
+  if (inv.waterHeater && Object.values(inv.waterHeater).some(Boolean)) {
+    const w = inv.waterHeater;
+    const parts = [];
+    if (w.type) parts.push(w.type);
+    if (w.yearInstalled) parts.push(`installed ${w.yearInstalled}`);
+    lines.push(`- water heater: ${parts.join(", ")}`);
+  }
+  if (inv.electrical && Object.values(inv.electrical).some(Boolean)) {
+    const e = inv.electrical;
+    const parts = [];
+    if (e.panelAmps) parts.push(`${e.panelAmps}A panel`);
+    if (e.yearUpdated) parts.push(`updated ${e.yearUpdated}`);
+    lines.push(`- electrical: ${parts.join(", ")}`);
+  }
+  if (Array.isArray(inv.vehicles) && inv.vehicles.length > 0) {
+    for (const v of inv.vehicles.slice(0, 5)) {
+      const parts = [v.year, v.make, v.model].filter(Boolean).join(" ");
+      const tail = [
+        v.mileage ? `${v.mileage} mi` : null,
+        v.lastService ? `last serviced ${v.lastService}` : null,
+      ].filter(Boolean).join(", ");
+      lines.push(`- vehicle: ${parts}${tail ? ` (${tail})` : ""}`);
+    }
+  }
+  if (Array.isArray(inv.appliances) && inv.appliances.length > 0) {
+    for (const a of inv.appliances.slice(0, 8)) {
+      const tail = a.yearPurchased ? ` (purchased ${a.yearPurchased})` : "";
+      lines.push(`- appliance: ${a.name || "Unknown"}${tail}`);
+    }
+  }
+  if (inv.notes) lines.push(`- notes: ${inv.notes}`);
+  return lines.length > 0 ? lines.join("\n") : "Not provided";
+}
+
 function formatMemoryLine(m) {
   const desc = m.description || "Unknown";
   const action = m.action || "?";
@@ -236,7 +304,8 @@ export default async function handler(req, res) {
     // a missing piece becomes "Not available" in the prompt rather than
     // a hard failure.
     const [
-      rawSignals, rawVault, rawCrew, rawHealth, weather, calendarEvents, rawMemory,
+      rawSignals, rawVault, rawCrew, rawHealth, weather, calendarEvents,
+      rawMemory, rawProviders, rawInventory,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       redis.lrange(`household:${householdId}:vault`, 0, -1),
@@ -245,6 +314,8 @@ export default async function handler(req, res) {
       fetchWeather(householdLocation),
       loadHouseholdCalendar(redis, householdId),
       redis.lrange(`household:${householdId}:memory`, 0, 9),
+      redis.hgetall(`household:${householdId}:providers`),
+      redis.get(`household:${householdId}:inventory`),
     ]);
 
     const allSignals = (rawSignals || []).map(safeJson).filter(Boolean);
@@ -258,6 +329,20 @@ export default async function handler(req, res) {
     })();
     const healthSnapshot = safeJson(rawHealth);
     const memoryEntries = (rawMemory || []).map(safeJson).filter(Boolean);
+
+    // Providers — stored as a Redis hash keyed by normalized name.
+    // Each value is a JSON-encoded provider record. Parse + array-ify
+    // for the prompt, dropping malformed entries silently.
+    const providers = [];
+    if (rawProviders && typeof rawProviders === "object") {
+      for (const v of Object.values(rawProviders)) {
+        const parsed = safeJson(v);
+        if (parsed) providers.push(parsed);
+      }
+    }
+
+    // Inventory — single JSON object stored at household:{id}:inventory.
+    const inventory = safeJson(rawInventory);
 
     // Calendar — next 7 days only, drop work blocks (privacy-stripped, no
     // title to surface).
@@ -305,19 +390,30 @@ export default async function handler(req, res) {
       ``,
       `HOUSEHOLD LOCATION: ${householdLocation.city || "Unknown"}, ${householdLocation.state || ""} (market: ${householdLocation.marketRegion || "generic"})`,
       ``,
-      // Pricing reference — embedded for questions about service costs.
-      // Uses the household's marketRegion so an LA question gets LA
-      // rates, NYC gets NYC, etc.
-      renderPricingForPrompt(householdLocation.marketRegion),
+      `PROVIDERS YOUR HOUSEHOLD HAS USED:`,
+      providers.length > 0 ? providers.map(formatProviderLine).filter(Boolean).join("\n") : "None on file yet",
+      ``,
+      `HOME INVENTORY:`,
+      formatInventoryBlock(inventory),
     ].join("\n");
+
+    const ratesBlock = renderRatesForPrompt(householdLocation.marketRegion);
 
     const systemPrompt = `You are Conductor, a household intelligence assistant. You have complete awareness of this household's signals, deadlines, health, weather, crew, and history. Answer questions directly from what you know. Never make things up. Never mention Claude or AI. Speak as Conductor in first person: "I can see that..." or "Based on what I'm watching..." or "Conductor has..." Maximum 3 sentences. Plain text only.
 
+${ratesBlock}
+
+HOME SERVICES GUIDANCE:
+- When the user asks about costs: give the market-specific range from the HOME SERVICES block above. If they share a quote, assess it as "within range" / "slightly high" / "above market — worth getting another quote." Note seasonal factors when relevant (e.g. summer HVAC premium, winter heating emergency rates).
+- When the user asks for providers: check the PROVIDERS YOUR HOUSEHOLD HAS USED list first. If a relevant provider is on file, recommend them by name. If not, say so honestly and offer to find rated local options once that surface ships.
+- Never invent provider names or phone numbers. Only use what's in the household provider history.
+- When inventory data is relevant (age of HVAC, roof material, etc.), use it. If it's not provided, say "Conductor doesn't have that on file yet — adding it under Home Inventory would help" rather than guessing.
+
 Return your response as a JSON object with this exact shape:
 {"answer": "your 1-3 sentence response", "confidence": "high" | "medium" | "low"}
-- confidence "high": the answer draws from specific data in the household context.
-- confidence "medium": the answer is inferred from the context but not stated explicitly.
-- confidence "low": the answer is speculative or you don't have visibility.
+- confidence "high": the answer draws from specific data in the household context (provider on file, inventory entry, exact rate range).
+- confidence "medium": the answer is inferred or general market guidance.
+- confidence "low": speculative or no visibility.
 Return only the JSON object, no preamble, no code fences.`;
 
     const userPrompt = `Household context:
