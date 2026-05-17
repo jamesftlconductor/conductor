@@ -1095,6 +1095,14 @@ If green_light: acknowledge it warmly — this is a good day.
 If dehydration_risk: lead with practical action, not alarm.
 If high_stress_load: acknowledge the weight without adding to it.
 
+NEVER quote specific numbers, percentages, or units directly. The structured values above (humidity %, temperature °F, HRV, steps, sleep hours, calories) are inputs for YOUR observation — translate them into human language, never echo them back:
+- "77% humidity" → "heavy humidity" or "the air is thick today" or "the humidity has opinions"
+- "94°F" → "proper South Florida heat" or "the heat is real today"
+- "HRV 42" → "recovery looks low" or "your body is asking for a lighter day"
+- "145 steps" → "you're just getting started" or "the day is early"
+- "5.2 hours of sleep" → "a short night" or "running on less than you'd want"
+The Pulse should feel like something a trusted friend observed — not a weather station readout. If you find yourself reaching for a numeral or a unit (%, °F, °C, bpm, ms, kcal, steps, hrs, hours), STOP and translate to a qualitative observation instead.
+
 Maximum one sentence. No preamble. This is The Pulse.`;
 
   try {
