@@ -2036,6 +2036,7 @@ export default async function handler(req, res) {
       rawMembers,
       rawInventory,
       networkContext,
+      rawActiveTransition,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: merges per-user calendar slices, falls back to
@@ -2080,8 +2081,26 @@ export default async function handler(req, res) {
         console.warn("[brief] network load failed:", err?.message || err);
         return [];
       }),
+      // Active life transition (new_baby/new_home/divorce/...) when
+      // present. Drives prompt-level tone adjustments — softer
+      // framing, suppressed mentions, etc. — for the 90-day window.
+      redis.get(`household:${householdId}:activeTransition`).catch(() => null),
     ]);
-    const isSingleMember = (rawMembers || []).length <= 1;
+    let isSingleMember = (rawMembers || []).length <= 1;
+
+    // Parse the active-transition record. Divorce flips the household
+    // into "treat as single-member" mode for tone — the other partner
+    // shouldn't appear in the brief during the 90-day window.
+    const activeTransition = (() => {
+      try {
+        return typeof rawActiveTransition === "string"
+          ? JSON.parse(rawActiveTransition)
+          : rawActiveTransition;
+      } catch { return null; }
+    })();
+    if (activeTransition && activeTransition.type === "divorce") {
+      isSingleMember = true;
+    }
 
     // Test override: ?testWeatherCode=N&testWeatherTemp=N replaces the
     // fetched weather with a synthetic value. Used to verify weather
@@ -3107,9 +3126,34 @@ ${isSingleMember
 - The ETA friendly field includes an authoritative parenthesized phrase like "(in 6 days)", "(in 2 weeks)", "(today)", or "(tomorrow)". The server picks the unit — it emits a weeks-form ONLY when the gap is an exact multiple of 7 days; otherwise it emits days. If you want to convey how soon something is, lift that phrase VERBATIM as a contiguous substring of your sentence — character-for-character, including the leading word ("in"). Examples of CORRECT lifts: "renewing in 5 days", "her birthday is in 1 week", "due today". Examples of INCORRECT lifts even though they preserve the timing: "gives you a week to think" (dropped "in", changed "1" → "a"), "5 days from today" (added "from today"), "a week away" (paraphrased "in 1 week"). The exact authoritative tokens must appear; embedding into a longer prose phrase is fine as long as the lifted substring is intact. Never substitute one unit for another: do NOT convert "(in 14 days)" to "in 2 weeks", do NOT convert "(in 5 days)" to "a few days", do NOT round "(in 13 days)" to "in 2 weeks". The ONLY two acceptable timing forms in the brief are: (1) the lifted parenthesized phrase verbatim, and (2) the day-and-date ("Wednesday, May 20"). Any other quantified duration is forbidden — this is a PATTERN rule, not a list-of-examples rule. The forbidden pattern is "<number-or-quantifier> <time-unit> <preposition>" where number-or-quantifier is anything like "5", "five", "a", "a couple of", "several", "a few", "about two", time-unit is days/weeks/months/years (singular OR plural), and preposition is away/out/left/remaining/from now/to <verb>/until <date>/later/before. Non-exhaustive examples that are ALL forbidden: "five days away", "5 days out", "five days left", "five days to renew", "two weeks later", "two weeks out", "two weeks away", "two weeks left", "a week out", "a couple of weeks away", "in about three weeks", "a few days from now", "next week", "soon", "shortly". If you find yourself constructing any duration phrase that isn't the lifted parenthesized phrase, stop and use the date alone instead — the day-and-date is always sufficient on its own. When using a lifted "(in N days)" phrase, NEVER place it after the word "until", "before", or "by" — the construction "until in N days", "before in N days", "by in N days" is ungrammatical and always reads as broken English. Examples of FORBIDDEN glue: "doesn't come due until in 11 days", "isn't needed before in 5 days", "wraps up by in 3 days". Instead either (1) use the date only — "doesn't come due until Thursday, May 28" — or (2) restructure so the lifted phrase starts the timing clause — "comes due in 11 days, on Thursday, May 28". The lifted phrase belongs at the start of a timing reference, not glued after a preposition. Also forbidden: window phrases like "in the next N days/weeks", "over the next N days", "within the next N days", "the next N days", "in the coming N days". N here means ANY quantity slot — digit ("3", "11"), spelled-out number ("three", "eleven"), OR quantifier ("few", "several", "couple", "handful", "couple of", "a few", "a couple of"). Every variant is forbidden: "in the next three days", "in the next 3 days", "in the next few days", "in the next several days", "over the coming couple of days", "within the next handful of days" — all banned. These are paraphrased windows, not lifted authoritative phrases. Use specific dates only, or lift the exact parenthesized phrase provided. Example: instead of "Two subscriptions need attention in the next three days" or "Two subscriptions need attention in the next few days" write "Two subscriptions are due this week — Health Tech Nerds on Wednesday and Google Home on the 28th."
 - The parenthesized phrase also surfaces past dates as "(yesterday)" or "(already passed N days ago)". Treat these signals as already-happened, NOT upcoming. Never write "looking ahead to..." or "her trip is set for..." or "watch for it as the date approaches" about a past-dated item — those framings are reserved for genuinely future dates. A past-dated signal usually means it's still open or unresolved (e.g., a delivery that never arrived, an appointment that wasn't marked done); if it warrants mention, frame it as a stale-or-outstanding item ("the spray tan from last Thursday hasn't been confirmed resolved", or simply omit). If a past-dated item has no actionable open thread, omit it entirely — do not pad the brief with retrospective recaps.`;
 
+    // Life-transition tone rule — appended to the rules block when
+    // activeTransition is present. Each type gets a tailored softener;
+    // divorce additionally trips the isSingleMember flag earlier in
+    // the pipeline so multi-member narration mechanics quiet down.
+    let composedRules = baseRules;
+    if (activeTransition && activeTransition.type) {
+      const t = activeTransition.type;
+      const TRANSITION_RULES = {
+        new_baby:
+          "- ACTIVE TRANSITION — NEW BABY: This household just welcomed a baby. Soften tone for 30 days. Be warmer, less urgent. Lead with what matters today, not the full pile. Never use the word 'deadline' on baby-related items — frame as 'when you're ready'. Sleep-deficit framing in the Pulse is fine; do not moralize about it.",
+        new_home:
+          "- ACTIVE TRANSITION — NEW HOME: This household just moved. Tone is practical-supportive. Expect to surface move-in vault items (mail forward, license, panel) ahead of older signals when timing demands. Acknowledge the move-in chaos when it fits naturally — never lecture.",
+        divorce:
+          "- ACTIVE TRANSITION — SEPARATION: Treat the household as a single member for the next 90 days regardless of membership. Never mention the other member by name or relationship. Suppress any signal owned by the other member (skip it silently — no narration). Tone is steady and respectful; never warm-and-fuzzy, never breezy, never hollow-cheerful. The brief is briefer during this window — only what actually needs attention.",
+        health_diagnosis:
+          "- ACTIVE TRANSITION — HEALTH DIAGNOSIS: This household received a medical diagnosis. For 60 days, weight health context more heavily and frame everything with extra gentleness. The Pulse may surface body state more often when recovery is low — always supportive, never alarmed. Lead with care-related signals when they're current; keep non-medical items quieter.",
+        job_change:
+          "- ACTIVE TRANSITION — JOB CHANGE: This household is transitioning employment. For 90 days, give extra weight to benefits / insurance / financial signals from the seeded vault items. Acknowledge change naturally if it fits, never as a directive.",
+        loss:
+          "- ACTIVE TRANSITION — LOSS: This household is in bereavement. For 60 days, tone is extra gentle. Never mention deadlines without warm framing — replace any directive language ('renew', 'submit', 'deadline') with softer equivalents ('when you're ready', 'when it feels right', 'whenever you can'). A quiet brief is correct. Never breezy.",
+      };
+      const rule = TRANSITION_RULES[t];
+      if (rule) composedRules = `${baseRules}\n${rule}`;
+    }
+
     // First-run is handled by an early-return branch above; this path is
     // always the steady-state pipeline.
-    const userPrompt = `${layeredContext}\n\n${baseRules}`;
+    const userPrompt = `${layeredContext}\n\n${composedRules}`;
 
     const systemPrompt = `You are Conductor, a household intelligence layer. You write calm, trusted, personal morning briefs for ${userName}. Your voice is like a thought the reader was already having — never assistant-like, never listy, always prose.`;
 
