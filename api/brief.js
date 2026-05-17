@@ -563,7 +563,7 @@ async function generateTransparency(brief, pools) {
     ? `- ${pools.horizon.description || "Unknown"}${horizonPhrase ? ` (${horizonPhrase})` : ""}`
     : "(none)";
 
-  const prompt = `You just generated this brief: ${brief}
+  const basePrompt = `You just generated this brief: ${brief}
 
 The signals you considered were (each carries an authoritative day-count phrase in parentheses — lift it verbatim, do NOT compute your own):
 Urgent: ${briefList(pools.urgent)}
@@ -588,29 +588,72 @@ Rules:
 - Calm, not defensive
 - Never assert what the user said, noted, mentioned, told you, indicated, expressed, confirmed, asked, or wrote. Describe only the signals present in the pool and how you weighed them. If you want to convey a user state, frame it as your own inference: "I inferred X" or "this reads like X" — never "you noted X".
 - Never compute or estimate how many days away something is. Each signal line above carries an authoritative day-count phrase in parentheses ("(in 5 days)", "(today)", "(in 2 weeks)", "(yesterday)"); lift that phrase verbatim if you reference timing. Do NOT produce your own counts like "in 8 days" — the math is frequently wrong, and the authoritative phrase is provided so you don't have to compute.
-- Weather should appear in your reasoning ONLY if a weather condition actually changed which signals you included, excluded, or framed differently. "The clear weather made it a good weekend" is NOT a reason — that's rationalization, not influence. If you would have made the same inclusion decisions regardless of weather, do not mention weather in your reasoning at all. Be honest about what actually drove your choices.`;
+- Weather should appear in your reasoning ONLY if a weather condition actually changed which signals you included, excluded, or framed differently. "The clear weather made it a good weekend" is NOT a reason — that's rationalization, not influence. If you would have made the same inclusion decisions regardless of weather, do not mention weather in your reasoning at all. Be honest about what actually drove your choices.
+- CRITICAL — NO QUANTIFIED HEALTH METRICS: NEVER quote specific health numbers, units, or quantified comparisons in the transparency text. The healthContext JSON above is for YOUR reasoning only — its fields (sleep.duration, hrv.current, hrv.baseline7d, restingHR, steps, activeCalories) must NEVER appear as numerals in the output. Specifically banned: "145 steps", "32 active calories", "32 kcal", "58 bpm", "42 ms", "7.2 hours of sleep", "6 hrs slept", "15% below baseline", "20% of normal". If health context shaped your reasoning, describe it qualitatively only: "low activity today", "recovery looks light", "the day's been quiet so far" — never with numerals. Treat numbers in healthContext like metadata: read them, weigh them, but never echo them back.`;
 
-  try {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: "claude-haiku-4-5-20251001",
-        max_tokens: 300,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    const data = await response.json();
-    const text = data?.content?.[0]?.text?.trim();
-    return text || null;
-  } catch (err) {
-    console.error("Transparency generation failed:", err);
-    return null;
+  // Generate-then-sweep loop for transparency. Same one-shot retry pattern
+  // as the main brief: first attempt uses the base prompt; on sweep
+  // violation the second attempt appends a retry addendum naming the
+  // offending phrases. Best-effort: any failure (Anthropic, network) just
+  // returns null and the brief still ships without transparency.
+  const MAX_ATTEMPTS = 2;
+  let text = null;
+  let attempts = 0;
+  let lastViolations = [];
+  while (attempts < MAX_ATTEMPTS) {
+    attempts++;
+    const promptToUse = lastViolations.length > 0
+      ? basePrompt + buildRetryAddendum(lastViolations)
+      : basePrompt;
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 300,
+          messages: [{ role: "user", content: promptToUse }],
+        }),
+      });
+      const data = await response.json();
+      const candidate = data?.content?.[0]?.text?.trim();
+      if (!candidate) {
+        if (!response.ok) {
+          console.error("[transparency] non-content response", {
+            status: response.status, errorType: data?.error?.type,
+            errorMessage: data?.error?.message,
+          });
+        }
+        break;
+      }
+      text = candidate;
+      const violations = sweepTransparencyForViolations(text);
+      if (violations.length === 0) {
+        if (attempts > 1) console.log(`[transparency] sweep clean on retry attempt ${attempts}`);
+        lastViolations = [];
+        break;
+      }
+      console.log(
+        `[transparency] sweep violations on attempt ${attempts}:`,
+        violations.map((v) => `${v.rule}=${v.matches.length}`).join(" ")
+      );
+      lastViolations = violations;
+    } catch (err) {
+      console.error("Transparency generation failed:", err);
+      return null;
+    }
   }
+  if (lastViolations.length > 0) {
+    console.log(
+      `[transparency] shipping after ${attempts} attempts with residual violations:`,
+      lastViolations.map((v) => `${v.rule}[${v.matches.join("|")}]`).join(" ; ")
+    );
+  }
+  return text;
 }
 
 // Fourth Claude call alongside segment-tagging and transparency. Produces
@@ -1116,6 +1159,15 @@ const GAP_PHRASE_RE = new RegExp(
 // bearing context for a specific signal.
 const WEATHER_CLOSER_RE = /\b(clear skies( today| ahead)?|otherwise quiet weather|nothing weather-related|the weather'?s calm|the day is clear and warm|with the nice weather|given the calm forecast|weather looks fine)\b/gi;
 
+// Hydration / heavy-air nudges. The synthesis layer encourages these in The
+// Pulse (correct — Pulse synthesizes weather + body + load). When they bleed
+// into the brief proper, they violate the "weather only when it affects a
+// specific named signal" rule. Pure-pattern: a hydration directive in the
+// brief is almost never tied to a specific signal in practice, and the rare
+// legitimate case (e.g. "stay hydrated for Mia's soccer game") is acceptable
+// retry collateral since the retry budget is 1.
+const HYDRATION_NUDGE_RE = /\b(drink (?:more )?water (?:throughout|today|often|early|all day|regularly)|stay hydrated|hydrate (?:today|early|often|throughout|more|all day|regularly)|keep water (?:close|nearby|handy|on you)|the air (?:is|feels) (?:thick|heavy|sticky|soupy)|heavy air today|humid today|muggy today|thick air|sticky (?:out|today))\b/gi;
+
 // Approved horizon-closer phrases. Eligibility rule: ONLY when attached to
 // a signal >14 days out. We don't ban the phrase itself; we ban its use on
 // a near-window signal. The eligibility check parses the surrounding
@@ -1236,6 +1288,7 @@ function sweepBriefForViolations(brief) {
     ["window_phrase", WINDOW_PHRASE_RE],
     ["gap_phrase", GAP_PHRASE_RE],
     ["weather_closer", WEATHER_CLOSER_RE],
+    ["hydration_nudge", HYDRATION_NUDGE_RE],
     ["positive_health", POSITIVE_HEALTH_RE],
   ];
   for (const [rule, re] of checks) {
@@ -1248,6 +1301,34 @@ function sweepBriefForViolations(brief) {
   const horizonMisuse = checkHorizonCloserNearWindow(brief);
   if (horizonMisuse.length > 0) {
     violations.push({ rule: "horizon_closer_near_window", matches: horizonMisuse });
+  }
+  return violations;
+}
+
+// ---------- transparency sweep ----------
+
+// Health-metric numerals in the transparency text. The brief itself bans
+// these via baseRules, but the transparency Claude call has its own
+// prompt — these patterns target the leak path where transparency quotes
+// the raw healthContext JSON values back to the user.
+const TRANSPARENCY_HEALTH_NUMBER_RE = /\b\d+(?:\.\d+)?\s*(?:steps|calories|kcal|bpm|ms|hours?\s+of\s+sleep|hrs?\s+of\s+sleep|hours?\s+slept|hrs?\s+slept)\b/gi;
+
+// "15% below baseline", "20% of average", etc. — quantified health
+// comparisons. Bans the percentage-plus-baseline-anchor pattern.
+const TRANSPARENCY_HEALTH_PCT_RE = /\b\d+%\s+(?:below|above|of|under|over)\s+(?:baseline|normal|average|usual|typical)\b/gi;
+
+function sweepTransparencyForViolations(text) {
+  if (!text || typeof text !== "string") return [];
+  const violations = [];
+  const checks = [
+    ["health_number", TRANSPARENCY_HEALTH_NUMBER_RE],
+    ["health_pct", TRANSPARENCY_HEALTH_PCT_RE],
+  ];
+  for (const [rule, re] of checks) {
+    const m = text.match(re);
+    if (m && m.length > 0) {
+      violations.push({ rule, matches: dedupeCi(m) });
+    }
   }
   return violations;
 }
@@ -2329,7 +2410,7 @@ ${isSingleMember
 - Always suggest a specific resolution when mentioning a conflict
 - If conflicts exist, lead with the most severe one. Be specific about what the conflict is and what action would resolve it. Never be alarmist — calm and actionable.
 - Health context: STRICTLY DEFICIT-ONLY. The brief mentions health ONLY when there is a concrete deficit: sleep.duration under 6 hours OR hrv.current meaningfully below hrv.baseline7d (roughly 15% or more lower). In those cases surface ONE calm, day-shaping sentence (e.g. "${userName} slept under six hours last night — worth keeping the day manageable" or "Recovery looks low today — a lighter afternoon might serve you well"). Never quote specific numbers, percentages, or units — only contextual observations. If sleep and HRV look normal, GOOD, or STRONG — say nothing about health. Never describe a positive or normal health state. Specifically banned: "your body feels strong", "your body is strong right now", "feeling strong", "energy is good", "you're in a strong window", "good timing energy-wise", "strong recovery", "your recovery looks solid", and any other affirmative health framing. A normal/strong healthState in the synthesis layer means the body is fine — the brief stays silent on it. The only reason to mention health is to soften the day's demands; if there is nothing to soften, omit health entirely.
-- WEATHER IN BRIEF — STRICT RULE: Weather only appears in the brief when it directly affects a specific named signal (outdoor service appointment, delivery requiring someone home, travel timing). Humidity, heat, and general weather conditions are NEVER mentioned in the brief as standalone observations or closing lines — those belong exclusively in The Pulse. Even when dehydration_risk is an active synthesis flag, the brief stays silent on weather unless a signal is directly affected. The Pulse handles weather context. The brief handles signals.
+- WEATHER IN BRIEF — STRICT RULE: Weather only appears in the brief when it directly affects a specific named signal (outdoor service appointment, delivery requiring someone home, travel timing). Humidity, heat, and general weather conditions are NEVER mentioned in the brief as standalone observations or closing lines — those belong exclusively in The Pulse. Even when dehydration_risk is an active synthesis flag, the brief stays silent on weather unless a signal is directly affected. The Pulse handles weather context. The brief handles signals. Specifically banned in the brief regardless of context (these are Pulse-only phrasings): "drink water throughout", "drink water today", "drink more water", "stay hydrated", "hydrate today/early/often/throughout/regularly", "keep water close/nearby/handy", "the air is thick/heavy/sticky/soupy", "the air feels heavy/thick", "heavy air today", "humid today", "muggy today", "thick air", "sticky out". A hydration directive or air-quality observation in the brief is a rule break even if it follows a signal mention — those phrasings live in The Pulse only.
 - Weather: use weather as context only when it changes what someone should do about a signal. (a) If WEATHER TODAY is rain/showers/thunderstorm AND any outdoor service appointment is scheduled today/tomorrow, mention timing may be affected. (b) If extreme heat (>90°F) AND an HVAC service is scheduled, mention this is good timing for the service. (c) If rain/storm AND any package delivery is arriving today, mention packages may need to be brought in promptly. (d) Otherwise — including all "normal" weather (clear, partly cloudy, mild temperatures) and any case where no signal would actually be affected — say absolutely nothing about weather. CRITICAL: do NOT mention weather as a closing flourish, do NOT use weather as an "everything's fine otherwise" transition, do NOT describe weather to round out a paragraph. Specifically banned closer-phrasings: "Clear skies today", "Clear skies ahead", "Otherwise quiet weather", "Nothing weather-related", "The weather's calm", "the day is clear and warm", "with the nice weather", "given the calm forecast", "weather looks fine". These all count as load-bearing-less weather mentions and are forbidden regardless of where they appear in the brief. A brief without any weather mention reads correctly when weather isn't load-bearing — the reader will not notice it's missing. Never lead with weather. Never quote the temperature or condition string verbatim — paraphrase ("the rain coming through this afternoon") rather than restate ("72°F, Rain"). When in doubt about whether weather is load-bearing, omit it.
 - Childcare: mention only if it affects coordination today or tomorrow
 - Crew (children and pets): Crew members surface in the brief only when something is happening today or tomorrow that requires the household to act or be present. Never mention routine pickups or recurring activities unless there is a conflict or timing consideration. A pet vet appointment today is as important as a child's activity.

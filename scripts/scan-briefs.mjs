@@ -24,6 +24,9 @@ const GAP_PHRASE_RE = new RegExp(
 );
 const WEATHER_CLOSER_RE = /\b(clear skies( today| ahead)?|otherwise quiet weather|nothing weather-related|the weather'?s calm|the day is clear and warm|with the nice weather|given the calm forecast|weather looks fine)\b/gi;
 const POSITIVE_HEALTH_RE = /\b(your body (?:feels?|is|'s) strong|feeling strong|energy is good|in a strong window|strong recovery|recovery looks solid|good timing energy-wise|you're in a strong window)\b/gi;
+const HYDRATION_NUDGE_RE = /\b(drink (?:more )?water (?:throughout|today|often|early|all day|regularly)|stay hydrated|hydrate (?:today|early|often|throughout|more|all day|regularly)|keep water (?:close|nearby|handy|on you)|the air (?:is|feels) (?:thick|heavy|sticky|soupy)|heavy air today|humid today|muggy today|thick air|sticky (?:out|today))\b/gi;
+const TRANSPARENCY_HEALTH_NUMBER_RE = /\b\d+(?:\.\d+)?\s*(?:steps|calories|kcal|bpm|ms|hours?\s+of\s+sleep|hrs?\s+of\s+sleep|hours?\s+slept|hrs?\s+slept)\b/gi;
+const TRANSPARENCY_HEALTH_PCT_RE = /\b\d+%\s+(?:below|above|of|under|over)\s+(?:baseline|normal|average|usual|typical)\b/gi;
 const HORIZON_CLOSER_RE = /\b(worth watching|on the radar|conductor has its eye on this|watching for it|we'?ll flag it when it matters)\b/gi;
 const INLINE_DAYCOUNT_RE = /\bin\s+(\d+)\s+(day|days|week|weeks)\b/gi;
 const NEAR_KEYWORDS_RE = /\b(today|tomorrow|tonight|this (?:morning|afternoon|evening|week|weekend))\b/gi;
@@ -87,6 +90,7 @@ function sweep(brief, today = new Date()) {
   WINDOW_PHRASE_RE.lastIndex = 0;
   GAP_PHRASE_RE.lastIndex = 0;
   WEATHER_CLOSER_RE.lastIndex = 0;
+  HYDRATION_NUDGE_RE.lastIndex = 0;
   POSITIVE_HEALTH_RE.lastIndex = 0;
   const w = brief.match(WINDOW_PHRASE_RE);
   if (w) hits.push(`window=[${w.join(", ")}]`);
@@ -94,10 +98,24 @@ function sweep(brief, today = new Date()) {
   if (g) hits.push(`gap=[${g.join(", ")}]`);
   const wc = brief.match(WEATHER_CLOSER_RE);
   if (wc) hits.push(`weather=[${wc.join(", ")}]`);
+  const hn = brief.match(HYDRATION_NUDGE_RE);
+  if (hn) hits.push(`hydration=[${hn.join(", ")}]`);
   const ph = brief.match(POSITIVE_HEALTH_RE);
   if (ph) hits.push(`health=[${ph.join(", ")}]`);
   const hcn = horizonNearViolations(brief, today);
   if (hcn.length > 0) hits.push(`horizon_near=[${hcn.join(", ")}]`);
+  return hits;
+}
+
+function sweepTransparency(text) {
+  if (!text) return [];
+  const hits = [];
+  TRANSPARENCY_HEALTH_NUMBER_RE.lastIndex = 0;
+  TRANSPARENCY_HEALTH_PCT_RE.lastIndex = 0;
+  const n = text.match(TRANSPARENCY_HEALTH_NUMBER_RE);
+  if (n) hits.push(`health_number=[${n.join(", ")}]`);
+  const p = text.match(TRANSPARENCY_HEALTH_PCT_RE);
+  if (p) hits.push(`health_pct=[${p.join(", ")}]`);
   return hits;
 }
 
@@ -109,16 +127,23 @@ if (files.length === 0) {
 let clean = 0;
 for (const f of files) {
   const d = JSON.parse(readFileSync(f, "utf-8"));
-  const hits = sweep(d.brief || "");
+  const briefHits = sweep(d.brief || "");
+  const transparencyHits = sweepTransparency(d.transparency || "");
   console.log(`===== ${f} =====`);
+  console.log("BRIEF:");
   console.log(d.brief);
   console.log();
-  if (hits.length === 0) {
-    console.log("SWEEP: CLEAN");
-    clean++;
+  if (briefHits.length === 0) {
+    console.log("BRIEF SWEEP: CLEAN");
   } else {
-    console.log("SWEEP:", hits.join(" ; "));
+    console.log("BRIEF SWEEP:", briefHits.join(" ; "));
   }
+  if (transparencyHits.length === 0) {
+    console.log("TRANSPARENCY SWEEP: CLEAN");
+  } else {
+    console.log("TRANSPARENCY SWEEP:", transparencyHits.join(" ; "));
+  }
+  if (briefHits.length === 0 && transparencyHits.length === 0) clean++;
   console.log();
 }
-console.log(`SUMMARY: ${clean} / ${files.length} clean`);
+console.log(`SUMMARY: ${clean} / ${files.length} fully clean`);
