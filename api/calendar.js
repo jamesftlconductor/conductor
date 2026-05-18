@@ -291,6 +291,61 @@ Return only the JSON object.`,
 }
 
 export default async function handler(req, res) {
+  // GET ?action=list — fetch the user's calendarList from Google,
+  // annotate each entry with isWorkCalendar via the existing
+  // heuristic, return the list + the detected work calendar id.
+  // Used by the mobile Settings smart picker.
+  if (req.method === "GET") {
+    const action = req.query?.action;
+    if (action !== "list") {
+      return res.status(400).json({ error: "Unknown action — use ?action=list" });
+    }
+    const userId = req.query?.userId;
+    if (!userId) return res.status(400).json({ error: "userId required" });
+    try {
+      const accessToken = await getValidToken(userId);
+      const profile = (await redis.get(`user:${userId}:profile`)) || null;
+      const profileObj = typeof profile === "string" ? JSON.parse(profile) : profile;
+      const userEmail = profileObj?.email || "";
+
+      const prefRaw = await redis.get(`user:${userId}:preferences`);
+      const prefs = typeof prefRaw === "string" ? JSON.parse(prefRaw) : prefRaw;
+      const overrideName = prefs?.workCalendarName || null;
+
+      const listRes = await fetch(
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      );
+      if (!listRes.ok) {
+        return res.status(502).json({ error: "Google calendarList fetch failed", status: listRes.status });
+      }
+      const data = await listRes.json();
+      const items = Array.isArray(data?.items) ? data.items : [];
+      let detectedWorkCalendar = null;
+      const calendars = items.map((cal) => {
+        const isWork = isWorkCalendar(cal, userEmail, overrideName);
+        if (isWork && !detectedWorkCalendar) detectedWorkCalendar = cal.id;
+        return {
+          id: cal.id,
+          summary: cal.summary,
+          primary: !!cal.primary,
+          backgroundColor: cal.backgroundColor || null,
+          accessRole: cal.accessRole || null,
+          isWorkCalendar: isWork,
+        };
+      });
+      return res.status(200).json({
+        userId,
+        calendars,
+        detectedWorkCalendar,
+        overrideName,
+      });
+    } catch (err) {
+      console.error("Calendar list error:", err);
+      return res.status(500).json({ error: "Calendar list failed", message: err?.message });
+    }
+  }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
