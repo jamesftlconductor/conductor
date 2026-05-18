@@ -411,13 +411,52 @@ async function fetchDestinationWeather(destination) {
   }
 }
 
+// Normalize whatever the user typed into a strict MM-DD. Accepts:
+//   "05-22"            → "05-22"
+//   "5-22"             → "05-22"
+//   "05-22-1990"       → "05-22"
+//   "1990-05-22"       → "05-22"
+//   "2026-05-22"       → "05-22"
+//   "May 22"           → "05-22"
+// Returns null when the input doesn't carry an unambiguous month + day.
+function normalizeMMDD(input) {
+  if (typeof input !== "string") return null;
+  const s = input.trim();
+  if (!s) return null;
+  // MM-DD or M-D
+  let m = s.match(/^(\d{1,2})-(\d{1,2})$/);
+  if (m) {
+    const mm = String(m[1]).padStart(2, "0");
+    const dd = String(m[2]).padStart(2, "0");
+    return `${mm}-${dd}`;
+  }
+  // MM-DD-YYYY (US legacy)
+  m = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+  if (m) {
+    return `${String(m[1]).padStart(2, "0")}-${String(m[2]).padStart(2, "0")}`;
+  }
+  // YYYY-MM-DD
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) {
+    return `${String(m[2]).padStart(2, "0")}-${String(m[3]).padStart(2, "0")}`;
+  }
+  // "May 22" / "May 22, 1990" — month name + day
+  const parsed = new Date(`${s} 2000`);
+  if (!isNaN(parsed.getTime()) && /[a-z]/i.test(s)) {
+    return `${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
+  }
+  return null;
+}
+
 // Days until the next occurrence of an MM-DD anchor (birthday or
-// anniversary, no year stored). Returns 0 for today, 1 for tomorrow,
-// and wraps to next year if the date has already passed this year.
-// Returns null for malformed input.
+// anniversary). Tolerant of MM-DD, MM-DD-YYYY, YYYY-MM-DD, and
+// month-name forms via normalizeMMDD. Returns 0 for today, 1 for
+// tomorrow, wraps to next year if past. Returns null for malformed
+// input.
 function daysUntilMMDD(mmDd) {
-  if (typeof mmDd !== "string" || !/^\d{2}-\d{2}$/.test(mmDd)) return null;
-  const [mm, dd] = mmDd.split("-").map(Number);
+  const normalized = normalizeMMDD(mmDd);
+  if (!normalized) return null;
+  const [mm, dd] = normalized.split("-").map(Number);
   if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
   const now = new Date();
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -430,8 +469,9 @@ function daysUntilMMDD(mmDd) {
 
 // Renders an MM-DD date as e.g. "June 3" — month name + day, no year.
 function formatMMDD(mmDd) {
-  if (typeof mmDd !== "string" || !/^\d{2}-\d{2}$/.test(mmDd)) return mmDd;
-  const [mm, dd] = mmDd.split("-").map(Number);
+  const normalized = normalizeMMDD(mmDd);
+  if (!normalized) return mmDd;
+  const [mm, dd] = normalized.split("-").map(Number);
   return new Date(2000, mm - 1, dd).toLocaleDateString("en-US", {
     month: "long",
     day: "numeric",
