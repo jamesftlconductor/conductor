@@ -3929,9 +3929,38 @@ ${isSingleMember
       console.warn("[brief] priorities rule failed:", err?.message);
     }
 
+    // Quiet day detection — when there's genuinely nothing in motion,
+    // we deserve a different brief shape rather than fabricating prose
+    // around emptiness. Conditions:
+    //   - No active signals
+    //   - No vault deadlines within 14 days
+    //   - No crew events today/tomorrow
+    const FOURTEEN_DAYS_MS = 14 * 24 * HOUR_MS;
+    const nowMs = Date.now();
+    const upcomingVaultIn14 = (allDeadlines || []).filter((d) => {
+      const ms = d?.renewalDate ? Date.parse(d.renewalDate) : NaN;
+      return !isNaN(ms) && ms >= nowMs && ms - nowMs <= FOURTEEN_DAYS_MS;
+    }).length;
+    const quietDay =
+      activeSignals.length === 0 &&
+      upcomingVaultIn14 === 0 &&
+      crewToday.length === 0;
+
     // First-run is handled by an early-return branch above; this path is
     // always the steady-state pipeline.
-    const userPrompt = `${layeredContext}\n\n${composedRules}`;
+    const userPrompt = quietDay
+      ? `${layeredContext}\n\nQUIET DAY PROMPT:
+This household has a genuinely quiet day — nothing urgent, nothing approaching, nothing needing attention.
+
+Write a brief that acknowledges this warmly. 2-3 sentences maximum.
+Options:
+- Acknowledge the quiet as a gift: "Nothing pressing today. The household is clear."
+- Use it as an opportunity: "Clear day ahead — good morning to handle something you've been putting off, or simply enjoy the space."
+- Reference the weather or season naturally: "Clear day in ${householdLocation?.city || "your city"}. Nothing in motion. Take it."
+- Occasional wit: "Conductor has been watching. Nothing to report. Enjoy it — this is rare."
+
+Never manufacture urgency. Never apologize for having nothing to say. The quiet brief is one of Conductor's best moments — use it well.`
+      : `${layeredContext}\n\n${composedRules}`;
 
     // Language preference. Default English; Spanish/Portuguese/
     // French households add a directive so the brief is generated
@@ -4313,6 +4342,7 @@ Return only the spoken text.`,
       brief: finalBrief,
       spokenSummary,
       householdName,
+      quietDay,
       segments,
       transparency,
       theRead,
