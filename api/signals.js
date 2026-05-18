@@ -504,6 +504,7 @@ async function handleCrew(req, res) {
           "type", "breed", "vet",
           "relationship",
           "notes", "prescriptions", "doctors",
+          "custodySchedule",
         ];
         const updates = member && typeof member === "object" ? member : {};
         for (const k of ALLOWED) {

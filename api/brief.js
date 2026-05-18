@@ -173,6 +173,35 @@ function parseDateLoose(value) {
   return isNaN(ms) ? null : new Date(ms);
 }
 
+// Custody-aware filter for child crew members. Returns true unless a
+// schedule says today is an away day. Used by the brief to suppress
+// signals + events belonging to a child who isn't with this household.
+function isChildHomeToday(member) {
+  const schedule = member?.custodySchedule;
+  if (!schedule || !schedule.type || schedule.type === "full_time") return true;
+  const now = new Date();
+  if (schedule.type === "alternating_weeks") {
+    // ISO week parity check. withUsWeeks: 'even' | 'odd' against the
+    // current ISO week number.
+    const target = String(schedule.withUsWeeks || "").toLowerCase();
+    if (target !== "even" && target !== "odd") return true;
+    const yearStart = new Date(now.getFullYear(), 0, 1);
+    const dayOfYear = Math.floor((now - yearStart) / (24 * 60 * 60 * 1000));
+    const isoWeek = Math.ceil((dayOfYear + yearStart.getDay() + 1) / 7);
+    const isEven = isoWeek % 2 === 0;
+    return target === "even" ? isEven : !isEven;
+  }
+  if (schedule.type === "alternating_days" || schedule.type === "custom") {
+    const days = Array.isArray(schedule.withUsDays)
+      ? schedule.withUsDays.map((d) => String(d).toLowerCase())
+      : [];
+    if (days.length === 0) return true;
+    const todayName = now.toLocaleString("en-US", { weekday: "long" }).toLowerCase();
+    return days.includes(todayName);
+  }
+  return true;
+}
+
 // Household profile → single combined HOUSEHOLD block in the prompt.
 // Reads new-schema fields (who/housing/modifiers) with legacy
 // fallback so we don't break briefs for households that completed
@@ -219,7 +248,7 @@ function buildHouseholdProfileRule(profile) {
 
   const MODIFIER_RULES = {
     has_pets: "Pet-care signals (vet appointments, prescriptions, food refills) are elevated.",
-    co_parent: "Co-parenting context — keep language neutral about the other parent. Children's schedule is the primary signal type; never reference the co-parent by relationship.",
+    co_parent: "Co-parenting context — never assume both parents are present. Children's schedule is the primary signal type regardless of other signal volume. Keep language neutral about the other parent — never 'your partner' or 'your spouse'. When the brief references a child's away time use 'is with their other parent this week' framing, never 'is away'. Never reference the co-parent by name unless explicitly stored in crew. Financial signals related to co-parenting (child support, shared expenses) get elevated priority.",
     health_needs: "Ongoing health needs in the household. Medication tracking and care appointments are elevated. The Pulse can lean into body-state observations when relevant.",
     major_change: "Major life change in progress. Tone is supportive throughout. Surface life-transition vault items ahead of older signals when timing demands.",
     students: "Students in the household. Academic-calendar awareness — semesters, finals, financial-aid deadlines get elevated priority.",
@@ -2815,6 +2844,12 @@ export default async function handler(req, res) {
     })();
     const crewToday = [];
     for (const m of crewMembers) {
+      // Custody-aware filtering: when a child's custodySchedule says
+      // they are not with this household today, skip surfacing their
+      // events. The Programme on mobile still shows them muted as
+      // "Away" so the parent can see the full picture; the brief
+      // simply doesn't mention them.
+      if (m?.memberType === "child" && !isChildHomeToday(m)) continue;
       const relevantEvents = (m.upcomingEvents || []).filter((ev) => {
         const ms = parseDateLoose(ev.date)?.getTime();
         if (!ms) return false;
