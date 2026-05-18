@@ -3749,6 +3749,48 @@ ${isSingleMember
       console.warn("[brief] style rule build failed:", err?.message);
     }
 
+    // Household priorities — what the user told us matters most during
+    // onboarding (Step 3). Stored at household:{id}:priorities as
+    // either an array or a { values: [...] } object. The prompt
+    // appendage tells Claude how to order competing lead candidates.
+    try {
+      const rawPriorities = await redis.get(`household:${householdId}:priorities`);
+      const parsed = rawPriorities
+        ? (typeof rawPriorities === "string" ? JSON.parse(rawPriorities) : rawPriorities)
+        : null;
+      const priorities = Array.isArray(parsed)
+        ? parsed
+        : Array.isArray(parsed?.values)
+        ? parsed.values
+        : [];
+      if (priorities.length > 0) {
+        const priorityLabels = {
+          deadlines: "Vault deadlines and renewals",
+          kids_schedules: "Children's schedules and crew events",
+          kids: "Children's schedules and crew events",
+          home_maintenance: "Home maintenance and service signals",
+          home: "Home maintenance and service signals",
+          financial: "Financial anomalies and subscription changes",
+          health: "Health synthesis and Oura readiness",
+          travel: "Travel signals and trip preparation",
+          service_providers: "Service appointments and contractor signals",
+          providers: "Service appointments and contractor signals",
+          deliveries: "Package deliveries and order tracking",
+          essentials: "Only genuinely urgent items — be conservative",
+        };
+        const labels = priorities
+          .map((p) => priorityLabels[p] || p)
+          .filter(Boolean);
+        const conservativeNote = priorities.includes("essentials")
+          ? "\nIf 'essentials' is selected: apply conservative filtering — only surface signals with genuine urgency or deadlines within 14 days."
+          : "";
+        const priorityRule = `- HOUSEHOLD PRIORITIES — lead with these signal types: ${labels.join(" → ")}. When multiple signals compete for brief lead, highest priority type wins.${conservativeNote}`;
+        composedRules = `${composedRules}\n${priorityRule}`;
+      }
+    } catch (err) {
+      console.warn("[brief] priorities rule failed:", err?.message);
+    }
+
     // First-run is handled by an early-return branch above; this path is
     // always the steady-state pipeline.
     const userPrompt = `${layeredContext}\n\n${composedRules}`;
