@@ -685,6 +685,84 @@ async function handleVault(req, res) {
       .map((s) => ({ ...s, isShared: true }));
     items = [...items, ...sharedItems];
 
+    // Lease items get computed fields at read time so the mobile
+    // doesn't have to re-derive notice deadlines + mileage overage.
+    // Residential leases: noticeDeadline = leaseEnd - noticeRequired
+    // days. Vehicle leases: projectedOverage = (estimatedMileageAtEnd)
+    // - allowance, using inventory vehicle mileage when matchable.
+    let inventoryVehicles = [];
+    try {
+      const rawInv = await redis.get(`household:${householdId}:inventory`);
+      const inv = rawInv ? (typeof rawInv === "string" ? JSON.parse(rawInv) : rawInv) : null;
+      if (inv && Array.isArray(inv.vehicles)) inventoryVehicles = inv.vehicles;
+    } catch { /* skip */ }
+    items = items.map((v) => {
+      if (v.category === "lease_residential") {
+        try {
+          if (v.leaseEnd && v.noticeRequired) {
+            const end = new Date(v.leaseEnd);
+            if (!isNaN(end.getTime())) {
+              const notice = new Date(end);
+              notice.setDate(notice.getDate() - Number(v.noticeRequired));
+              v.noticeDeadline = notice.toISOString().slice(0, 10);
+              v.daysUntilNoticeDeadline = Math.round(
+                (notice.getTime() - Date.now()) / (24 * 60 * 60 * 1000)
+              );
+              // Surface noticeDeadline as the renewalDate so existing
+              // vault sort/urgency logic picks it up.
+              if (!v.renewalDate) v.renewalDate = v.noticeDeadline;
+            }
+          }
+        } catch { /* skip */ }
+      } else if (v.category === "lease_vehicle") {
+        try {
+          if (v.leaseEnd && v.annualMileageAllowance) {
+            const end = new Date(v.leaseEnd);
+            if (!isNaN(end.getTime())) {
+              // Match inventory vehicle by make/model/year.
+              const match = inventoryVehicles.find(
+                (iv) =>
+                  iv &&
+                  String(iv.make || "").toLowerCase() === String(v.vehicleMake || "").toLowerCase() &&
+                  String(iv.model || "").toLowerCase() === String(v.vehicleModel || "").toLowerCase() &&
+                  Number(iv.year) === Number(v.vehicleYear)
+              );
+              const currentMileage =
+                Number(match?.currentMileage) ||
+                Number(v.currentMileageEstimate) ||
+                0;
+              // Estimate years remaining in the lease.
+              const yearsTotal =
+                v.leaseStart && !isNaN(Date.parse(v.leaseStart))
+                  ? (end.getTime() - Date.parse(v.leaseStart)) /
+                    (365.25 * 24 * 60 * 60 * 1000)
+                  : 3;
+              const yearsRemaining =
+                (end.getTime() - Date.now()) /
+                (365.25 * 24 * 60 * 60 * 1000);
+              const yearsElapsed = Math.max(0, yearsTotal - yearsRemaining);
+              const milesPerYear =
+                yearsElapsed > 0 ? currentMileage / yearsElapsed : 0;
+              const projectedAtEnd =
+                yearsElapsed > 0
+                  ? Math.round(milesPerYear * yearsTotal)
+                  : currentMileage;
+              const overage =
+                projectedAtEnd - Number(v.annualMileageAllowance) * yearsTotal;
+              v.projectedMileageAtEnd = projectedAtEnd;
+              v.projectedOverage = Math.round(overage);
+              v.projectedOverageCost =
+                overage > 0 && v.overageCostPerMile
+                  ? Math.round(overage * Number(v.overageCostPerMile))
+                  : null;
+              if (!v.renewalDate) v.renewalDate = v.leaseEnd;
+            }
+          }
+        } catch { /* skip */ }
+      }
+      return v;
+    });
+
     // Optional search — case-insensitive substring across description,
     // provider, category, and notes.
     const search = (req.query?.search || "").toString().trim().toLowerCase();
@@ -1273,6 +1351,874 @@ export function applyCamouflage(signals, rules) {
     if (s.sender && senderSet.has(normalizeSender(s.sender))) return false;
     return true;
   });
+}
+
+// ---------- Conductor Junior ----------
+
+const BADGE_DEFINITIONS = [
+  { id: "first_signal", name: "First signal", description: "Added your first school signal." },
+  { id: "week_streak", name: "Week streak", description: "7 consecutive days of chore completion." },
+  { id: "saver", name: "Saver", description: "Reached a savings goal." },
+  { id: "organized", name: "Organized", description: "Added 5 school signals in one month." },
+  { id: "reliable", name: "Reliable", description: "Completed all chores 2 weeks straight." },
+];
+
+// Resolve the crew member record + parent household for a child user
+// id. Children are stored as crew rows with juniorAccess=true and a
+// juniorUserId. We don't have a separate user:{id} mapping for them
+// — the parent's household key is authoritative.
+async function resolveJuniorContext(juniorUserId) {
+  if (!juniorUserId) return null;
+  // Direct lookup first — a child can have their own user:{id}:household
+  // mapping if a parent set one up; otherwise scan the parent's crew.
+  let householdId = await redis.get(`user:${juniorUserId}:household`);
+  let childRecord = null;
+
+  if (householdId) {
+    const rawCrew = await redis.get(`household:${householdId}:crew`);
+    const crew = safeJson(rawCrew) || [];
+    if (Array.isArray(crew)) {
+      childRecord = crew.find(
+        (m) => m && (m.juniorUserId === juniorUserId || m.userId === juniorUserId)
+      ) || null;
+    }
+  }
+  return { householdId, childRecord };
+}
+
+function calculateChoreStreak(chores) {
+  // Streak = consecutive days where AT LEAST one chore was completed,
+  // counting back from today.
+  const allDates = new Set();
+  for (const c of chores || []) {
+    for (const d of c?.completedDates || []) {
+      if (typeof d === "string") allDates.add(d.slice(0, 10));
+    }
+  }
+  let streak = 0;
+  const day = new Date();
+  day.setHours(0, 0, 0, 0);
+  for (let i = 0; i < 365; i++) {
+    const key = day.toISOString().slice(0, 10);
+    if (allDates.has(key)) {
+      streak += 1;
+      day.setDate(day.getDate() - 1);
+    } else if (i === 0) {
+      // Allow no-chore today without breaking streak — start counting
+      // from yesterday if today is empty.
+      day.setDate(day.getDate() - 1);
+    } else {
+      break;
+    }
+  }
+  return streak;
+}
+
+function evaluateBadges(child, streak, juniorSignalsThisMonth) {
+  const earned = new Set((child.badges || []).map((b) => b.id));
+  const newBadges = [];
+  const award = (id) => {
+    if (earned.has(id)) return;
+    const def = BADGE_DEFINITIONS.find((d) => d.id === id);
+    if (!def) return;
+    newBadges.push({
+      id: def.id,
+      name: def.name,
+      description: def.description,
+      earnedAt: new Date().toISOString(),
+    });
+    earned.add(id);
+  };
+  if ((child.signalsCreated || 0) >= 1) award("first_signal");
+  if (streak >= 7) award("week_streak");
+  if (
+    child.savingsGoal &&
+    typeof child.savingsGoal.currentAmount === "number" &&
+    typeof child.savingsGoal.targetAmount === "number" &&
+    child.savingsGoal.targetAmount > 0 &&
+    child.savingsGoal.currentAmount >= child.savingsGoal.targetAmount
+  ) {
+    award("saver");
+  }
+  if (juniorSignalsThisMonth >= 5) award("organized");
+  if (streak >= 14) award("reliable");
+  return newBadges;
+}
+
+async function handleJunior(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const juniorUserId = req.query?.userId;
+  if (!juniorUserId) return res.status(400).json({ error: "userId required" });
+  const ctx = await resolveJuniorContext(juniorUserId);
+  if (!ctx?.householdId || !ctx.childRecord) {
+    return res.status(404).json({
+      ok: false,
+      error: "junior_not_configured",
+      message: "No junior crew member found for this userId.",
+    });
+  }
+  const { householdId, childRecord } = ctx;
+  const childName = childRecord.name || "";
+
+  // Pull attributed signals + count this month's junior-source signals.
+  const rawSignals = await redis.lrange(`household:${householdId}:signals`, 0, -1);
+  const monthStart = new Date();
+  monthStart.setDate(1);
+  monthStart.setHours(0, 0, 0, 0);
+  const attributed = [];
+  let juniorSignalsThisMonth = 0;
+  for (const r of rawSignals || []) {
+    const s = safeJson(r);
+    if (!s) continue;
+    const matchesChild =
+      (s.crewMemberId && String(s.crewMemberId).toLowerCase() === childName.toLowerCase()) ||
+      (s.userId === juniorUserId);
+    if (matchesChild) attributed.push(s);
+    if (
+      s.source === "junior" &&
+      s.createdAt &&
+      s.createdAt >= monthStart.getTime()
+    ) {
+      juniorSignalsThisMonth += 1;
+    }
+  }
+
+  const streak = calculateChoreStreak(childRecord.chores);
+  const newBadges = evaluateBadges(childRecord, streak, juniorSignalsThisMonth);
+  // Persist newly-earned badges back into the crew record so the
+  // next read shows them even before any chore activity.
+  if (newBadges.length > 0) {
+    try {
+      const rawCrew = await redis.get(`household:${householdId}:crew`);
+      const crew = safeJson(rawCrew) || [];
+      const idx = crew.findIndex(
+        (m) =>
+          m &&
+          (m.juniorUserId === juniorUserId ||
+            (m.name && m.name.toLowerCase() === childName.toLowerCase()))
+      );
+      if (idx >= 0) {
+        crew[idx].badges = [...(crew[idx].badges || []), ...newBadges];
+        await redis.set(`household:${householdId}:crew`, JSON.stringify(crew));
+      }
+    } catch (err) {
+      console.warn("[junior] badge persist failed:", err?.message);
+    }
+  }
+
+  return res.status(200).json({
+    ok: true,
+    household: householdId,
+    name: childName,
+    streak,
+    chores: childRecord.chores || [],
+    savingsGoal: childRecord.savingsGoal || null,
+    allowanceWeekly: childRecord.allowanceWeekly || null,
+    badges: [...(childRecord.badges || []), ...newBadges],
+    badgesAvailable: BADGE_DEFINITIONS,
+    attributedSignals: attributed.slice(0, 10),
+    juniorSignalsThisMonth,
+  });
+}
+
+async function handleJuniorRelay(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const { userId, description, category, urgency, voiceTranscript } = req.body || {};
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  if (!description || !String(description).trim()) {
+    return res.status(400).json({ error: "description required" });
+  }
+  const ctx = await resolveJuniorContext(userId);
+  if (!ctx?.householdId || !ctx.childRecord) {
+    return res.status(404).json({ error: "junior_not_configured" });
+  }
+  const { householdId, childRecord } = ctx;
+  const childName = childRecord.name || "";
+
+  if (category === "allowance_request") {
+    // Pending allowance request — not a signal. Stored separately so
+    // a parent can approve/reject via Settings or a future approval
+    // surface.
+    const request = {
+      id: Date.now(),
+      childName,
+      childUserId: userId,
+      description: String(description).trim(),
+      voiceTranscript: voiceTranscript || null,
+      requestedAt: new Date().toISOString(),
+      status: "pending",
+    };
+    await redis.lpush(
+      `household:${householdId}:juniorAllowanceRequests`,
+      JSON.stringify(request)
+    );
+    return res.status(200).json({ ok: true, kind: "allowance_request", request });
+  }
+
+  const etaForUrgency = (() => {
+    const now = new Date();
+    if (urgency === "today") return now.toISOString().slice(0, 10);
+    if (urgency === "this_week") {
+      const d = new Date(now);
+      d.setDate(d.getDate() + 5);
+      return d.toISOString().slice(0, 10);
+    }
+    if (urgency === "soon") {
+      const d = new Date(now);
+      d.setDate(d.getDate() + 14);
+      return d.toISOString().slice(0, 10);
+    }
+    return null;
+  })();
+
+  const tagPrefix = `[${childName.toUpperCase()} ADDED] `;
+  const cleanDesc = String(description).trim().replace(/^\[.*?ADDED\]\s*/i, "");
+  const signal = {
+    id: Date.now(),
+    description: tagPrefix + cleanDesc,
+    type:
+      category === "supply_needed" ? "supplies"
+      : category === "school_info" ? "school"
+      : category === "schedule_change" ? "schedule"
+      : "junior",
+    eta: etaForUrgency,
+    sender: childName || "Junior",
+    status: null,
+    state: "incoming",
+    source: "junior",
+    crewMemberId: childName,
+    userId,
+    voiceTranscript: voiceTranscript || null,
+    juniorCategory: category || "other",
+    juniorUrgency: urgency || "soon",
+    lastUpdate: new Date().toLocaleString(),
+    createdAt: Date.now(),
+  };
+  await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
+
+  // Bump signalsCreated counter on the child record so the badge
+  // evaluator can fire "First signal" + "Organized".
+  try {
+    const rawCrew = await redis.get(`household:${householdId}:crew`);
+    const crew = safeJson(rawCrew) || [];
+    const idx = crew.findIndex(
+      (m) =>
+        m &&
+        (m.juniorUserId === userId ||
+          (m.name && m.name.toLowerCase() === childName.toLowerCase()))
+    );
+    if (idx >= 0) {
+      crew[idx].signalsCreated = (crew[idx].signalsCreated || 0) + 1;
+      await redis.set(`household:${householdId}:crew`, JSON.stringify(crew));
+    }
+  } catch (err) {
+    console.warn("[junior] signalsCreated bump failed:", err?.message);
+  }
+
+  return res.status(201).json({ ok: true, household: householdId, signal });
+}
+
+async function handleJuniorVoice(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const { userId, transcript } = req.body || {};
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  if (!transcript || !String(transcript).trim()) {
+    return res.status(400).json({ error: "transcript required" });
+  }
+  const ctx = await resolveJuniorContext(userId);
+  if (!ctx?.householdId || !ctx.childRecord) {
+    return res.status(404).json({ error: "junior_not_configured" });
+  }
+
+  // Classify intent via Haiku tool_use.
+  const prompt = `A child has spoken this into Conductor Junior. Classify the intent and extract details for the parent's household signal feed. Be charitable — children speak naturally.
+
+Voice input: "${String(transcript).trim()}"
+
+Return via the record_junior_intent tool.`;
+
+  let parsed = null;
+  try {
+    const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 500,
+        tools: [
+          {
+            name: "record_junior_intent",
+            description: "Classify a child's voice input.",
+            input_schema: {
+              type: "object",
+              properties: {
+                intent: {
+                  type: "string",
+                  enum: [
+                    "need_supplies",
+                    "schedule_change",
+                    "school_info",
+                    "allowance_request",
+                    "chore_done",
+                    "memory",
+                    "other",
+                  ],
+                },
+                description: { type: "string" },
+                urgency: { type: "string", enum: ["today", "this_week", "soon"] },
+                item: { type: ["string", "null"] },
+                amount: { type: ["number", "null"] },
+                isPositive: { type: "boolean" },
+                choreName: { type: ["string", "null"] },
+              },
+              required: ["intent", "description", "urgency", "isPositive"],
+            },
+          },
+        ],
+        tool_choice: { type: "tool", name: "record_junior_intent" },
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (apiRes.ok) {
+      const data = await apiRes.json();
+      const tool = (data?.content || []).find((b) => b?.type === "tool_use");
+      if (tool) parsed = tool.input;
+    }
+  } catch (err) {
+    console.warn("[junior-voice] classify failed:", err?.message);
+  }
+
+  if (!parsed) {
+    return res.status(502).json({ error: "voice classification failed" });
+  }
+
+  // Branch on intent. Memory + chore_done don't hit the parent feed.
+  if (parsed.isPositive || parsed.intent === "memory") {
+    const entry = {
+      type: "junior_memory",
+      childName: ctx.childRecord.name,
+      description: parsed.description,
+      voiceTranscript: String(transcript).trim(),
+      createdAt: Date.now(),
+      createdAtIso: new Date().toISOString(),
+    };
+    await redis.lpush(
+      `household:${ctx.householdId}:memory`,
+      JSON.stringify(entry)
+    );
+    return res.status(200).json({ ok: true, kind: "memory", entry });
+  }
+
+  if (parsed.intent === "chore_done" && parsed.choreName) {
+    // Forward to chore-complete inline.
+    req.body = {
+      userId,
+      choreName: parsed.choreName,
+      completedDate: new Date().toISOString().slice(0, 10),
+    };
+    return handleChoreComplete(req, res);
+  }
+
+  // Otherwise create a relay signal.
+  req.body = {
+    userId,
+    description: parsed.description,
+    category:
+      parsed.intent === "need_supplies" ? "supply_needed"
+      : parsed.intent === "schedule_change" ? "schedule_change"
+      : parsed.intent === "school_info" ? "school_info"
+      : parsed.intent === "allowance_request" ? "allowance_request"
+      : "other",
+    urgency: parsed.urgency,
+    voiceTranscript: String(transcript).trim(),
+  };
+  return handleJuniorRelay(req, res);
+}
+
+async function handleChoreComplete(req, res) {
+  if (req.method !== "POST" && req.method !== "PATCH") {
+    res.setHeader("Allow", "POST, PATCH");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const { userId, choreName, completedDate } = req.body || {};
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  if (!choreName) return res.status(400).json({ error: "choreName required" });
+  const ctx = await resolveJuniorContext(userId);
+  if (!ctx?.householdId || !ctx.childRecord) {
+    return res.status(404).json({ error: "junior_not_configured" });
+  }
+  const dayKey = (completedDate || new Date().toISOString()).slice(0, 10);
+
+  const rawCrew = await redis.get(`household:${ctx.householdId}:crew`);
+  const crew = safeJson(rawCrew) || [];
+  const idx = crew.findIndex(
+    (m) =>
+      m &&
+      (m.juniorUserId === userId ||
+        (m.name && m.name.toLowerCase() === (ctx.childRecord.name || "").toLowerCase()))
+  );
+  if (idx < 0) {
+    return res.status(404).json({ error: "junior_not_configured" });
+  }
+  const chores = Array.isArray(crew[idx].chores) ? crew[idx].chores : [];
+  const choreIdx = chores.findIndex(
+    (c) => c && c.name && c.name.toLowerCase() === String(choreName).toLowerCase()
+  );
+  if (choreIdx < 0) {
+    return res.status(404).json({ error: "chore_not_found" });
+  }
+  const completed = new Set(chores[choreIdx].completedDates || []);
+  completed.add(dayKey);
+  chores[choreIdx].completedDates = Array.from(completed);
+  crew[idx].chores = chores;
+  await redis.set(`household:${ctx.householdId}:crew`, JSON.stringify(crew));
+
+  const streak = calculateChoreStreak(chores);
+  return res.status(200).json({
+    ok: true,
+    streak,
+    chore: chores[choreIdx],
+  });
+}
+
+// ---------- Household Profile ----------
+
+const VALID_PROFILE_TYPES = new Set([
+  "single",
+  "couple",
+  "family",
+  "roommates",
+  "multigenerational",
+  "other",
+]);
+
+async function handleProfile(req, res) {
+  const userId = req.method === "GET" ? req.query?.userId : req.body?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+  const key = `household:${householdId}:profile`;
+
+  if (req.method === "GET") {
+    const raw = await redis.get(key);
+    const profile = safeJson(raw);
+    return res.status(200).json({ ok: true, household: householdId, profile });
+  }
+  if (req.method === "POST") {
+    const { type, ownOrRent, childrenCount, petsCount } = req.body || {};
+    if (type && !VALID_PROFILE_TYPES.has(type)) {
+      return res.status(400).json({ error: "invalid type" });
+    }
+    const existing = safeJson(await redis.get(key)) || {};
+    const next = {
+      ...existing,
+      ...(type && { type }),
+      ...(ownOrRent && { ownOrRent }),
+      ...(childrenCount != null && { childrenCount: Number(childrenCount) }),
+      ...(petsCount != null && { petsCount: Number(petsCount) }),
+      setAt: new Date().toISOString(),
+    };
+    await redis.set(key, JSON.stringify(next));
+    return res.status(200).json({ ok: true, household: householdId, profile: next });
+  }
+  res.setHeader("Allow", "GET, POST");
+  return res.status(405).json({ error: "Method not allowed" });
+}
+
+// ---------- Privacy Dashboard ----------
+
+async function handlePrivacy(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const userId = req.query?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+
+  // Best-effort counts — each is wrapped in try because some keys may
+  // not exist for a brand-new household.
+  const safeLen = async (k) => {
+    try {
+      const n = await redis.llen(k);
+      return typeof n === "number" ? n : 0;
+    } catch { return 0; }
+  };
+  const safeArrLen = async (k) => {
+    try {
+      const raw = await redis.get(k);
+      const arr = safeJson(raw);
+      return Array.isArray(arr) ? arr.length : 0;
+    } catch { return 0; }
+  };
+  const safeSetLen = async (k) => {
+    try {
+      const n = await redis.scard(k);
+      return typeof n === "number" ? n : 0;
+    } catch { return 0; }
+  };
+
+  const [
+    signalsFound,
+    vaultItems,
+    importedMessages,
+    sentCommunications,
+    networkConnections,
+    crewCount,
+  ] = await Promise.all([
+    safeLen(`household:${householdId}:signals`),
+    safeArrLen(`household:${householdId}:vault`).then(async (n) => {
+      // Vault may also be a list — try both shapes.
+      if (n) return n;
+      return safeLen(`household:${householdId}:vault`);
+    }),
+    safeSetLen(`household:${householdId}:importedMessages`),
+    safeLen(`household:${householdId}:sentCommunications`),
+    safeSetLen(`household:${householdId}:networkConnections`),
+    safeArrLen(`household:${householdId}:crew`),
+  ]);
+
+  // connectedSince — try user:{id}:profile or fall back to oldest signal.
+  let connectedSince = null;
+  try {
+    const profile = safeJson(await redis.get(`user:${userId}:profile`));
+    if (profile?.connectedAt) connectedSince = profile.connectedAt;
+  } catch { /* skip */ }
+  if (!connectedSince) {
+    try {
+      const raw = await redis.lrange(`household:${householdId}:signals`, -1, -1);
+      const oldest = safeJson(raw?.[0]);
+      if (oldest?.createdAt) connectedSince = new Date(oldest.createdAt).toISOString();
+    } catch { /* skip */ }
+  }
+
+  // dataTypes — derived from which feature keys exist.
+  const dataTypes = ["gmail", "calendar"];
+  try {
+    if (await redis.get(`user:${userId}:health`)) dataTypes.push("health");
+  } catch { /* skip */ }
+  try {
+    if (await redis.get(`user:${userId}:oura:tokens`)) dataTypes.push("oura");
+  } catch { /* skip */ }
+
+  return res.status(200).json({
+    ok: true,
+    household: householdId,
+    signalsFound,
+    vaultItems,
+    crewMembers: crewCount,
+    emailsScanned: importedMessages,
+    sentCommunications,
+    networkConnections,
+    connectedSince,
+    dataTypes,
+  });
+}
+
+// ---------- Founding Household / Referrals ----------
+
+const REFERRAL_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+function generateReferralCode() {
+  let out = "";
+  for (let i = 0; i < 8; i++) {
+    out += REFERRAL_ALPHABET[Math.floor(Math.random() * REFERRAL_ALPHABET.length)];
+  }
+  return out;
+}
+
+async function ensureReferralCode(householdId) {
+  const key = `household:${householdId}:referralCode`;
+  const existing = await redis.get(key);
+  if (existing) return String(existing);
+  let attempts = 0;
+  while (attempts < 8) {
+    const code = generateReferralCode();
+    const taken = await redis.get(`referral:${code}`);
+    if (!taken) {
+      await redis.set(key, code);
+      await redis.set(`referral:${code}`, householdId);
+      return code;
+    }
+    attempts += 1;
+  }
+  // Extremely unlikely, but fall back to a longer code on collision.
+  const fallback = generateReferralCode() + Date.now().toString(36).slice(-4).toUpperCase();
+  await redis.set(key, fallback);
+  await redis.set(`referral:${fallback}`, householdId);
+  return fallback;
+}
+
+async function handleReferral(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const userId = req.query?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+
+  // Founding household detection — if not already flagged, check the
+  // count of all households and mark this one as founding if it's
+  // one of the first 50.
+  const flagKey = `household:${householdId}:foundingHousehold`;
+  const freeUntilKey = `household:${householdId}:freeUntil`;
+  let founding = (await redis.get(flagKey)) === "1";
+  let freeUntil = await redis.get(freeUntilKey);
+
+  if (!founding && !freeUntil) {
+    try {
+      // Approximate global count via SCARD on a registry set if it
+      // exists; otherwise just opt this household in. The 50-cap is
+      // best-effort — a future cron can prune outliers.
+      const count = await redis.scard("households:registry").catch(() => 0);
+      const isFounding = (count || 0) < 50;
+      if (isFounding) {
+        founding = true;
+        const six = new Date();
+        six.setMonth(six.getMonth() + 6);
+        freeUntil = six.toISOString();
+        await redis.set(flagKey, "1");
+        await redis.set(freeUntilKey, freeUntil);
+      }
+      try { await redis.sadd("households:registry", householdId); } catch { /* skip */ }
+    } catch (err) {
+      console.warn("[referral] founding check failed:", err?.message);
+    }
+  }
+
+  const code = await ensureReferralCode(householdId);
+  const count = parseInt(
+    (await redis.get(`household:${householdId}:referralCount`)) || "0",
+    10
+  ) || 0;
+  const freeMonthsEarned = count; // 30 days per referral, simplified as months
+
+  return res.status(200).json({
+    ok: true,
+    referralCode: code,
+    referralCount: count,
+    freeMonthsEarned,
+    foundingHousehold: founding,
+    freeUntil: freeUntil || null,
+  });
+}
+
+async function handleReferralJoin(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const { referralCode, newHouseholdId } = req.body || {};
+  if (!referralCode) return res.status(400).json({ error: "referralCode required" });
+  if (!newHouseholdId) return res.status(400).json({ error: "newHouseholdId required" });
+
+  const referringHouseholdId = await redis.get(`referral:${String(referralCode).toUpperCase()}`);
+  if (!referringHouseholdId) {
+    return res.status(404).json({ ok: false, error: "invalid referral code" });
+  }
+
+  // Increment referrer's count + extend freeUntil by 30 days.
+  const countKey = `household:${referringHouseholdId}:referralCount`;
+  const currentCount = parseInt((await redis.get(countKey)) || "0", 10) || 0;
+  await redis.set(countKey, String(currentCount + 1));
+
+  const freeKey = `household:${referringHouseholdId}:freeUntil`;
+  const existingFreeUntil = await redis.get(freeKey);
+  const baseDate = existingFreeUntil ? new Date(existingFreeUntil) : new Date();
+  if (isNaN(baseDate.getTime())) baseDate.setTime(Date.now());
+  baseDate.setDate(baseDate.getDate() + 30);
+  await redis.set(freeKey, baseDate.toISOString());
+
+  // Mark new household as referred.
+  await redis.set(`household:${newHouseholdId}:referredBy`, String(referralCode).toUpperCase());
+
+  return res.status(200).json({
+    ok: true,
+    referringHouseholdId,
+    referrerNewFreeUntil: baseDate.toISOString(),
+  });
+}
+
+// ---------- Account Deletion + Export ----------
+
+const DELETE_CONFIRMATION_PHRASE = "delete my account";
+
+const HOUSEHOLD_KEY_SUFFIXES = [
+  "signals",
+  "vault",
+  "crew",
+  "memory",
+  "patterns",
+  "inventory",
+  "providers",
+  "transactions",
+  "maintenancePlan",
+  "streakData",
+  "networkConnections",
+  "calendar",
+  "horizon",
+  "weeklyGoals",
+  "importedMessages",
+  "contentFingerprints",
+  "sentCommunications",
+  "contacts",
+  "profile",
+  "firstBriefSent",
+  "foundingHousehold",
+  "freeUntil",
+  "referralCount",
+  "referralCode",
+  "referredBy",
+  "juniorAllowanceRequests",
+  "anniversaryAcknowledged",
+];
+
+async function handleDeleteAccount(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const { userId, confirmationPhrase } = req.body || {};
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  if (
+    !confirmationPhrase ||
+    String(confirmationPhrase).trim().toLowerCase() !== DELETE_CONFIRMATION_PHRASE
+  ) {
+    return res.status(400).json({
+      error: "confirmation_phrase_required",
+      expected: DELETE_CONFIRMATION_PHRASE,
+    });
+  }
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+
+  // Best-effort, idempotent deletion. Errors on any single key are
+  // logged but don't abort — better to clear most than refuse to
+  // delete on a stuck key.
+  const deletions = {};
+  for (const suffix of HOUSEHOLD_KEY_SUFFIXES) {
+    const key = `household:${householdId}:${suffix}`;
+    try { deletions[key] = await redis.del(key); } catch { deletions[key] = "err"; }
+  }
+  // Per-user keys.
+  const userKeys = [
+    `user:${userId}:tokens`,
+    `user:${userId}:profile`,
+    `user:${userId}:household`,
+    `user:${userId}:preferences`,
+    `user:${userId}:currentTakeoff`,
+    `user:${userId}:health`,
+    `user:${userId}:pushToken`,
+    `user:${userId}:oura:tokens`,
+    `user:${userId}:oura:settings`,
+  ];
+  for (const key of userKeys) {
+    try { deletions[key] = await redis.del(key); } catch { deletions[key] = "err"; }
+  }
+  // Drop the household from the registry.
+  try { await redis.srem("households:registry", householdId); } catch { /* skip */ }
+
+  return res.status(200).json({
+    ok: true,
+    deleted: true,
+    deletions,
+  });
+}
+
+async function handleExport(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const userId = req.query?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+
+  const safeList = async (k) => {
+    try {
+      const raw = await redis.lrange(k, 0, -1);
+      return (raw || []).map((r) => safeJson(r)).filter(Boolean);
+    } catch { return []; }
+  };
+  const safeGetJson = async (k) => {
+    try {
+      const raw = await redis.get(k);
+      return safeJson(raw);
+    } catch { return null; }
+  };
+
+  const [
+    signals,
+    memory,
+    patterns,
+    transactions,
+    sentCommunications,
+    vault,
+    crew,
+    inventory,
+    providers,
+    streakData,
+    maintenancePlan,
+    profile,
+    contacts,
+  ] = await Promise.all([
+    safeList(`household:${householdId}:signals`),
+    safeList(`household:${householdId}:memory`),
+    safeList(`household:${householdId}:patterns`),
+    safeList(`household:${householdId}:transactions`),
+    safeList(`household:${householdId}:sentCommunications`),
+    safeGetJson(`household:${householdId}:vault`),
+    safeGetJson(`household:${householdId}:crew`),
+    safeGetJson(`household:${householdId}:inventory`),
+    safeGetJson(`household:${householdId}:providers`),
+    safeGetJson(`household:${householdId}:streakData`),
+    safeGetJson(`household:${householdId}:maintenancePlan`),
+    safeGetJson(`household:${householdId}:profile`),
+    safeGetJson(`household:${householdId}:contacts`),
+  ]);
+
+  const payload = {
+    exportedAt: new Date().toISOString(),
+    householdId,
+    userId,
+    profile,
+    signals,
+    vault,
+    crew,
+    memory,
+    patterns,
+    inventory,
+    providers,
+    transactions,
+    streakData,
+    maintenancePlan,
+    sentCommunications,
+    contacts,
+  };
+
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader(
+    "Content-Disposition",
+    `attachment; filename="conductor-export-${householdId}-${Date.now()}.json"`
+  );
+  return res.status(200).send(JSON.stringify(payload, null, 2));
 }
 
 async function handleCamouflage(req, res) {
@@ -2325,6 +3271,50 @@ export default async function handler(req, res) {
     // adds + scrubs matching active signals, DELETE removes a rule.
     if (queryType === "camouflage" || bodyType === "camouflage") {
       return handleCamouflage(req, res);
+    }
+
+    // Junior — child interface aggregate. Returns chores + streak +
+    // savings + badges + attributed signals for the requesting child.
+    // The child's userId is the same key as the parent's view, but
+    // the response is shaped for the child UI.
+    if (queryType === "junior") {
+      return handleJunior(req, res);
+    }
+
+    if (queryType === "junior-relay" || bodyType === "junior-relay") {
+      return handleJuniorRelay(req, res);
+    }
+
+    if (queryType === "junior-voice" || bodyType === "junior-voice") {
+      return handleJuniorVoice(req, res);
+    }
+
+    if (queryType === "chore-complete" || bodyType === "chore-complete") {
+      return handleChoreComplete(req, res);
+    }
+
+    if (queryType === "profile" || bodyType === "profile") {
+      return handleProfile(req, res);
+    }
+
+    if (queryType === "privacy") {
+      return handlePrivacy(req, res);
+    }
+
+    if (queryType === "referral") {
+      return handleReferral(req, res);
+    }
+
+    if (queryType === "referral-join" || bodyType === "referral-join") {
+      return handleReferralJoin(req, res);
+    }
+
+    if (queryType === "delete-account" || bodyType === "delete-account") {
+      return handleDeleteAccount(req, res);
+    }
+
+    if (queryType === "export") {
+      return handleExport(req, res);
     }
 
     if (req.method === "GET") {

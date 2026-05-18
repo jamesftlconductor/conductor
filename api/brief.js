@@ -3569,6 +3569,40 @@ ${isSingleMember
       if (rule) composedRules = `${baseRules}\n${rule}`;
     }
 
+    // Household profile voice adjustments. The profile is set during
+    // onboarding (POST /api/signals?type=profile) — single/couple/
+    // family/roommates/multigenerational/other + own/rent. We append
+    // a voice rule so the brief speaks differently to each shape.
+    try {
+      const rawProfile = await redis.get(`household:${householdId}:profile`);
+      const profile = rawProfile
+        ? (typeof rawProfile === "string" ? JSON.parse(rawProfile) : rawProfile)
+        : null;
+      if (profile?.type) {
+        const PROFILE_VOICE = {
+          single: "- HOUSEHOLD PROFILE: SINGLE. Use 'you' not 'the household'. More personal tone — this person is the household. 'Your week' not 'the household's week'. Lead with personal health and financial signals when both are present.",
+          couple: "- HOUSEHOLD PROFILE: COUPLE. Collaborative language is natural. Handoff detection is active. Occasional 'you two' is fine but don't lean on it.",
+          family: "- HOUSEHOLD PROFILE: FAMILY WITH CHILDREN. Crew-forward voice — kids' schedules matter. Junior-added signals (source: 'junior') get elevated priority and warm framing.",
+          roommates: "- HOUSEHOLD PROFILE: ROOMMATES. Lighter assumptions about shared life. Financial signals (shared expenses, utilities) get elevated priority. Skip family-coded framings like 'the household's week together'.",
+          multigenerational: "- HOUSEHOLD PROFILE: MULTIGENERATIONAL. Health awareness for all ages is more prominent. Medication tracking and appointment signals get elevated priority. Voice is gentle throughout.",
+          other: "",
+        };
+        const profileRule = PROFILE_VOICE[profile.type] || "";
+        const ownRentRule =
+          profile.ownOrRent === "rent"
+            ? "- OWN VS RENT: RENTING. Skip any home-maintenance phrasing. Lease tracking is prominent — surface lease notice deadlines aggressively. Apartment-scale inventory only — never reference roof/exterior/landscape items."
+            : profile.ownOrRent === "own"
+            ? "- OWN VS RENT: OWNS HOME. Full maintenance plan + inventory + exterior items in play."
+            : "";
+        const combined = [profileRule, ownRentRule].filter(Boolean).join("\n");
+        if (combined) {
+          composedRules = `${composedRules}\n${combined}`;
+        }
+      }
+    } catch (err) {
+      console.warn("[brief] profile rule load failed:", err?.message);
+    }
+
     // First-run is handled by an early-return branch above; this path is
     // always the steady-state pipeline.
     const userPrompt = `${layeredContext}\n\n${composedRules}`;
@@ -3873,7 +3907,7 @@ ${isSingleMember
 
     let finalBrief = brief;
     if (isFirstBrief) {
-      const welcome = "Conductor is built for households like yours — complex, busy, always in motion. A Directory is in Settings whenever you want to explore what's here.";
+      const welcome = "Conductor is built for households like yours — complex, busy, always in motion. A Directory in Settings covers everything whenever you're ready.";
       finalBrief = `${welcome}\n\n${brief}`.trim();
     }
     if (anniversary) {

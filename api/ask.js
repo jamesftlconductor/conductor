@@ -263,6 +263,201 @@ function parseAskResponse(raw) {
   return { answer: raw, confidence: "medium" };
 }
 
+// ---------- Intent classification ----------
+
+const NAVIGATE_ROUTES = {
+  vault: "/vault",
+  "my vault": "/vault",
+  crew: "/crew",
+  "my crew": "/crew",
+  hover: "/hover",
+  radar: "/hover",
+  horizon: "/horizon",
+  "the horizon": "/horizon",
+  compass: "/compass",
+  patterns: "/compass",
+  journal: "/journal",
+  memory: "/journal",
+  settings: "/settings",
+  inventory: "/inventory",
+  "home inventory": "/inventory",
+  providers: "/providers",
+  network: "/network",
+  "the network": "/network",
+  maintenance: "/maintenance",
+  "maintenance plan": "/maintenance",
+  programme: "/programme",
+  "the programme": "/programme",
+  directory: "/directory",
+  privacy: "/privacy-dashboard",
+  "privacy dashboard": "/privacy-dashboard",
+  junior: "/junior",
+  "conductor junior": "/junior",
+};
+
+const SETTING_MAP = {
+  "face id": { key: "security.securityEnabled", value: true, label: "Face ID" },
+  biometrics: { key: "security.securityEnabled", value: true, label: "biometrics" },
+  "touch id": { key: "security.securityEnabled", value: true, label: "Touch ID" },
+  "midday brief": { key: "preferences.middayEnabled", value: true, label: "midday brief" },
+  "midday notifications": { key: "preferences.middayEnabled", value: true, label: "midday notifications" },
+};
+
+const PRODUCT_KNOWLEDGE = {
+  vault: "The Vault is your household's permanent record — insurance policies, subscriptions, warranties, registrations, and deadlines. Conductor populates it from Gmail automatically. You can also scan documents or add items manually.",
+  brief: "The brief is a 3-5 sentence morning summary of what matters most in your household today. It arrives at 7am and gets smarter as Conductor learns your patterns.",
+  hover: "Hover is your household radar — three rings showing signal urgency. Inner ring needs attention today. Middle ring is approaching. Outer ring is on the horizon. Tap any dot to see details.",
+  radar: "Hover is your household radar — three rings showing signal urgency. Inner ring needs attention today. Middle ring is approaching. Outer ring is on the horizon.",
+  pulse: "The Pulse synthesizes your health, weather, and signal load into one sentence about today. Tap it on the Ground screen to expand and see what's feeding into it.",
+  crew: "Crew is everyone in your household — partners, children, pets. Each crew member has a bio with schedule, health details, and attributed signals.",
+  horizon: "The Horizon shows everything beyond the next two weeks — Coming Up, Further Out, and On the Edge. Tap Noted to acknowledge without resolving.",
+  programme: "The Programme is a 14-day timeline showing signals, crew events, vault deadlines, and calendar events on one view.",
+  inventory: "Home Inventory is where you tell Conductor about your home's systems — roof, HVAC, water heater, vehicles. The more you fill in, the smarter the maintenance plan.",
+  network: "The Network connects your household to family households you trust. You choose what to share — from emergency-only to full signal visibility.",
+  maintenance: "The maintenance plan is an annual schedule generated from your home inventory with seasonal timing and real cost ranges. Each item can be added to your signal radar with one tap.",
+  signal: "A signal is anything in your household that needs awareness or action — a delivery, a deadline, a service appointment, a renewal. Conductor finds signals in your Gmail automatically.",
+  signals: "Signals are anything in your household that need awareness or action. Conductor finds them in your Gmail automatically and you can add manual ones.",
+  rest: "Rest resolves a signal — it moves to the resolved state and contributes to your household streak.",
+  streak: "The streak counts consecutive days where at least one signal was handled. It rewards keeping things in motion.",
+  "the brief": "The brief is a 3-5 sentence morning summary of what matters most in your household today. It arrives at 7am.",
+  "the radar": "Hover is your household radar — three rotating rings showing signal urgency, from inner (today) to outer (on the horizon).",
+};
+
+async function classifyIntent(question) {
+  const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 300,
+      tools: [
+        {
+          name: "classify_ask_intent",
+          description: "Classify a household question into an actionable intent.",
+          input_schema: {
+            type: "object",
+            properties: {
+              intent: {
+                type: "string",
+                enum: ["NAVIGATE", "SETTINGS_CHANGE", "CREATE", "EXPLAIN", "QUERY"],
+              },
+              destination: { type: ["string", "null"] },
+              settingKey: { type: ["string", "null"] },
+              entity: { type: ["string", "null"] },
+              explainTopic: { type: ["string", "null"] },
+            },
+            required: ["intent"],
+          },
+        },
+      ],
+      tool_choice: { type: "tool", name: "classify_ask_intent" },
+      messages: [
+        {
+          role: "user",
+          content: `Classify this household question into one of these intents:
+- NAVIGATE: wants to go to a screen ("show me vault", "take me to crew", "open settings")
+- SETTINGS_CHANGE: wants to change a setting ("turn on face id", "enable midday")
+- CREATE: wants to create something ("add a reminder", "create a signal")
+- EXPLAIN: wants to understand the product ("what is the vault", "how do I add crew", "what does rest mean")
+- QUERY: wants household-specific info (everything else, including "what's coming up" / "what should this cost" / "how am I doing")
+
+For NAVIGATE, set destination to the short label (e.g. "vault", "crew", "horizon").
+For EXPLAIN, set explainTopic to the concept being asked about (e.g. "vault", "pulse").
+For SETTINGS_CHANGE, set settingKey to a phrase like "face id" or "midday brief".
+For CREATE, set entity to "signal" or "crew_member".
+
+Question: "${question}"`,
+        },
+      ],
+    }),
+  });
+  if (!apiRes.ok) return null;
+  const data = await apiRes.json();
+  const tool = (data?.content || []).find((b) => b?.type === "tool_use");
+  return tool?.input || null;
+}
+
+function buildIntentResponse(intent, question) {
+  if (intent.intent === "NAVIGATE" && intent.destination) {
+    const key = intent.destination.toLowerCase().trim();
+    const route = NAVIGATE_ROUTES[key] || NAVIGATE_ROUTES[key.replace(/^the\s+/, "")];
+    if (!route) return null;
+    return {
+      answer: `Opening your ${intent.destination}.`,
+      confidence: "high",
+      action: { type: "navigate", destination: route },
+    };
+  }
+  if (intent.intent === "SETTINGS_CHANGE" && intent.settingKey) {
+    const key = intent.settingKey.toLowerCase().trim();
+    const map = SETTING_MAP[key];
+    if (map) {
+      return {
+        answer: `I can turn ${map.label} on for you. Want me to do that?`,
+        confidence: "high",
+        action: {
+          type: "confirm_setting",
+          setting: map.key,
+          value: map.value,
+          label: map.label,
+        },
+      };
+    }
+    // Fall through with a generic navigate-to-settings response.
+    return {
+      answer: `That setting lives in Settings — opening it now.`,
+      confidence: "medium",
+      action: { type: "navigate", destination: "/settings" },
+    };
+  }
+  if (intent.intent === "CREATE") {
+    if ((intent.entity || "").toLowerCase().includes("crew")) {
+      return {
+        answer: `Opening the Crew screen — tap + to add a new member.`,
+        confidence: "high",
+        action: { type: "navigate", destination: "/crew" },
+      };
+    }
+    // Default: route to add-signal sheet via Hover. The mobile side
+    // can show the AddSignalSheet on focus.
+    return {
+      answer: `Opening Hover so you can add a signal.`,
+      confidence: "high",
+      action: { type: "navigate", destination: "/hover" },
+    };
+  }
+  if (intent.intent === "EXPLAIN") {
+    const topic = (intent.explainTopic || question).toLowerCase();
+    const found = PRODUCT_KNOWLEDGE[topic] ||
+      Object.entries(PRODUCT_KNOWLEDGE).find(([k]) => topic.includes(k))?.[1];
+    if (!found) return null;
+    return {
+      answer: `${found} Want me to take you there?`,
+      confidence: "high",
+      action: { type: "navigate", destination: routeForTopic(topic) },
+    };
+  }
+  return null;
+}
+
+function routeForTopic(topic) {
+  if (topic.includes("vault")) return "/vault";
+  if (topic.includes("crew")) return "/crew";
+  if (topic.includes("horizon")) return "/horizon";
+  if (topic.includes("hover") || topic.includes("radar")) return "/hover";
+  if (topic.includes("compass") || topic.includes("pattern")) return "/compass";
+  if (topic.includes("programme")) return "/programme";
+  if (topic.includes("inventory")) return "/inventory";
+  if (topic.includes("maintenance")) return "/maintenance";
+  if (topic.includes("memory") || topic.includes("journal")) return "/journal";
+  if (topic.includes("network")) return "/network";
+  return "/directory";
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -290,6 +485,25 @@ export default async function handler(req, res) {
     }
   } catch (err) {
     console.warn("[ask] cache read failed:", err?.message || err);
+  }
+
+  // Intent classification — fast Haiku call before the heavyweight
+  // Sonnet path. NAVIGATE / SETTINGS_CHANGE / CREATE / EXPLAIN
+  // intents short-circuit with a structured action; QUERY falls
+  // through to the existing knowledge-base answer.
+  try {
+    const intent = await classifyIntent(trimmedQuestion);
+    if (intent && intent.intent !== "QUERY") {
+      const shortcut = buildIntentResponse(intent, trimmedQuestion);
+      if (shortcut) {
+        try {
+          await redis.set(cacheKey, JSON.stringify(shortcut), { ex: 600 });
+        } catch { /* skip */ }
+        return res.status(200).json({ ...shortcut, cached: false });
+      }
+    }
+  } catch (err) {
+    console.warn("[ask] intent classify failed (falling through):", err?.message);
   }
 
   try {
