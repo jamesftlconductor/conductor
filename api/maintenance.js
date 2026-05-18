@@ -56,19 +56,34 @@ async function evaluateOfferReady(householdId) {
   // ANY inventory data is enough. A partial plan with only an HVAC
   // entry is more useful than no plan — the generator skips empty
   // sections and notes which data would round out coverage.
+  //
+  // Renter / living-with-family households use a narrower gate:
+  // they only need *personal* inventory (vehicles or appliances) to
+  // qualify, since the home-systems entries don't apply to them.
   const inv = safeJson(invRaw) || {};
   function filled(obj, fields) {
     if (!obj || typeof obj !== "object") return false;
     return fields.some((f) => obj[f] != null && obj[f] !== "");
   }
+  // Load housing context to narrow the gate for renters.
+  let housing = null;
+  try {
+    const rawProfile = await redis.get(`household:${householdId}:profile`);
+    const profile = safeJson(rawProfile);
+    housing = profile?.housing || null;
+  } catch { /* skip */ }
+  const personalOnly = housing === "rent" || housing === "living_with_family";
+
   let count = 0;
-  if (filled(inv.roof, ["material", "yearInstalled", "lastInspected"])) count++;
-  if (filled(inv.hvac, ["brand", "yearInstalled", "lastServiced", "filterSize"])) count++;
-  if (filled(inv.waterHeater, ["yearInstalled", "type"])) count++;
-  if (filled(inv.electrical, ["panelAmps", "yearUpdated"])) count++;
+  if (!personalOnly) {
+    if (filled(inv.roof, ["material", "yearInstalled", "lastInspected"])) count++;
+    if (filled(inv.hvac, ["brand", "yearInstalled", "lastServiced", "filterSize"])) count++;
+    if (filled(inv.waterHeater, ["yearInstalled", "type"])) count++;
+    if (filled(inv.electrical, ["panelAmps", "yearUpdated"])) count++;
+    if (inv.homeBuiltYear != null && inv.homeBuiltYear !== "") count++;
+  }
   if (Array.isArray(inv.vehicles) && inv.vehicles.length > 0) count++;
   if (Array.isArray(inv.appliances) && inv.appliances.length > 0) count++;
-  if (inv.homeBuiltYear != null && inv.homeBuiltYear !== "") count++;
   const hasInventory = count >= 1;
 
   // Existing plan blocks new offer unless it's older than 365 days.
@@ -97,16 +112,20 @@ export async function isMaintenanceOfferReady(householdId) {
 
 async function generatePlan(userId, householdId) {
   const [
-    invRaw, locationStored, signalsRaw, providersHashRaw,
+    invRaw, locationStored, signalsRaw, providersHashRaw, profileRaw,
   ] = await Promise.all([
     redis.get(`household:${householdId}:inventory`),
     loadHouseholdLocation(householdId),
     redis.lrange(`household:${householdId}:signals`, 0, -1).catch(() => []),
     redis.hgetall(`household:${householdId}:providers`).catch(() => null),
+    redis.get(`household:${householdId}:profile`).catch(() => null),
   ]);
   const inventory = safeJson(invRaw) || {};
   const location = locationStored || LOCATION_FALLBACK;
   const marketRegion = location.marketRegion || "south_florida";
+  const profile = safeJson(profileRaw) || {};
+  const isRenter = profile.housing === "rent";
+  const isLivingWith = profile.housing === "living_with_family";
 
   // Pull recent service-history from the signal stream — last 90
   // days of resolved/expired service-typed signals gives the model
@@ -143,7 +162,12 @@ async function generatePlan(userId, householdId) {
     ? `${location.city}${location.state ? ", " + location.state : ""}`
     : "Fort Lauderdale, FL";
 
-  const prompt = `Generate a 12-month home maintenance plan for this household. Return ONLY the structured JSON via the tool — no commentary.
+  const renterDirective = isRenter
+    ? `\n\nIMPORTANT — RENTER HOUSEHOLD: This household rents their home. Generate a maintenance plan covering ONLY:\n- Their personal appliances (refrigerator, washer/dryer, dishwasher only if listed in inventory)\n- Their vehicles (if any in inventory)\n- Their lease renewal timing (use any lease data passed in signals)\n- Renter's insurance renewal\n- General personal maintenance (vehicle service, subscriptions, health)\n\nDo NOT include: roof, HVAC, water heater, electrical, structural items, pool, lawn (unless tenant-responsible per lease), pest control (unless tenant-responsible).\n\nTitle the plan internally as 'Your Maintenance Plan' (mobile renders the header).\n`
+    : isLivingWith
+    ? `\n\nIMPORTANT — LIVING WITH FAMILY: This household does not own or rent independently. Skip ALL home-related items. Include only personal items (vehicles, subscriptions, health). Quiet months are expected.\n`
+    : "";
+  const prompt = `Generate a 12-month ${isRenter || isLivingWith ? "personal" : "home"} maintenance plan for this household. Return ONLY the structured JSON via the tool — no commentary.${renterDirective}
 
 HOUSEHOLD:
 Location: ${cityLabel} (market region: ${marketRegion})
