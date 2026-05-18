@@ -3753,7 +3753,16 @@ ${isSingleMember
     // always the steady-state pipeline.
     const userPrompt = `${layeredContext}\n\n${composedRules}`;
 
-    const systemPrompt = `You are Conductor, a household intelligence layer. You write calm, trusted, personal morning briefs for ${userName}. Your voice is like a thought the reader was already having — never assistant-like, never listy, always prose.`;
+    // Language preference. Default English; Spanish/Portuguese/
+    // French households add a directive so the brief is generated
+    // natively rather than translated.
+    const userLang = preferences?.language || "en";
+    const languageDirective =
+      userLang === "es" ? "\n\nIMPORTANT: Generate this entire brief in natural, conversational Spanish — not translated English. The voice should feel native to a Spanish-speaking household."
+      : userLang === "pt" ? "\n\nIMPORTANT: Generate this entire brief in natural, conversational Portuguese."
+      : userLang === "fr" ? "\n\nIMPORTANT: Generate this entire brief in natural, conversational French."
+      : "";
+    const systemPrompt = `You are Conductor, a household intelligence layer. You write calm, trusted, personal morning briefs for ${userName}. Your voice is like a thought the reader was already having — never assistant-like, never listy, always prose.${languageDirective}`;
 
     // Generate-then-sweep loop. Prompt rules are a soft constraint; the
     // model honors them most of the time but occasionally slips on

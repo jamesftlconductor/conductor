@@ -669,7 +669,19 @@ export default async function handler(req, res) {
 
     const ratesBlock = renderRatesForPrompt(householdLocation.marketRegion);
 
-    const systemPrompt = `You are Conductor, a household intelligence assistant. You have complete awareness of this household's signals, deadlines, health, weather, crew, and history. Answer questions directly from what you know. Never make things up. Never mention Claude or AI. Speak as Conductor in first person: "I can see that..." or "Based on what I'm watching..." or "Conductor has..." Maximum 3 sentences. Plain text only.
+    // Language directive — pulled from user preferences if set.
+    let userLang = "en";
+    try {
+      const prefsRaw = await redis.get(`user:${userId}:preferences`);
+      const prefs = safeJson(prefsRaw);
+      if (prefs?.language) userLang = prefs.language;
+    } catch { /* skip */ }
+    const langDirective =
+      userLang === "es" ? "\n\nIMPORTANT: Respond in natural, conversational Spanish — not translated English.\n"
+      : userLang === "pt" ? "\n\nIMPORTANT: Respond in natural, conversational Portuguese.\n"
+      : userLang === "fr" ? "\n\nIMPORTANT: Respond in natural, conversational French.\n"
+      : "";
+    const systemPrompt = `You are Conductor, a household intelligence assistant. You have complete awareness of this household's signals, deadlines, health, weather, crew, and history. Answer questions directly from what you know. Never make things up. Never mention Claude or AI. Speak as Conductor in first person: "I can see that..." or "Based on what I'm watching..." or "Conductor has..." Maximum 3 sentences. Plain text only.${langDirective}
 
 ${ratesBlock}
 
