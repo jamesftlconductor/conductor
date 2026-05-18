@@ -33,7 +33,7 @@ export const config = {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-const ALL_JOBS = ["emails", "calendar", "vault", "crew", "horizon"];
+const ALL_JOBS = ["emails", "calendar", "vault", "crew", "horizon", "inventory"];
 const TERMINAL_STATES = new Set(["complete", "failed", "skipped"]);
 
 // ---------- helpers ----------
@@ -1740,6 +1740,177 @@ const SURPRISING_KEYWORDS = [
   "warranty", "license", "passport", "tax", "premium", "policy",
 ];
 
+// Inventory extraction job. Sweeps the user's Gmail for messages
+// that mention household equipment (HVAC, vehicle service, appliance
+// warranties, roof/plumbing/water heater records) and extracts
+// structured inventory data via Haiku. Each successful extraction
+// is LPUSH'd to household:{id}:inventorySuggestions as an
+// unconfirmed record — the mobile app surfaces these in a "CONDUCTOR
+// FOUND" section so the user can one-tap-confirm or edit before
+// merging into :inventory.
+//
+// Designed to be cheap: 4 parallel narrow Gmail queries instead of
+// one broad one; Haiku batches of 5 messages per call; null/low-
+// confidence results dropped. Suggestions are deduped by
+// (itemType + brand + model) before write.
+async function runInventoryJob(userId, householdId) {
+  await patchJob(householdId, "inventory", { state: "running", startedAt: Date.now() });
+  const accessToken = await getValidToken(userId);
+  const twelveMonthsAgo = Math.floor((Date.now() - 365 * DAY_MS) / 1000);
+
+  // Four narrow queries — fewer false positives than one omnibus
+  // search, and Haiku batches stay focused on one equipment family
+  // at a time which keeps the prompt's mental model simple.
+  const queries = [
+    `after:${twelveMonthsAgo} subject:(HVAC OR "air conditioning" OR "AC service" OR furnace OR "heating service" OR filter)`,
+    `after:${twelveMonthsAgo} subject:(vehicle OR "oil change" OR "tire rotation" OR "car service" OR registration OR "auto service")`,
+    `after:${twelveMonthsAgo} subject:(appliance OR refrigerator OR washer OR dryer OR dishwasher OR "home warranty" OR warranty)`,
+    `after:${twelveMonthsAgo} subject:(roof OR plumbing OR "water heater" OR electrical OR "home inspection")`,
+  ];
+
+  let scanned = 0;
+  let extracted = 0;
+  const allIds = [];
+  for (const q of queries) {
+    try {
+      const ids = await gmailSearch(accessToken, q, 25).catch(() => []);
+      allIds.push(...ids);
+    } catch (err) {
+      console.warn("[inventory] gmailSearch failed:", err.message);
+    }
+  }
+  // Dedup across queries (a single message can match multiple).
+  const uniqueIds = [...new Set(allIds)];
+  scanned = uniqueIds.length;
+
+  if (uniqueIds.length === 0) {
+    await patchJob(householdId, "inventory", {
+      state: "complete",
+      finishedAt: Date.now(),
+      scanned: 0,
+      extracted: 0,
+    });
+    return;
+  }
+
+  // Pull metadata for all matched messages first (subject + from +
+  // date) — enough signal for the extraction prompt, much cheaper
+  // than full-body fetch.
+  const headers = [];
+  for (let i = 0; i < uniqueIds.length; i += 15) {
+    const chunk = uniqueIds.slice(i, i + 15);
+    const results = await Promise.all(
+      chunk.map((id) => fetchEmailMetadata(accessToken, id).catch(() => null))
+    );
+    headers.push(...results.filter(Boolean));
+  }
+
+  // Existing suggestions and confirmed inventory items both shape
+  // dedup — don't surface the same fridge twice across runs, don't
+  // re-suggest something the user already confirmed.
+  const dedupKey = (item) =>
+    `${(item.itemType || "").toLowerCase()}|${(item.brand || "").toLowerCase()}|${(item.model || "").toLowerCase()}`;
+  const existingSeen = new Set();
+  try {
+    const existingRaw = await redis.lrange(
+      `household:${householdId}:inventorySuggestions`,
+      0, -1
+    );
+    for (const r of existingRaw || []) {
+      const p = safeJson(r);
+      if (p) existingSeen.add(dedupKey(p));
+    }
+    const invRaw = await redis.get(`household:${householdId}:inventory`);
+    const inv = safeJson(invRaw);
+    if (inv && typeof inv === "object") {
+      for (const item of Object.values(inv).flat()) {
+        if (item && typeof item === "object") existingSeen.add(dedupKey(item));
+      }
+    }
+  } catch (err) {
+    console.warn("[inventory] dedup preload failed:", err.message);
+  }
+
+  // Batches of 5 emails per Haiku call. Each call returns an array
+  // of items (one per email) or [null] for emails with nothing
+  // extractable. Null entries and low-confidence are dropped.
+  for (let i = 0; i < headers.length; i += 5) {
+    const batch = headers.slice(i, i + 5);
+    const emailsList = batch
+      .map((e, idx) =>
+        `${idx + 1}. Subject: ${e.subject || ""}\n   From: ${e.from || ""}\n   Date: ${e.date || ""}`
+      )
+      .join("\n\n");
+    const prompt = `Extract home inventory information from these emails. Return a JSON array with one entry per email; entries that have no extractable equipment data must be null.
+
+[
+  {
+    "itemType": "hvac" | "vehicle" | "appliance" | "roof" | "water_heater" | "electrical" | "other",
+    "brand": string | null,
+    "model": string | null,
+    "year": number | null,
+    "installDate": "YYYY-MM-DD" | null,
+    "lastServiceDate": "YYYY-MM-DD" | null,
+    "lastServiceMileage": number | null,
+    "filterSize": string | null,
+    "serialNumber": string | null,
+    "confidence": "high" | "medium" | "low",
+    "sourceDescription": "what email this came from in 5 words"
+  } | null
+]
+
+Rules:
+- Drop marketing/promotional emails entirely (return null).
+- Only return entries with specific, structured equipment data — not a generic "got an oil change" mention.
+- "filterSize" applies only to HVAC items.
+- "lastServiceMileage" applies only to vehicle items.
+- "sourceDescription" should be a short phrase like "Goodman HVAC quote" or "Toyota service receipt", not a full sentence.
+
+Emails:
+${emailsList}`;
+
+    let items = null;
+    try {
+      const text = await callClaude(prompt, 1200);
+      items = safeParseJsonText(text);
+    } catch (err) {
+      console.warn("[inventory] batch failed:", err.message);
+      continue;
+    }
+    if (!Array.isArray(items)) continue;
+
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      if (!item.itemType) continue;
+      if (item.confidence === "low") continue;
+      const k = dedupKey(item);
+      if (existingSeen.has(k)) continue;
+      existingSeen.add(k);
+      const record = {
+        id: `inv_sug_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        ...item,
+        suggested: true,
+        confirmed: false,
+        source: "email",
+        foundAt: Date.now(),
+      };
+      await redis.lpush(
+        `household:${householdId}:inventorySuggestions`,
+        JSON.stringify(record)
+      );
+      extracted++;
+    }
+  }
+
+  await patchJob(householdId, "inventory", {
+    state: "complete",
+    finishedAt: Date.now(),
+    scanned,
+    extracted,
+  });
+  console.log(`[inventory] scanned=${scanned} extracted=${extracted}`);
+}
+
 async function runHorizonJob(householdId) {
   await patchJob(householdId, "horizon", { state: "running", startedAt: Date.now() });
 
@@ -1844,6 +2015,7 @@ export default async function handler(req, res) {
     else if (job === "vault") await runVaultJob(userId, householdId);
     else if (job === "crew") await runCrewJob(userId, householdId);
     else if (job === "horizon") await runHorizonJob(householdId);
+    else if (job === "inventory") await runInventoryJob(userId, householdId);
   } catch (err) {
     console.error(`${job} job failed:`, err);
     await patchJob(householdId, job, {

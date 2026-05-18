@@ -1692,6 +1692,114 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true, household: householdId, ...record });
     }
 
+    // Inventory suggestions — read unconfirmed records produced by
+    // onboard's inventory job (or by import.js's per-email extraction
+    // when it lands). Mobile renders these in a "CONDUCTOR FOUND"
+    // section so the user can one-tap-confirm or edit before merging
+    // into the canonical household:{id}:inventory store.
+    if (queryType === "inventorySuggestions") {
+      if (req.method !== "GET") {
+        res.setHeader("Allow", "GET");
+        return res.status(405).json({ error: "Method not allowed for inventorySuggestions" });
+      }
+      const householdId = await resolveHouseholdId(req.query?.userId);
+      if (!householdId) return res.status(400).json({ error: "userId required" });
+      const raw = await redis.lrange(
+        `household:${householdId}:inventorySuggestions`,
+        0, -1
+      );
+      const items = (raw || [])
+        .map(safeJson)
+        .filter(Boolean)
+        .filter((s) => !s.confirmed && !s.dismissed);
+      return res.status(200).json({
+        household: householdId,
+        count: items.length,
+        items,
+      });
+    }
+
+    // Confirm or reject an inventory suggestion. Confirmed entries
+    // get merged into household:{id}:inventory under the appropriate
+    // category bucket; rejected entries get marked dismissed so they
+    // don't reappear in the GET above.
+    if (queryType === "confirmInventory" || bodyType === "confirmInventory") {
+      if (req.method !== "POST") {
+        res.setHeader("Allow", "POST");
+        return res.status(405).json({ error: "Method not allowed for confirmInventory" });
+      }
+      const { userId: bodyUserId, suggestionId, confirmed, updates } = req.body || {};
+      if (!bodyUserId) return res.status(400).json({ error: "userId required" });
+      if (!suggestionId) return res.status(400).json({ error: "suggestionId required" });
+      const householdId = await resolveHouseholdId(bodyUserId);
+      const key = `household:${householdId}:inventorySuggestions`;
+      const raw = await redis.lrange(key, 0, -1);
+      let target = null;
+      let targetRaw = null;
+      let idx = -1;
+      for (let i = 0; i < raw.length; i++) {
+        const p = safeJson(raw[i]);
+        if (p && (p.id === suggestionId || String(p.id) === String(suggestionId))) {
+          target = p;
+          targetRaw = raw[i];
+          idx = i;
+          break;
+        }
+      }
+      if (!target) return res.status(404).json({ error: "suggestion not found" });
+
+      // Apply any inline edits the user made on the confirmation
+      // card before tapping "Looks right".
+      const ALLOWED = [
+        "itemType", "brand", "model", "year", "installDate",
+        "lastServiceDate", "lastServiceMileage", "filterSize", "serialNumber",
+      ];
+      const merged = { ...target };
+      if (updates && typeof updates === "object") {
+        for (const k of ALLOWED) {
+          if (Object.prototype.hasOwnProperty.call(updates, k)) {
+            merged[k] = updates[k];
+          }
+        }
+      }
+
+      if (confirmed === false) {
+        merged.dismissed = true;
+        merged.dismissedAt = new Date().toISOString();
+        await redis.lset(key, idx, JSON.stringify(merged));
+        return res.status(200).json({ ok: true, dismissed: true });
+      }
+
+      // Confirmed path — write the canonical record into :inventory
+      // under the appropriate bucket. Existing inventory keeps its
+      // shape (object map by itemType → array). Anything bucketless
+      // gets routed to "other".
+      merged.confirmed = true;
+      merged.confirmedAt = new Date().toISOString();
+      delete merged.suggested;
+      await redis.lset(key, idx, JSON.stringify(merged));
+
+      const invKey = `household:${householdId}:inventory`;
+      const invRaw = await redis.get(invKey);
+      const inv = (() => {
+        const p = safeJson(invRaw);
+        return p && typeof p === "object" && !Array.isArray(p) ? p : {};
+      })();
+      const bucket = String(merged.itemType || "other");
+      const arr = Array.isArray(inv[bucket]) ? inv[bucket] : [];
+      // Sourced-from-email flag persists onto the canonical record
+      // so the mobile UI can show the "✓ from email" badge after
+      // confirmation.
+      arr.push({
+        ...merged,
+        fromEmail: true,
+        addedAt: new Date().toISOString(),
+      });
+      inv[bucket] = arr;
+      await redis.set(invKey, JSON.stringify(inv));
+      return res.status(200).json({ ok: true, household: householdId, bucket, item: arr[arr.length - 1] });
+    }
+
     // Auto-resolutions — surfaces what Conductor handled without
     // user action over the last 48h (default). Reads the memory log
     // for resolved/expired entries within the window. Source

@@ -21,7 +21,7 @@ const WORKER_URL = "https://conductor-ivory.vercel.app/api/onboard-worker";
 // emails, calendar, vault, crew run in parallel as independent QStash
 // messages. horizon depends on vault's output (it reads :vault) and is
 // chained by the worker on vault completion — see onboard-worker.js.
-const PARALLEL_JOBS = ["emails", "calendar", "vault", "crew"];
+const PARALLEL_JOBS = ["emails", "calendar", "vault", "crew", "inventory"];
 const ALL_JOBS = [...PARALLEL_JOBS, "horizon"];
 
 async function resolveHouseholdId(userId) {
