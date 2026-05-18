@@ -243,6 +243,7 @@ function buildHouseholdProfileRule(profile) {
     couple: "Collaborative voice — coordination across two adults matters. Handoff detection is active. Occasional 'you two' is fine, don't lean on it.",
     family: "Crew-forward voice — children's schedules matter. Junior-added signals (source: 'junior') get elevated priority and warm framing.",
     multigenerational: "Gentle tone throughout. Health awareness across multiple generations is more prominent. Medication tracking and appointment signals get elevated priority.",
+    investment_property: "INVESTMENT PROPERTY voice — use 'the property' not 'your home'. Lead with tenant and lease signals. Financial signals (rental income, expenses, property tax) are elevated. Maintenance is critical because tenant experience matters. Tone is professional and practical — never personal household language. Signals attributed to crew member type 'tenant' carry a [TENANT] prefix; honor that framing.",
   };
 
   const HOUSING_RULE = {
@@ -3338,12 +3339,29 @@ export default async function handler(req, res) {
       return "";
     };
 
+    // Build a quick lookup of crew members marked as tenant. Used by
+    // formatSignal to prefix [TENANT] on signals attributed to them
+    // — investment_property households route signals through the
+    // tenant rather than household members.
+    const tenantNames = new Set();
+    for (const m of crewMembers || []) {
+      if (m && m.memberType === "tenant" && typeof m.name === "string") {
+        tenantNames.add(m.name.toLowerCase().trim());
+      }
+    }
+    const tenantPrefix = (s) => {
+      const cm = s?.crewMemberId;
+      if (!cm) return "";
+      return tenantNames.has(String(cm).toLowerCase().trim()) ? "[TENANT] " : "";
+    };
+
     const formatSignal = (s) => {
       const owner = `[${ownershipTag(s, userId, householdNameMap, isSingleMember)}]`;
+      const tenant = tenantPrefix(s);
       if (s._isDeadline) {
-        return `- ${owner} [DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
+        return `- ${owner} ${tenant}[DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
       }
-      return `- ${owner} ${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}${freshnessTag(s)}`;
+      return `- ${owner} ${tenant}${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}${freshnessTag(s)}`;
     };
     const formatEvent = (e) => {
       const owner = `[${ownershipTag(e, userId, householdNameMap, isSingleMember)}]`;

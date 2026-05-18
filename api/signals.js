@@ -1916,7 +1916,13 @@ const VALID_PROFILE_TYPES = new Set([
   "other",
 ]);
 
-const VALID_WHO = new Set(["solo", "couple", "family", "multigenerational"]);
+const VALID_WHO = new Set([
+  "solo",
+  "couple",
+  "family",
+  "multigenerational",
+  "investment_property",
+]);
 const VALID_HOUSING = new Set(["own", "rent", "living_with_family"]);
 const VALID_MODIFIERS = new Set([
   "has_pets",
