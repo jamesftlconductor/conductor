@@ -3835,7 +3835,27 @@ ${isSingleMember
       console.warn("[brief] maintenance offer check failed:", err?.message || err);
     }
 
+    // First-brief acknowledgment — exactly one sentence introducing
+    // the Directory, prepended once and never again. Permanent key
+    // (no TTL) so the welcome line never reappears on a re-onboard
+    // or a brief regeneration weeks later.
+    let isFirstBrief = false;
+    try {
+      const firstSentKey = `household:${householdId}:firstBriefSent`;
+      const alreadySent = await redis.get(firstSentKey);
+      if (!alreadySent) {
+        isFirstBrief = true;
+        await redis.set(firstSentKey, "1");
+      }
+    } catch (err) {
+      console.warn("[brief] firstBrief check failed:", err?.message || err);
+    }
+
     let finalBrief = brief;
+    if (isFirstBrief) {
+      const welcome = "Conductor is built for households like yours — complex, busy, always in motion. A Directory is in Settings whenever you want to explore what's here.";
+      finalBrief = `${welcome}\n\n${brief}`.trim();
+    }
     if (anniversary) {
       try {
         const ackKey = `household:${householdId}:anniversaryAcknowledged:${anniversary.anniversaryYearKey}`;
@@ -3873,6 +3893,7 @@ ${isSingleMember
       // household in the last 7 days. The mobile Ground card reads
       // this flag to show the "Build plan →" card.
       maintenancePlanOffer: maintenancePlanOffer,
+      isFirstBrief,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for
