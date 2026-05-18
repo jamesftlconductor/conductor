@@ -173,6 +173,44 @@ function parseDateLoose(value) {
   return isNaN(ms) ? null : new Date(ms);
 }
 
+// User-tunable voice preferences → prompt rule fragment. Returns null
+// when no preference is set, so the brief preserves its default voice
+// for households that haven't touched the settings.
+function buildStyleRule(tone, humor, detail) {
+  if (!tone && !humor && !detail) return null;
+  const t = tone || "balanced";
+  const h = humor || "occasionally";
+  const d = detail || "standard";
+  const toneDetail = `${t}+${d}`;
+  const toneRules = {
+    "direct+brief": "VOICE: Maximum efficiency. No softening. No filler. Facts only. Every word earns its place.",
+    "direct+standard": "VOICE: Direct and clear. Minimal softening. Context only when essential.",
+    "direct+thorough": "VOICE: Direct but with full context. Explain implications without softening the language.",
+    "warm+brief": "VOICE: Warm but concise. One human touch per brief, then move on.",
+    "warm+standard": "VOICE: Conversational and caring. Human without being excessive.",
+    "warm+thorough": "VOICE: Warm and contextual. Take the extra sentence. The relationship matters as much as the information.",
+    "balanced+brief": "VOICE: Calibrated and lean. Soft where it helps, terse where it doesn't.",
+    "balanced+standard": "VOICE: Read the room. Warm when the day is good, direct when it's heavy, light when earned.",
+    "balanced+thorough": "VOICE: Calibrated with context. Explain why things matter when it serves the reader.",
+  };
+  const humorRules = {
+    yes: "Humor is welcome when genuinely earned — dry observation, true irony, local awareness.",
+    occasionally: "Light humor occasionally when it fits naturally. Never forced.",
+    no: "No humor. Professional tone throughout.",
+  };
+  const detailRules = {
+    brief: "Never explain why unless the user would otherwise miss the significance. Trust them.",
+    standard: "",
+    thorough: "Context is valuable. Explain why things matter when it adds clarity.",
+  };
+  const lines = [
+    toneRules[toneDetail] || toneRules["balanced+standard"],
+    humorRules[h],
+    detailRules[d],
+  ].filter(Boolean);
+  return `- ${lines.join(" ")}`;
+}
+
 // Common-airport-to-city map for destination extraction. Not exhaustive
 // — covers the heavy-traffic routes a household traveler is likeliest to
 // see in flight confirmation subjects/descriptions. Falls back to text
@@ -3601,6 +3639,22 @@ ${isSingleMember
       }
     } catch (err) {
       console.warn("[brief] profile rule load failed:", err?.message);
+    }
+
+    // User-tunable voice preferences — tone (direct/balanced/warm),
+    // humor (yes/occasionally/no), and detail (brief/standard/thorough).
+    // Each modifies the assistant's voice independently, so we layer
+    // three rule fragments and append them once.
+    try {
+      const tone = preferences?.communicationTone;
+      const humor = preferences?.communicationHumor;
+      const detail = preferences?.communicationDetail;
+      const styleRule = buildStyleRule(tone, humor, detail);
+      if (styleRule) {
+        composedRules = `${composedRules}\n${styleRule}`;
+      }
+    } catch (err) {
+      console.warn("[brief] style rule build failed:", err?.message);
     }
 
     // First-run is handled by an early-return branch above; this path is
