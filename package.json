@@ -16,6 +16,7 @@
     "@vercel/kv": "^3.0.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
+    "resend": "^6.12.3",
     "twilio": "^6.0.2"
   },
   "devDependencies": {
