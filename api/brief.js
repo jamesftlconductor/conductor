@@ -160,6 +160,11 @@ async function fetchWeather(location) {
       uvPeak,
       sunrise,
       sunset,
+      // Raw hourly arrays exposed so downstream code (conflict
+      // detection at signal-time) can probe a specific hour's
+      // precipitation probability. Same length, parallel indices.
+      hourlyTime: times,
+      hourlyPrecipProb: rainProbs,
     };
   } catch (err) {
     console.error("Weather fetch failed:", err?.message || err);
@@ -600,8 +605,52 @@ function detectConflicts({
   calendarEvents,
   householdNameMap,
   requestingUserId,
+  weather,
 }) {
   const conflicts = [];
+
+  // Weather-at-signal-time check — outdoor service signal whose ETA
+  // falls in an hour with > 60% precipitation probability is a real
+  // conflict (the technician likely cancels, OR the work needs
+  // rescheduling). We probe the hourly forecast directly rather than
+  // relying on the contiguous rainWindow string which collapses
+  // distinct rain periods.
+  if (weather?.hourlyTime?.length && weather?.hourlyPrecipProb?.length) {
+    const hourlyTime = weather.hourlyTime;
+    const hourlyPrecip = weather.hourlyPrecipProb;
+    for (const s of activeSignals) {
+      if (!isOutdoorService(s)) continue;
+      const eta = parseDateLoose(s.eta);
+      if (!eta) continue;
+      const offset = dayOffsetFromToday(eta);
+      // Only flag for today + tomorrow — beyond that the forecast
+      // accuracy isn't worth surfacing.
+      if (offset !== 0 && offset !== 1) continue;
+      // Find the hourly index closest to the ETA. hourly.time entries
+      // are "YYYY-MM-DDTHH:00" in local zone — we exact-match the
+      // YYYY-MM-DDTHH prefix for the appointment.
+      const pad = (n) => String(n).padStart(2, "0");
+      const target =
+        `${eta.getFullYear()}-${pad(eta.getMonth() + 1)}-${pad(eta.getDate())}` +
+        `T${pad(eta.getHours())}`;
+      const idx = hourlyTime.findIndex(
+        (t) => typeof t === "string" && t.startsWith(target)
+      );
+      if (idx < 0) continue;
+      const precip = Number(hourlyPrecip[idx]) || 0;
+      if (precip > 60) {
+        conflicts.push({
+          type: "weather_outdoor_conflict",
+          signal: s,
+          weatherNote: "Rain expected at appointment time",
+          precipProbability: Math.round(precip),
+          appointmentHour: eta.getHours(),
+          severity: "moderate",
+        });
+      }
+    }
+  }
+
   const memberIds = [
     requestingUserId,
     ...Array.from(householdNameMap?.keys() || []),
@@ -3411,6 +3460,7 @@ ${isSingleMember
       calendarEvents: Array.isArray(calendarEvents) ? calendarEvents : [],
       householdNameMap,
       requestingUserId: userId,
+      weather,
     });
 
     // Handoff detection — runs alongside conflicts but is structurally
