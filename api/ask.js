@@ -263,6 +263,47 @@ function parseAskResponse(raw) {
   return { answer: raw, confidence: "medium" };
 }
 
+// ---------- Spoken-style condensation ----------
+
+// Convert the written answer to a natural-speech version. Used by the
+// mobile "Speak responses" toggle. Falls back to null on any failure
+// so the mobile side can speak the written answer instead.
+async function convertToSpoken(written) {
+  if (!written || typeof written !== "string") return null;
+  // Skip the Haiku call when the answer is already short enough to
+  // read out loud as-is (≤ 140 chars and 1 sentence). Saves a call.
+  if (written.length <= 140 && (written.match(/[.!?]/g) || []).length <= 1) {
+    return written;
+  }
+  const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 200,
+      messages: [
+        {
+          role: "user",
+          content: `Convert this answer to natural spoken speech. Maximum 2 sentences. No visual formatting language. Conversational and direct. Remove any parenthetical clarifications. Keep only what's essential to hear out loud.
+
+Written answer: ${written}
+
+Return only the spoken text, nothing else — no preface, no quotes.`,
+        },
+      ],
+    }),
+  });
+  if (!apiRes.ok) return null;
+  const data = await apiRes.json();
+  const text = data?.content?.[0]?.text;
+  if (!text || typeof text !== "string") return null;
+  return text.trim();
+}
+
 // ---------- Intent classification ----------
 
 const NAVIGATE_ROUTES = {
@@ -304,21 +345,27 @@ const SETTING_MAP = {
 };
 
 const PRODUCT_KNOWLEDGE = {
-  vault: "The Vault is your household's permanent record — insurance policies, subscriptions, warranties, registrations, and deadlines. Conductor populates it from Gmail automatically. You can also scan documents or add items manually.",
+  vault: "The Vault is your household's permanent record — insurance policies, subscriptions, warranties, registrations, leases, and deadlines. Conductor populates it from your Gmail automatically. You can also scan physical documents or add items manually.",
   brief: "The brief is a 3-5 sentence morning summary of what matters most in your household today. It arrives at 7am and gets smarter as Conductor learns your patterns.",
   hover: "Hover is your household radar — three rings showing signal urgency. Inner ring needs attention today. Middle ring is approaching. Outer ring is on the horizon. Tap any dot to see details.",
-  radar: "Hover is your household radar — three rings showing signal urgency. Inner ring needs attention today. Middle ring is approaching. Outer ring is on the horizon.",
-  pulse: "The Pulse synthesizes your health, weather, and signal load into one sentence about today. Tap it on the Ground screen to expand and see what's feeding into it.",
-  crew: "Crew is everyone in your household — partners, children, pets. Each crew member has a bio with schedule, health details, and attributed signals.",
-  horizon: "The Horizon shows everything beyond the next two weeks — Coming Up, Further Out, and On the Edge. Tap Noted to acknowledge without resolving.",
-  programme: "The Programme is a 14-day timeline showing signals, crew events, vault deadlines, and calendar events on one view.",
-  inventory: "Home Inventory is where you tell Conductor about your home's systems — roof, HVAC, water heater, vehicles. The more you fill in, the smarter the maintenance plan.",
-  network: "The Network connects your household to family households you trust. You choose what to share — from emergency-only to full signal visibility.",
-  maintenance: "The maintenance plan is an annual schedule generated from your home inventory with seasonal timing and real cost ranges. Each item can be added to your signal radar with one tap.",
-  signal: "A signal is anything in your household that needs awareness or action — a delivery, a deadline, a service appointment, a renewal. Conductor finds signals in your Gmail automatically.",
-  signals: "Signals are anything in your household that need awareness or action. Conductor finds them in your Gmail automatically and you can add manual ones.",
-  rest: "Rest resolves a signal — it moves to the resolved state and contributes to your household streak.",
-  streak: "The streak counts consecutive days where at least one signal was handled. It rewards keeping things in motion.",
+  radar: "Hover is your household radar — three rotating rings showing signal urgency, from inner (today) to outer (on the horizon).",
+  pulse: "The Pulse synthesizes your health, weather, and signal load into one sentence about today. Tap it to expand and see what's feeding into it.",
+  signals: "A signal is anything in your household that needs awareness or action — a delivery, a deadline, a service appointment. Conductor finds signals in your Gmail automatically.",
+  signal: "A signal is anything in your household that needs awareness or action. Conductor finds them in your Gmail automatically and you can add manual ones.",
+  crew: "Crew is everyone in your household — partners, children, pets. Each member has their own bio with schedule, health details, and attributed signals.",
+  horizon: "The Horizon shows everything beyond the next two weeks — organized into Coming Up, Further Out, and On the Edge. Tap Noted to acknowledge something without resolving it.",
+  network: "The Network connects your household to family households you trust. You choose what to share — from emergency-only awareness to full signal visibility.",
+  maintenance: "The Home Maintenance Plan is an annual schedule generated from your home's systems and seasonal patterns. Each item can be added to your radar with one tap.",
+  compass: "Compass shows your household's patterns and health trends over time — streak data, resolution patterns, and how the household has been running.",
+  journal: "The Memory Journal is a scrollable record of everything Conductor has handled — resolutions, caught moments, and household history.",
+  programme: "The Programme is a 14-day timeline combining signals, crew events, vault deadlines, and calendar events in one unified view.",
+  inventory: "Home Inventory is where you tell Conductor about your home's systems — roof, HVAC, water heater, vehicles, appliances. The more you fill in, the smarter the maintenance plan.",
+  rest: "Rest means the signal is handled — done, resolved, complete. Tapping Rest moves it out of your radar and adds to your streak.",
+  hold: "Hold means you're aware but not done yet. The signal stays active. Use Hold when something is in progress.",
+  streak: "Your streak counts consecutive days where at least one signal was rested. It's a measure of how consistently the household is staying on top of things.",
+  clearance: "Clearance is your evening brief — arriving at 9pm. It covers what still needs attention before tomorrow and on Sundays includes the Week in Review.",
+  takeoff: "Takeoff is your morning brief — arriving at 7am. It covers the most important things happening in your household today.",
+  overwatch: "Overwatch is the overnight mode — between 10pm and 7am. The radar is visible but Conductor is quiet, watching and preparing for tomorrow's Takeoff.",
   "the brief": "The brief is a 3-5 sentence morning summary of what matters most in your household today. It arrives at 7am.",
   "the radar": "Hover is your household radar — three rotating rings showing signal urgency, from inner (today) to outer (on the horizon).",
 };
@@ -388,6 +435,7 @@ function buildIntentResponse(intent, question) {
     if (!route) return null;
     return {
       answer: `Opening your ${intent.destination}.`,
+      spokenAnswer: `Opening ${intent.destination}.`,
       confidence: "high",
       action: { type: "navigate", destination: route },
     };
@@ -398,6 +446,7 @@ function buildIntentResponse(intent, question) {
     if (map) {
       return {
         answer: `I can turn ${map.label} on for you. Want me to do that?`,
+        spokenAnswer: `Should I turn ${map.label} on?`,
         confidence: "high",
         action: {
           type: "confirm_setting",
@@ -409,7 +458,8 @@ function buildIntentResponse(intent, question) {
     }
     // Fall through with a generic navigate-to-settings response.
     return {
-      answer: `That setting lives in Settings — opening it now.`,
+      answer: `That setting lives in Your House — opening it now.`,
+      spokenAnswer: `Opening Your House.`,
       confidence: "medium",
       action: { type: "navigate", destination: "/settings" },
     };
@@ -418,6 +468,7 @@ function buildIntentResponse(intent, question) {
     if ((intent.entity || "").toLowerCase().includes("crew")) {
       return {
         answer: `Opening the Crew screen — tap + to add a new member.`,
+        spokenAnswer: `Opening Crew.`,
         confidence: "high",
         action: { type: "navigate", destination: "/crew" },
       };
@@ -426,6 +477,7 @@ function buildIntentResponse(intent, question) {
     // can show the AddSignalSheet on focus.
     return {
       answer: `Opening Hover so you can add a signal.`,
+      spokenAnswer: `Opening Hover so you can add a signal.`,
       confidence: "high",
       action: { type: "navigate", destination: "/hover" },
     };
@@ -435,10 +487,14 @@ function buildIntentResponse(intent, question) {
     const found = PRODUCT_KNOWLEDGE[topic] ||
       Object.entries(PRODUCT_KNOWLEDGE).find(([k]) => topic.includes(k))?.[1];
     if (!found) return null;
+    // First sentence of the explanation is the spoken version — keeps
+    // audio tight while the written answer carries the full detail.
+    const firstSentence = found.split(/(?<=[.!?])\s+/)[0] || found;
     return {
       answer: `${found} Want me to take you there?`,
+      spokenAnswer: firstSentence,
       confidence: "high",
-      action: { type: "navigate", destination: routeForTopic(topic) },
+      action: { type: "navigate_offer", destination: routeForTopic(topic) },
     };
   }
   return null;
@@ -650,7 +706,16 @@ Answer in maximum 3 sentences. If you don't have the information say: "Conductor
       return res.status(502).json({ error: "Empty answer returned" });
     }
 
-    const responseBody = { answer, confidence };
+    // Spoken-style condensation via Haiku. Best-effort — if it fails
+    // the mobile side falls back to speaking the written answer.
+    let spokenAnswer = null;
+    try {
+      spokenAnswer = await convertToSpoken(answer);
+    } catch (err) {
+      console.warn("[ask] spoken conversion failed:", err?.message);
+    }
+
+    const responseBody = { answer, spokenAnswer, confidence };
     try {
       await redis.set(cacheKey, JSON.stringify(responseBody), { ex: ASK_TTL_S });
     } catch (err) {

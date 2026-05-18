@@ -3961,7 +3961,7 @@ ${isSingleMember
 
     let finalBrief = brief;
     if (isFirstBrief) {
-      const welcome = "Conductor is built for households like yours — complex, busy, always in motion. A Directory in Settings covers everything whenever you're ready.";
+      const welcome = "Conductor is built for households like yours — complex, busy, always in motion. A Directory in Your House covers everything whenever you're ready.";
       finalBrief = `${welcome}\n\n${brief}`.trim();
     }
     if (anniversary) {
@@ -3980,8 +3980,45 @@ ${isSingleMember
       }
     }
 
+    // Spoken summary — 2-sentence speech-friendly condensation of
+    // the brief for the morning Takeoff voice playback. Best-effort;
+    // null when the Haiku call fails (mobile falls back to silent).
+    let spokenSummary = null;
+    try {
+      const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 200,
+          messages: [
+            {
+              role: "user",
+              content: `Summarize this brief as 2 spoken sentences. What are the 1-2 most important things? Natural speech, no formatting, no preface.
+
+Brief: ${finalBrief}
+
+Return only the spoken text.`,
+            },
+          ],
+        }),
+      });
+      if (apiRes.ok) {
+        const data = await apiRes.json();
+        const text = data?.content?.[0]?.text;
+        if (text && typeof text === "string") spokenSummary = text.trim();
+      }
+    } catch (err) {
+      console.warn("[brief] spokenSummary failed:", err?.message);
+    }
+
     const briefResponse = {
       brief: finalBrief,
+      spokenSummary,
       segments,
       transparency,
       theRead,
