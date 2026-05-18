@@ -3,6 +3,7 @@ import { loadHouseholdCalendar } from "./calendar-loader.js";
 import { loadCamouflageRules, applyCamouflage } from "./signals.js";
 import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
 import { loadNetworkContext } from "./network.js";
+import { isMaintenanceOfferReady } from "./maintenance.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -3809,6 +3810,31 @@ ${isSingleMember
     // Anniversary closer — append exactly once per anniversary year.
     // The 48h TTL key guards against duplicate appends if the user
     // refreshes the brief multiple times during the day.
+    // Maintenance plan offer — only true when (a) inventory is
+    // sufficient + no fresh plan exists + user hasn't dismissed
+    // AND (b) we haven't shown the offer in the last 7 days. The
+    // 7-day cooldown is enforced via a per-household TTL key so
+    // the offer doesn't appear daily and become noise.
+    let maintenancePlanOffer = false;
+    try {
+      const ready = await isMaintenanceOfferReady(householdId);
+      if (ready) {
+        const lastOfferedRaw = await redis.get(`household:${householdId}:maintenanceOfferShownAt`);
+        const sevenDays = 7 * 24 * 60 * 60 * 1000;
+        const lastOffered = lastOfferedRaw ? parseInt(String(lastOfferedRaw), 10) : 0;
+        if (!lastOffered || Date.now() - lastOffered > sevenDays) {
+          maintenancePlanOffer = true;
+          await redis.set(
+            `household:${householdId}:maintenanceOfferShownAt`,
+            String(Date.now()),
+            { ex: 7 * 24 * 60 * 60 }
+          );
+        }
+      }
+    } catch (err) {
+      console.warn("[brief] maintenance offer check failed:", err?.message || err);
+    }
+
     let finalBrief = brief;
     if (anniversary) {
       try {
@@ -3842,6 +3868,11 @@ ${isSingleMember
         ? { signalId: handoff.signalId, message: handoff.message, type: handoff.type }
         : null,
       conductorQuestion: conductorQuestion || null,
+      // Maintenance plan offer — surfaced when inventory is rich
+      // enough to plan against AND no offer has been shown to this
+      // household in the last 7 days. The mobile Ground card reads
+      // this flag to show the "Build plan →" card.
+      maintenancePlanOffer: maintenancePlanOffer,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for
