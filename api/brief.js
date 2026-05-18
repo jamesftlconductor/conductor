@@ -3103,6 +3103,41 @@ export default async function handler(req, res) {
         ? await fetchDestinationWeather(destination)
         : null;
 
+      // Leave-by time — airport math. For the Fort Lauderdale household
+      // (FLL): typical 20-30min drive + 2h domestic / 3h international
+      // arrival buffer. Peak commute hours add 15min to the drive.
+      // We don't currently store airport identity in the travel signal,
+      // so we assume home airport based on household marketRegion and
+      // surface a single conservative leave-by figure.
+      const travelDate = new Date(travelEtaMs);
+      const INTL_CITY = new Set([
+        "London", "Paris", "Amsterdam", "Frankfurt", "Munich", "Zurich",
+        "Madrid", "Barcelona", "Rome", "Venice", "Athens", "Istanbul",
+        "Dublin", "Copenhagen", "Stockholm", "Helsinki", "Oslo",
+        "Tokyo", "Seoul", "Beijing", "Shanghai", "Hong Kong", "Singapore",
+        "Bangkok", "Dubai", "Doha", "Mumbai", "Delhi",
+        "Sydney", "Melbourne", "Auckland",
+        "São Paulo", "Rio de Janeiro", "Buenos Aires",
+        "Mexico City", "Cancun", "Toronto", "Vancouver", "Montreal",
+      ]);
+      const isInternational = !!destination && INTL_CITY.has(destination);
+      const driveMinutes = (() => {
+        // Peak commute (7-9am OR 4-7pm) adds 15 min to base 30 min.
+        const depHour = travelDate.getHours();
+        const peak = (depHour >= 7 && depHour <= 9) ||
+                     (depHour >= 16 && depHour <= 19);
+        return peak ? 45 : 30;
+      })();
+      const arrivalBufferMinutes = isInternational ? 180 : 150;
+      const leaveByMs =
+        travelEtaMs - (driveMinutes + arrivalBufferMinutes) * 60 * 1000;
+      const fmtTime = (ms) =>
+        new Date(ms).toLocaleString("en-US", {
+          hour: "numeric",
+          minute: "2-digit",
+          hour12: true,
+        });
+
       travelPrep = {
         travelSignal,
         accommodations,
@@ -3110,6 +3145,12 @@ export default async function handler(req, res) {
         sameDayConflicts,
         destination,
         destinationWeather,
+        leaveBy: fmtTime(leaveByMs),
+        leaveByMs,
+        flightTime: fmtTime(travelEtaMs),
+        airport: "FLL",
+        driveMinutes,
+        isInternational,
       };
     }
 
@@ -3123,6 +3164,13 @@ export default async function handler(req, res) {
       lines.push(
         `Flight/travel: ${travelPrep.travelSignal.description || "Travel"}${lift(travelPrep.travelSignal.eta)}`
       );
+      if (travelPrep.leaveBy && travelPrep.flightTime) {
+        lines.push(
+          `Departs ${travelPrep.flightTime} — leave home by ${travelPrep.leaveBy}` +
+          ` (${travelPrep.driveMinutes}min drive to ${travelPrep.airport}` +
+          (travelPrep.isInternational ? `, 3h international buffer)` : `, 2.5h domestic buffer)`)
+        );
+      }
       if (travelPrep.accommodations.length > 0) {
         lines.push(
           `Accommodation: ${travelPrep.accommodations.map((s) => `${s.description || "Reservation"}${lift(s.eta)}`).join("; ")}`
