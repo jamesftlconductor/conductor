@@ -1755,6 +1755,9 @@ const SURPRISING_KEYWORDS = [
 // (itemType + brand + model) before write.
 async function runInventoryJob(userId, householdId) {
   await patchJob(householdId, "inventory", { state: "running", startedAt: Date.now() });
+  // Wipe any prior-run diagnostics so the debug surface only carries
+  // this run's batches.
+  await redis.del(`household:${householdId}:inventoryDebug`).catch(() => {});
   const accessToken = await getValidToken(userId);
   const twelveMonthsAgo = Math.floor((Date.now() - 365 * DAY_MS) / 1000);
 
@@ -1805,6 +1808,24 @@ async function runInventoryJob(userId, householdId) {
     headers.push(...results.filter(Boolean));
   }
 
+  // Diagnostic — record headers count + a sample so we can tell
+  // whether metadata fetch is yielding usable rows.
+  try {
+    await redis.set(
+      `household:${householdId}:inventoryDebugMeta`,
+      JSON.stringify({
+        uniqueIds: uniqueIds.length,
+        headersLen: headers.length,
+        sample: headers.slice(0, 5).map((h) => ({
+          subject: h.subject,
+          from: h.from,
+          date: h.date,
+        })),
+      }),
+      { ex: 3600 }
+    );
+  } catch { /* ignore */ }
+
   // Existing suggestions and confirmed inventory items both shape
   // dedup — don't surface the same fridge twice across runs, don't
   // re-suggest something the user already confirmed.
@@ -1841,7 +1862,7 @@ async function runInventoryJob(userId, householdId) {
         `${idx + 1}. Subject: ${e.subject || ""}\n   From: ${e.from || ""}\n   Date: ${e.date || ""}`
       )
       .join("\n\n");
-    const prompt = `Extract home inventory information from these emails. Return a JSON array with one entry per email; entries that have no extractable equipment data must be null.
+    const prompt = `Extract home inventory information from these emails. Return ONLY a JSON array — no commentary, no markdown fences, no reasoning. One entry per email; entries that are purely marketing/promotional must be null.
 
 [
   {
@@ -1860,29 +1881,114 @@ async function runInventoryJob(userId, householdId) {
 ]
 
 Rules:
-- Drop marketing/promotional emails entirely (return null).
-- Only return entries with specific, structured equipment data — not a generic "got an oil change" mention.
+- Drop pure marketing emails (return null) — newsletter sales, ads for new units, etc.
+- Service reminders, scheduling confirmations, and receipts ARE in scope even when they don't carry full structured details. Extract whatever you can — itemType alone is enough to count.
+- Set confidence:"high" when brand+model+year are all present; "medium" when 1-2 of those are present; "low" when only itemType + a date or general detail is known.
 - "filterSize" applies only to HVAC items.
 - "lastServiceMileage" applies only to vehicle items.
-- "sourceDescription" should be a short phrase like "Goodman HVAC quote" or "Toyota service receipt", not a full sentence.
+- "sourceDescription" should be a short phrase like "Goodman HVAC quote", "Toyota service receipt", or "oil change reminder", not a full sentence.
 
 Emails:
 ${emailsList}`;
 
     let items = null;
+    let rawText = "";
+    let stopReason = "";
+    let httpStatus = 0;
     try {
-      const text = await callClaude(prompt, 1200);
-      items = safeParseJsonText(text);
+      // Tool-use forced extraction — model MUST invoke
+      // record_inventory_items with the structured array; no prose
+      // leaks into the response and there's no JSON parsing risk.
+      const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 2400,
+          tools: [
+            {
+              name: "record_inventory_items",
+              description: "Record extracted home inventory items, one per input email. Use null for emails with no extractable equipment data.",
+              input_schema: {
+                type: "object",
+                properties: {
+                  items: {
+                    type: "array",
+                    items: {
+                      anyOf: [
+                        { type: "null" },
+                        {
+                          type: "object",
+                          properties: {
+                            itemType: { type: "string", enum: ["hvac", "vehicle", "appliance", "roof", "water_heater", "electrical", "other"] },
+                            brand: { type: ["string", "null"] },
+                            model: { type: ["string", "null"] },
+                            year: { type: ["integer", "null"] },
+                            installDate: { type: ["string", "null"] },
+                            lastServiceDate: { type: ["string", "null"] },
+                            lastServiceMileage: { type: ["integer", "null"] },
+                            filterSize: { type: ["string", "null"] },
+                            serialNumber: { type: ["string", "null"] },
+                            confidence: { type: "string", enum: ["high", "medium", "low"] },
+                            sourceDescription: { type: "string" },
+                          },
+                          required: ["itemType", "confidence", "sourceDescription"],
+                        },
+                      ],
+                    },
+                  },
+                },
+                required: ["items"],
+              },
+            },
+          ],
+          tool_choice: { type: "tool", name: "record_inventory_items" },
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      httpStatus = apiRes.status;
+      const data = await apiRes.json();
+      stopReason = data?.stop_reason || "";
+      const toolBlock = (data?.content || []).find((b) => b?.type === "tool_use");
+      if (toolBlock && Array.isArray(toolBlock.input?.items)) {
+        items = toolBlock.input.items;
+      }
+      rawText = JSON.stringify(toolBlock?.input || data?.error || data).slice(0, 1500);
     } catch (err) {
       console.warn("[inventory] batch failed:", err.message);
-      continue;
+      rawText = `EXCEPTION: ${err.message}`;
+    }
+    // Diagnostic — persist a few batches to Redis so we can read
+    // back what Haiku saw vs what it returned without depending on
+    // Vercel log streaming. Truncated; auto-expires in 1h.
+    try {
+      await redis.lpush(
+        `household:${householdId}:inventoryDebug`,
+        JSON.stringify({
+          batch: i / 5,
+          subjects: batch.map((e) => (e.subject || "").slice(0, 80)),
+          haikuHead: (rawText || "").slice(0, 1500),
+          stopReason,
+          httpStatus,
+          parsed: Array.isArray(items),
+          parsedLen: Array.isArray(items) ? items.length : null,
+        })
+      );
+      await redis.expire(`household:${householdId}:inventoryDebug`, 3600);
+    } catch {
+      // ignore — diagnostics shouldn't break the job
     }
     if (!Array.isArray(items)) continue;
 
     for (const item of items) {
       if (!item || typeof item !== "object") continue;
       if (!item.itemType) continue;
-      if (item.confidence === "low") continue;
+      // Low-confidence kept — mobile UI tier signals it visually via
+      // the confidence dot (green/amber/muted) so the user can judge.
       const k = dedupKey(item);
       if (existingSeen.has(k)) continue;
       existingSeen.add(k);
