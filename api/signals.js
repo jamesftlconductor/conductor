@@ -365,7 +365,10 @@ async function handleCompass(req, res) {
 async function handleCrew(req, res) {
   if (req.method === "GET") {
     const householdId = await resolveHouseholdId(req.query?.userId);
-    const raw = await redis.get(`household:${householdId}:crew`);
+    const [raw, rawSignals] = await Promise.all([
+      redis.get(`household:${householdId}:crew`),
+      redis.lrange(`household:${householdId}:signals`, 0, -1).catch(() => []),
+    ]);
     let crew = [];
     if (raw != null) {
       try {
@@ -375,21 +378,123 @@ async function handleCrew(req, res) {
         // malformed payload — return empty rather than 500
       }
     }
+    // Bucket signals by crewMemberId so the per-member attribution
+    // lookup is O(n) total instead of O(n * m).
+    const signalsByMember = new Map();
+    for (const r of rawSignals || []) {
+      const s = (() => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })();
+      if (!s || !s.crewMemberId) continue;
+      // Skip resolved/expired — only surface live attributions.
+      if (s.state && s.state !== "incoming" && s.state !== "active") continue;
+      const key = String(s.crewMemberId).toLowerCase().trim();
+      if (!signalsByMember.has(key)) signalsByMember.set(key, []);
+      signalsByMember.get(key).push(s);
+    }
     // Generate fresh signed photoUrls — 1-hour expiry, regenerated
     // every GET so the mobile app gets a usable URL whenever it
     // refreshes (focus, pull-to-refresh, etc.). Legacy public
     // photoUrl values (from before the private-blob switch) are
     // passed through untouched so older uploads still render.
+    // Also stamp attributedSignals (up to 5 most recent) + count
+    // so the expanded card can render the SIGNALS row without a
+    // second roundtrip.
     crew = crew.map((m) => {
-      if (m && typeof m === "object" && m.photoBlobPathname) {
-        return { ...m, photoUrl: signedPhotoUrl(householdId, m.photoBlobPathname) };
+      if (!m || typeof m !== "object") return m;
+      const next = { ...m };
+      if (m.photoBlobPathname) {
+        next.photoUrl = signedPhotoUrl(householdId, m.photoBlobPathname);
       }
-      return m;
+      if (m.name) {
+        const k = m.name.toLowerCase().trim();
+        const bucket = signalsByMember.get(k) || [];
+        // Newest first by signal id (id = Date.now() at import).
+        bucket.sort((a, b) => (b.id || 0) - (a.id || 0));
+        next.attributedSignals = bucket.slice(0, 5).map((s) => ({
+          id: s.id,
+          description: s.description,
+          type: s.type,
+          eta: s.eta,
+          state: s.state,
+          status: s.status,
+        }));
+        next.attributedSignalCount = bucket.length;
+      }
+      return next;
     });
     return res.status(200).json({ household: householdId, crew });
   }
 
   if (req.method === "POST") {
+    // CRUD via action param: add/edit/remove. Existing
+    // birthday-only POST shape (no action) flows through to the
+    // legacy path below unchanged.
+    const action = req.body?.action;
+    if (action === "add" || action === "edit" || action === "remove") {
+      const { userId, member, memberName } = req.body || {};
+      if (!userId) return res.status(400).json({ error: "userId required" });
+      const householdId = await resolveHouseholdId(userId);
+      const crewKey = `household:${householdId}:crew`;
+      const rawCrew = await redis.get(crewKey);
+      const crew = Array.isArray(safeJson(rawCrew)) ? safeJson(rawCrew) : [];
+
+      if (action === "add") {
+        if (!member || typeof member !== "object" || !member.name || !member.memberType) {
+          return res.status(400).json({ error: "member.name and member.memberType required" });
+        }
+        // Dedup on memberType + lowercase name to avoid double-adds
+        // when the user taps Save twice or re-runs a re-onboard.
+        const exists = crew.find(
+          (m) =>
+            m && m.memberType === member.memberType &&
+            (m.name || "").toLowerCase().trim() === String(member.name).toLowerCase().trim()
+        );
+        if (exists) {
+          return res.status(409).json({ error: "Crew member already exists", member: exists });
+        }
+        crew.push({ ...member, addedAt: new Date().toISOString() });
+        await redis.set(crewKey, JSON.stringify(crew));
+        return res.status(200).json({ ok: true, household: householdId, member: crew[crew.length - 1] });
+      }
+
+      if (action === "edit") {
+        if (!memberName) return res.status(400).json({ error: "memberName required" });
+        const idx = crew.findIndex(
+          (m) =>
+            m && (m.name || "").toLowerCase().trim() === String(memberName).toLowerCase().trim()
+        );
+        if (idx === -1) return res.status(404).json({ error: "member not found" });
+        // Whitelist what edit can touch — never overwrites
+        // memberType, photo blob refs, or sender patterns.
+        const ALLOWED = [
+          "name", "age", "birthday", "anniversary",
+          "school", "grade", "activities",
+          "type", "breed", "vet",
+          "relationship",
+          "notes", "prescriptions", "doctors",
+        ];
+        const updates = member && typeof member === "object" ? member : {};
+        for (const k of ALLOWED) {
+          if (Object.prototype.hasOwnProperty.call(updates, k)) {
+            crew[idx][k] = updates[k];
+          }
+        }
+        await redis.set(crewKey, JSON.stringify(crew));
+        return res.status(200).json({ ok: true, household: householdId, member: crew[idx] });
+      }
+
+      // remove
+      if (!memberName) return res.status(400).json({ error: "memberName required" });
+      const before = crew.length;
+      const next = crew.filter(
+        (m) => !(m && (m.name || "").toLowerCase().trim() === String(memberName).toLowerCase().trim())
+      );
+      if (next.length === before) {
+        return res.status(404).json({ error: "member not found" });
+      }
+      await redis.set(crewKey, JSON.stringify(next));
+      return res.status(200).json({ ok: true, household: householdId, removed: memberName });
+    }
+
     // Edit modal: update birthday/anniversary on an existing crew
     // member. Two routing paths mirror the onboard worker's birthday
     // pass:
