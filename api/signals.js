@@ -1770,10 +1770,11 @@ export default async function handler(req, res) {
         return res.status(200).json({ ok: true, dismissed: true });
       }
 
-      // Confirmed path — write the canonical record into :inventory
-      // under the appropriate bucket. Existing inventory keeps its
-      // shape (object map by itemType → array). Anything bucketless
-      // gets routed to "other".
+      // Confirmed path — merge into :inventory honoring its
+      // legacy schema (single-object slots for roof/hvac/waterHeater/
+      // electrical, arrays for vehicles/appliances). Field-name
+      // mapping bridges the suggestion shape (brand/year/...) to the
+      // canonical inventory shape that the mobile renderer expects.
       merged.confirmed = true;
       merged.confirmedAt = new Date().toISOString();
       delete merged.suggested;
@@ -1785,19 +1786,78 @@ export default async function handler(req, res) {
         const p = safeJson(invRaw);
         return p && typeof p === "object" && !Array.isArray(p) ? p : {};
       })();
-      const bucket = String(merged.itemType || "other");
-      const arr = Array.isArray(inv[bucket]) ? inv[bucket] : [];
-      // Sourced-from-email flag persists onto the canonical record
-      // so the mobile UI can show the "✓ from email" badge after
-      // confirmation.
-      arr.push({
-        ...merged,
-        fromEmail: true,
-        addedAt: new Date().toISOString(),
-      });
-      inv[bucket] = arr;
+
+      const fromEmail = true;
+      const yearStr = merged.year != null ? String(merged.year) : null;
+      const t = String(merged.itemType || "other").toLowerCase();
+      let bucket = t;
+      if (t === "hvac") {
+        inv.hvac = {
+          ...(inv.hvac && !Array.isArray(inv.hvac) ? inv.hvac : {}),
+          brand: merged.brand ?? inv.hvac?.brand ?? null,
+          yearInstalled: yearStr ?? inv.hvac?.yearInstalled ?? null,
+          lastServiced: merged.lastServiceDate ?? inv.hvac?.lastServiced ?? null,
+          filterSize: merged.filterSize ?? inv.hvac?.filterSize ?? null,
+          fromEmail,
+        };
+      } else if (t === "roof") {
+        inv.roof = {
+          ...(inv.roof && !Array.isArray(inv.roof) ? inv.roof : {}),
+          material: merged.brand ?? inv.roof?.material ?? null,
+          yearInstalled: yearStr ?? inv.roof?.yearInstalled ?? null,
+          lastInspected: merged.lastServiceDate ?? inv.roof?.lastInspected ?? null,
+          fromEmail,
+        };
+      } else if (t === "water_heater") {
+        bucket = "waterHeater";
+        inv.waterHeater = {
+          ...(inv.waterHeater && !Array.isArray(inv.waterHeater) ? inv.waterHeater : {}),
+          yearInstalled: yearStr ?? inv.waterHeater?.yearInstalled ?? null,
+          type: merged.brand ?? inv.waterHeater?.type ?? null,
+          fromEmail,
+        };
+      } else if (t === "electrical") {
+        inv.electrical = {
+          ...(inv.electrical && !Array.isArray(inv.electrical) ? inv.electrical : {}),
+          panelAmps: inv.electrical?.panelAmps ?? null,
+          yearUpdated: yearStr ?? inv.electrical?.yearUpdated ?? null,
+          fromEmail,
+        };
+      } else if (t === "vehicle") {
+        bucket = "vehicles";
+        const arr = Array.isArray(inv.vehicles) ? inv.vehicles : [];
+        arr.push({
+          make: merged.brand ?? null,
+          model: merged.model ?? null,
+          year: yearStr,
+          mileage: merged.lastServiceMileage != null ? String(merged.lastServiceMileage) : null,
+          lastService: merged.lastServiceDate ?? null,
+          fromEmail,
+        });
+        inv.vehicles = arr;
+      } else if (t === "appliance") {
+        bucket = "appliances";
+        const arr = Array.isArray(inv.appliances) ? inv.appliances : [];
+        const name = [merged.brand, merged.model].filter(Boolean).join(" ").trim()
+          || merged.sourceDescription
+          || "Appliance";
+        arr.push({
+          name,
+          yearPurchased: yearStr,
+          fromEmail,
+        });
+        inv.appliances = arr;
+      } else {
+        // Bucketless — preserve under inv.other[] so nothing is lost
+        // even though no current mobile section renders it.
+        bucket = "other";
+        const arr = Array.isArray(inv.other) ? inv.other : [];
+        arr.push({ ...merged, fromEmail, addedAt: new Date().toISOString() });
+        inv.other = arr;
+      }
+
       await redis.set(invKey, JSON.stringify(inv));
-      return res.status(200).json({ ok: true, household: householdId, bucket, item: arr[arr.length - 1] });
+      return res.status(200).json({ ok: true, household: householdId, bucket, inventory: inv });
     }
 
     // Auto-resolutions — surfaces what Conductor handled without
