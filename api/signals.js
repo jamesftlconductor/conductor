@@ -1354,6 +1354,110 @@ export function applyCamouflage(signals, rules) {
   });
 }
 
+// ---------- Commons (anonymous provider aggregation) ----------
+
+// Normalize a sender name into a stable provider key. Lowercased,
+// trimmed, common email-suffix noise stripped. Used as the
+// commons:providers:{key}:{region} aggregation slot.
+function normalizeProvider(name) {
+  if (!name || typeof name !== "string") return null;
+  let s = name.toLowerCase().trim();
+  // Strip "via", "from", and address-like fragments.
+  s = s.replace(/<[^>]+>/g, "").replace(/\b(via|from)\b/g, "").trim();
+  s = s.replace(/[^a-z0-9 -]/g, "").trim();
+  s = s.replace(/\s+/g, "-");
+  return s.length > 1 && s.length < 80 ? s : null;
+}
+
+// Write an anonymous resolution record to the commons aggregation.
+// No householdId. No userId. resolutionDays + signalType + timestamp
+// only. Capped at 100 entries per provider+region slot.
+async function writeCommonsRecord(householdId, signal) {
+  try {
+    if (!signal || !signal.sender) return;
+    const provider = normalizeProvider(signal.sender);
+    if (!provider) return;
+    const created =
+      typeof signal.createdAt === "number"
+        ? signal.createdAt
+        : Date.parse(signal.createdAt || "");
+    const resolved =
+      typeof signal.id === "number" && signal.id > 1e12 ? signal.id : Date.now();
+    if (isNaN(created) || created < 0) return;
+    const resolutionDays = Math.max(
+      0,
+      Math.floor((Date.now() - created) / (24 * 60 * 60 * 1000))
+    );
+    // Resolve region from household location — best-effort; default
+    // 'generic' bucket when missing.
+    let region = "generic";
+    try {
+      const raw = await redis.get(`household:${householdId}:location`);
+      const loc = safeJson(raw);
+      if (loc?.marketRegion) region = loc.marketRegion;
+    } catch { /* skip */ }
+    const key = `commons:providers:${provider}:${region}`;
+    const record = {
+      resolutionDays,
+      signalType: signal.type || "unknown",
+      resolvedAt: new Date(resolved).toISOString(),
+    };
+    await redis.lpush(key, JSON.stringify(record));
+    await redis.ltrim(key, 0, 99);
+  } catch (err) {
+    console.warn("[commons] write failed:", err?.message);
+  }
+}
+
+async function handleCommons(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const providerInput = req.query?.provider;
+  const region = req.query?.region || "generic";
+  if (!providerInput) {
+    return res.status(400).json({ error: "provider required" });
+  }
+  const provider = normalizeProvider(String(providerInput));
+  if (!provider) {
+    return res.status(400).json({ error: "invalid provider name" });
+  }
+  const key = `commons:providers:${provider}:${region}`;
+  const raw = await redis.lrange(key, 0, -1);
+  const records = (raw || []).map((r) => safeJson(r)).filter(Boolean);
+  if (records.length === 0) {
+    return res.status(200).json({
+      ok: true,
+      provider,
+      region,
+      sampleSize: 0,
+      avgResolutionDays: null,
+      rating: null,
+    });
+  }
+  const days = records
+    .map((r) => Number(r.resolutionDays))
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  const avg = days.length
+    ? Math.round((days.reduce((a, b) => a + b, 0) / days.length) * 10) / 10
+    : null;
+  const rating =
+    avg == null ? null
+    : avg < 2 ? "excellent"
+    : avg < 5 ? "good"
+    : avg < 10 ? "fair"
+    : "poor";
+  return res.status(200).json({
+    ok: true,
+    provider,
+    region,
+    sampleSize: records.length,
+    avgResolutionDays: avg,
+    rating,
+  });
+}
+
 // ---------- Conductor Junior ----------
 
 const BADGE_DEFINITIONS = [
@@ -3509,6 +3613,10 @@ export default async function handler(req, res) {
       return handleRecurringEvents(req, res);
     }
 
+    if (queryType === "commons") {
+      return handleCommons(req, res);
+    }
+
     if (req.method === "GET") {
       const householdId = await resolveHouseholdId(req.query.userId);
       const [{ signals }, camouflageRules] = await Promise.all([
@@ -3662,6 +3770,9 @@ export default async function handler(req, res) {
             try { await updateStreak(householdId); } catch (err) {
               console.warn("[streak] update failed:", err?.message || err);
             }
+            // Commons — anonymous provider aggregation. No identifiers
+            // ever written; only resolution days + type + timestamp.
+            await writeCommonsRecord(householdId, signals[index]);
           }
         }
         return res.status(200).json({ household: householdId, signal: signals[index] });
