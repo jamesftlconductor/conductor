@@ -2189,6 +2189,114 @@ async function handleDeleteAccount(req, res) {
   });
 }
 
+// Default recurring events pre-seeded for every household, optionally
+// extended for family (kids in the home) and homeowners. The brief
+// surfaces these as awareness items, not signals; the Programme on
+// mobile shows them as muted calendar markers.
+const DEFAULT_RECURRING_EVENTS = [
+  { id: "tax_filing", name: "Tax filing season", description: "Federal tax filing window opens.", recurrence: "annual", month: 2, dayOfMonth: 1, weeksBefore: 6, category: "financial", active: true },
+  { id: "annual_insurance_review", name: "Annual insurance review", description: "Review home, auto, umbrella policies.", recurrence: "annual", month: 11, dayOfMonth: 1, weeksBefore: 2, category: "financial", active: true },
+  { id: "holiday_travel_planning", name: "Holiday travel planning", description: "Holiday travel fills up — worth booking.", recurrence: "annual", month: 10, dayOfMonth: 1, weeksBefore: 3, category: "family", active: true },
+  { id: "new_year_financial_review", name: "New Year financial review", description: "Annual budget + goals review.", recurrence: "annual", month: 12, dayOfMonth: 15, weeksBefore: 2, category: "financial", active: true },
+];
+
+const FAMILY_RECURRING_EVENTS = [
+  { id: "back_to_school", name: "Back to school", description: "Supplies, schedule, registration.", recurrence: "annual", month: 7, dayOfMonth: 15, weeksBefore: 3, category: "family", active: true },
+  { id: "school_registration", name: "School registration", description: "Annual school registration window.", recurrence: "annual", month: 3, dayOfMonth: 1, weeksBefore: 4, category: "family", active: true },
+  { id: "sports_registration", name: "Sports registration season", description: "Fall sports registration opens.", recurrence: "annual", month: 7, dayOfMonth: 1, weeksBefore: 3, category: "family", active: true },
+];
+
+const HOMEOWNER_RECURRING_EVENTS = [
+  { id: "spring_home_inspection", name: "Spring home inspection", description: "Roof, gutters, exterior check.", recurrence: "annual", month: 3, dayOfMonth: 1, weeksBefore: 3, category: "home", active: true },
+  { id: "fall_winterization", name: "Fall winterization", description: "Storm prep + seasonal turnover.", recurrence: "annual", month: 9, dayOfMonth: 1, weeksBefore: 3, category: "home", active: true },
+];
+
+async function buildSeededRecurringEvents(householdId) {
+  // Read profile to decide which seeds apply.
+  let who = null;
+  let housing = null;
+  try {
+    const raw = await redis.get(`household:${householdId}:profile`);
+    const profile = safeJson(raw);
+    who = profile?.who || null;
+    housing = profile?.housing || null;
+  } catch { /* skip */ }
+  const seeds = [...DEFAULT_RECURRING_EVENTS];
+  if (who === "family") seeds.push(...FAMILY_RECURRING_EVENTS);
+  if (housing === "own") seeds.push(...HOMEOWNER_RECURRING_EVENTS);
+  return seeds;
+}
+
+async function handleRecurringEvents(req, res) {
+  const userId = req.method === "GET" ? req.query?.userId : req.body?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+  const key = `household:${householdId}:recurringEvents`;
+
+  if (req.method === "GET") {
+    let raw = await redis.get(key);
+    let list = safeJson(raw);
+    if (!Array.isArray(list)) {
+      // Auto-seed on first read so the household has a working set
+      // immediately. Subsequent edits persist as-is.
+      list = await buildSeededRecurringEvents(householdId);
+      await redis.set(key, JSON.stringify(list));
+    }
+    return res.status(200).json({ ok: true, household: householdId, events: list });
+  }
+
+  if (req.method === "POST") {
+    const { event } = req.body || {};
+    if (!event || typeof event !== "object" || !event.name) {
+      return res.status(400).json({ error: "event.name required" });
+    }
+    const existing = safeJson(await redis.get(key));
+    const list = Array.isArray(existing)
+      ? existing
+      : await buildSeededRecurringEvents(householdId);
+    const newEvent = {
+      id: event.id || `re_${Date.now()}`,
+      name: String(event.name).trim(),
+      description: event.description || "",
+      recurrence: event.recurrence || "annual",
+      month: event.month != null ? Number(event.month) : null,
+      dayOfMonth: event.dayOfMonth != null ? Number(event.dayOfMonth) : null,
+      weeksBefore: event.weeksBefore != null ? Number(event.weeksBefore) : 2,
+      category: event.category || "other",
+      active: event.active !== false,
+    };
+    const next = list.filter((e) => e.id !== newEvent.id).concat(newEvent);
+    await redis.set(key, JSON.stringify(next));
+    return res.status(200).json({ ok: true, event: newEvent, events: next });
+  }
+
+  if (req.method === "PATCH") {
+    const { id, active } = req.body || {};
+    if (!id) return res.status(400).json({ error: "id required" });
+    const existing = safeJson(await redis.get(key));
+    const list = Array.isArray(existing)
+      ? existing
+      : await buildSeededRecurringEvents(householdId);
+    const next = list.map((e) => (e.id === id ? { ...e, active: active !== false } : e));
+    await redis.set(key, JSON.stringify(next));
+    return res.status(200).json({ ok: true, events: next });
+  }
+
+  if (req.method === "DELETE") {
+    const { id } = req.body || req.query || {};
+    if (!id) return res.status(400).json({ error: "id required" });
+    const existing = safeJson(await redis.get(key));
+    const list = Array.isArray(existing) ? existing : [];
+    const next = list.filter((e) => e.id !== id);
+    await redis.set(key, JSON.stringify(next));
+    return res.status(200).json({ ok: true, events: next });
+  }
+
+  res.setHeader("Allow", "GET, POST, PATCH, DELETE");
+  return res.status(405).json({ error: "Method not allowed" });
+}
+
 async function handlePriorities(req, res) {
   const userId = req.method === "GET" ? req.query?.userId : req.body?.userId;
   if (!userId) return res.status(400).json({ error: "userId required" });
@@ -3395,6 +3503,10 @@ export default async function handler(req, res) {
 
     if (queryType === "priorities" || bodyType === "priorities") {
       return handlePriorities(req, res);
+    }
+
+    if (queryType === "recurringEvents" || bodyType === "recurringEvents") {
+      return handleRecurringEvents(req, res);
     }
 
     if (req.method === "GET") {
