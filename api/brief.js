@@ -3320,12 +3320,30 @@ export default async function handler(req, res) {
       return phrase ? `${friendly} (${phrase}) (raw: ${raw})` : `${friendly} (raw: ${raw})`;
     };
 
+    // Signal freshness — days since last update (lastUpdate ?? createdAt).
+    // Emitted alongside each signal so the prompt rule can choose
+    // staleness framing without recomputing dates.
+    const signalAgeDays = (s) => {
+      const stamp = s?.lastUpdate || s?.createdAt;
+      if (!stamp) return 0;
+      const ms = typeof stamp === "number" ? stamp : Date.parse(stamp);
+      if (isNaN(ms)) return 0;
+      return Math.floor((Date.now() - ms) / (24 * HOUR_MS));
+    };
+    const freshnessTag = (s) => {
+      const d = signalAgeDays(s);
+      if (d >= 14) return " | freshness: ANCIENT";
+      if (d >= 7) return " | freshness: STALE";
+      if (d >= 3) return " | freshness: NEAR";
+      return "";
+    };
+
     const formatSignal = (s) => {
       const owner = `[${ownershipTag(s, userId, householdNameMap, isSingleMember)}]`;
       if (s._isDeadline) {
         return `- ${owner} [DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
       }
-      return `- ${owner} ${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}`;
+      return `- ${owner} ${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}${freshnessTag(s)}`;
     };
     const formatEvent = (e) => {
       const owner = `[${ownershipTag(e, userId, householdNameMap, isSingleMember)}]`;
@@ -3886,6 +3904,12 @@ ${isSingleMember
     } catch (err) {
       console.warn("[brief] style rule build failed:", err?.message);
     }
+
+    // Signal freshness rule — each signal carries an optional
+    // " | freshness: NEAR/STALE/ANCIENT" suffix indicating days since
+    // last update. Use it to calibrate framing without ever quoting
+    // the tag itself.
+    composedRules = `${composedRules}\n- SIGNAL FRESHNESS: Each signal line may end with "| freshness: NEAR" (3-6d), "STALE" (7-13d), or "ANCIENT" (14d+). For STALE signals, briefly acknowledge the staleness if you surface them — e.g. "the garage door estimate has been quiet for over a week." ANCIENT signals belong in The Read, not the brief — only surface them if they are urgently approaching a deadline. Fresh signals (no tag, or NEAR) get normal treatment. Never quote the literal "freshness:" annotation — it's routing metadata.`;
 
     // Household priorities — what the user told us matters most during
     // onboarding (Step 3). Stored at household:{id}:priorities as
