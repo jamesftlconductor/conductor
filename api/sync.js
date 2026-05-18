@@ -216,7 +216,15 @@ export default async function handler(req, res) {
       households.get(householdId).push(userId);
     }
 
-    for (const [householdId, members] of households) {
+    // Batch processing — 8 households in parallel per chunk, with a
+    // 45s timeout race per household so a single hung Gmail call
+    // doesn't stall the whole sweep. 2s settle between chunks to
+    // avoid simultaneous Anthropic/Upstash burst-throttling.
+    const BATCH_SIZE = 8;
+    const BATCH_DELAY_MS = 2000;
+    const PER_HOUSEHOLD_TIMEOUT_MS = 45000;
+
+    async function processHousehold(householdId, members) {
       for (const userId of members) {
         try {
           const result = await runImport(userId);
@@ -227,12 +235,6 @@ export default async function handler(req, res) {
           errors.push({ stage: "import", householdId, userId, message: err.message });
         }
       }
-
-      // Multi-driver calendar sync — every member's tokens drive their
-      // own runCalendarSync, writing to a per-user calendar key
-      // (household:{id}:calendar:{userId}). The 23h cooldown is now
-      // per-user, so each member's call independently skips or runs.
-      // Consumers merge the per-user keys via api/calendar-loader.js.
       for (const userId of members) {
         try {
           await runCalendarSync(userId);
@@ -240,12 +242,6 @@ export default async function handler(req, res) {
           errors.push({ stage: "calendar", householdId, userId, message: err.message });
         }
       }
-
-      // Per-member Oura sync — only fires for users who have completed
-      // the OAuth flow (user:{id}:ouraTokens exists). runOuraSync is
-      // best-effort: token expiry triggers a refresh, individual
-      // endpoint failures (ring out of sync, network blip) leave the
-      // corresponding section null in the merged health snapshot.
       for (const userId of members) {
         try {
           const hasTokens = await redis.exists(`user:${userId}:ouraTokens`);
@@ -255,31 +251,52 @@ export default async function handler(req, res) {
           errors.push({ stage: "oura", householdId, userId, message: err.message });
         }
       }
-
-      // Anticipated-signal generation — reads :patterns built by
-      // import.js's detectAndStampRecurring and adds a soft
-      // "anticipated" signal when a recurring sender is overdue.
       try {
         await generateAnticipatedSignals(redis, householdId);
       } catch (err) {
         errors.push({ stage: "anticipated", householdId, message: err.message });
       }
-
-      // Self-healing — partial onboards leave vault/crew/horizon
-      // empty. After the first full day with no manual intervention,
-      // re-trigger the missing jobs so the household catches up
-      // organically. Driven off the same household:{id}:lastSync
-      // age and per-job emptiness checks.
       try {
         await selfHealHousehold(redis, householdId, members);
       } catch (err) {
         errors.push({ stage: "self-heal", householdId, message: err.message });
       }
-
       try {
         await redis.set(`household:${householdId}:lastSync`, Date.now());
       } catch (err) {
         errors.push({ stage: "stamp-lastSync", householdId, message: err.message });
+      }
+    }
+
+    const householdEntries = Array.from(households.entries());
+    const chunks = [];
+    for (let i = 0; i < householdEntries.length; i += BATCH_SIZE) {
+      chunks.push(householdEntries.slice(i, i + BATCH_SIZE));
+    }
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      await Promise.all(
+        chunk.map(([householdId, members]) =>
+          Promise.race([
+            processHousehold(householdId, members),
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error(`per-household timeout after ${PER_HOUSEHOLD_TIMEOUT_MS}ms`)),
+                PER_HOUSEHOLD_TIMEOUT_MS
+              )
+            ),
+          ]).catch((err) => {
+            errors.push({
+              stage: "household-batch",
+              householdId,
+              message: err?.message || String(err),
+            });
+          })
+        )
+      );
+      if (i < chunks.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
       }
     }
 
