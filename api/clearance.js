@@ -319,8 +319,26 @@ function friendlyDateTime(value) {
 
 const DAY_MS_LOCAL = 24 * 60 * 60 * 1000;
 
+// See brief.js parseEtaDeadline — same shape, kept inline so this
+// module stays self-contained. Falls back to single-date parsing
+// when no range separator is present.
+function parseEtaDeadline(value) {
+  if (!value || typeof value !== "string") return parseDateLoose(value);
+  const direct = parseDateLoose(value);
+  if (direct) return direct;
+  const parts = value.split(/\s+(?:to|through|thru|–|—|-)\s+/i);
+  if (parts.length >= 2) {
+    const a = parseDateLoose(parts[0]);
+    const b = parseDateLoose(parts[parts.length - 1]);
+    if (a && b) return a.getTime() > b.getTime() ? a : b;
+    if (b) return b;
+    if (a) return a;
+  }
+  return null;
+}
+
 function daysFromTodayPhrase(value) {
-  const d = parseDateLoose(value);
+  const d = parseEtaDeadline(value);
   if (!d) return null;
   const startOfToday = new Date();
   startOfToday.setHours(0, 0, 0, 0);

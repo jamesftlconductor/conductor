@@ -302,6 +302,26 @@ function formatMMDD(mmDd) {
   });
 }
 
+// Extract the deadline anchor from a possibly-windowed ETA string
+// like "2025-12-10 to 2025-12-20" or "Dec 10 – Dec 20". Returns the
+// later side (the window's close) since that's the authoritative
+// "still open" boundary. Falls back to whichever side parses if only
+// one is valid. Plain single-date strings pass through unchanged.
+function parseEtaDeadline(value) {
+  if (!value || typeof value !== "string") return parseDateLoose(value);
+  const direct = parseDateLoose(value);
+  if (direct) return direct;
+  const parts = value.split(/\s+(?:to|through|thru|–|—|-)\s+/i);
+  if (parts.length >= 2) {
+    const a = parseDateLoose(parts[0]);
+    const b = parseDateLoose(parts[parts.length - 1]);
+    if (a && b) return a.getTime() > b.getTime() ? a : b;
+    if (b) return b;
+    if (a) return a;
+  }
+  return null;
+}
+
 // Module-level day-count phrase: emits authoritative "(in N days)" /
 // "(today)" / "(tomorrow)" / "(in N weeks)" for clean multiples of 7,
 // or "(yesterday)" / "(already passed N days ago)" for past dates.
@@ -309,7 +329,7 @@ function formatMMDD(mmDd) {
 // generateTransparency's pre-formatting so the transparency Claude
 // call can lift counts instead of computing them.
 function daysFromTodayPhrase(value) {
-  const d = parseDateLoose(value);
+  const d = parseEtaDeadline(value);
   if (!d) return null;
   const startOfToday = new Date();
   startOfToday.setHours(0, 0, 0, 0);
