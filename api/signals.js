@@ -47,6 +47,39 @@ const VALID_STATES = ["incoming", "active", "resolved", "expired", "snoozed"];
 const DEFAULT_SNOOZE_MS = 24 * 60 * 60 * 1000;
 const EXPIRY_MS = 24 * 60 * 60 * 1000;
 
+// Drop the per-user brief cache for every member of a household.
+// Called from the PATCH signal/deadline paths when description /
+// eta / status change — the cached prose would otherwise misquote
+// the edited field until its TTL expires.
+async function invalidateBriefCache(householdId) {
+  if (!householdId) return;
+  // Find every user whose household resolves to this id. Mirrors
+  // the scan pattern in sync.js / notify.js.
+  const keys = [];
+  let cursor = "0";
+  do {
+    const [next, batch] = await redis.scan(cursor, { match: "user:*:household", count: 100 });
+    cursor = next;
+    if (batch?.length) keys.push(...batch);
+  } while (cursor !== "0" && cursor !== 0);
+  const members = [];
+  for (const key of keys) {
+    const userId = key.slice("user:".length, -":household".length);
+    const hid = await redis.get(key);
+    if ((hid || userId) === householdId) members.push(userId);
+  }
+  const del = [];
+  for (const uid of members) {
+    del.push(redis.del(`user:${uid}:currentTakeoff`));
+    del.push(redis.del(`user:${uid}:currentClearance`));
+    del.push(redis.del(`user:${uid}:currentMidday`));
+  }
+  await Promise.all(del);
+  console.log(
+    `[cache] invalidated brief cache for household ${householdId} (${members.length} members)`
+  );
+}
+
 async function resolveHouseholdId(userId) {
   if (!userId) return "RangerOaks925";
   const hid = await redis.get(`user:${userId}:household`);
@@ -2419,6 +2452,19 @@ export default async function handler(req, res) {
         }
         await redis.lset(key, index, JSON.stringify(signals[index]));
 
+        // Brief cache invalidation — when a signal's
+        // description / eta / status changes, the previously
+        // cached morning/midday/evening prose is now stale and
+        // could misquote the edited field. Clear the cache for
+        // every household member so the next brief regenerates.
+        if (hasDescription || hasEta || hasStatus) {
+          try {
+            await invalidateBriefCache(householdId);
+          } catch (err) {
+            console.warn("[cache] brief invalidation failed:", err?.message || err);
+          }
+        }
+
         // Memory log fires only on state lifecycle transitions, not on
         // pure field edits. An edit isn't a "resolved" or "held" event;
         // logging it would pollute the longitudinal feed and Compass.
@@ -2460,6 +2506,12 @@ export default async function handler(req, res) {
         deadlines[index].notedAt = notedAt;
       }
       await redis.lset(deadlinesKey, index, JSON.stringify(deadlines[index]));
+
+      // Same brief-cache invalidation as the :signals path.
+      if (hasDescription || hasEta || hasStatus) {
+        try { await invalidateBriefCache(householdId); }
+        catch (err) { console.warn("[cache] deadlines brief invalidation failed:", err?.message); }
+      }
 
       if (stateProvided && (state === "resolved" || state === "active")) {
         const action = state === "resolved" ? "resolved" : "held";
