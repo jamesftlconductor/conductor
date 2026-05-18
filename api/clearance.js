@@ -375,15 +375,26 @@ function etaWithFriendly(raw) {
 // paragraph. Returns null on non-Sunday or any failure — the response
 // always carries the field so the mobile renderer can decide whether
 // to render the section.
-async function generateWeekInReview(householdId) {
+async function loadHouseholdName(householdId) {
   try {
-    // Sunday detection uses the user-facing timezone (America/New_York
-    // for the dev household). At 02:00 UTC Monday — when the clearance
-    // cron fires — it's Sunday 9-10pm ET, which is the right moment
-    // for the user to read a week-in-review. Intl.DateTimeFormat is
-    // timezone-aware regardless of the server's UTC clock.
+    const raw = await redis.get(`household:${householdId}:profile`);
+    const profile = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
+    return profile?.householdName || null;
+  } catch { return null; }
+}
+
+async function generateWeekInReview(householdId, householdName) {
+  try {
+    // Sunday detection uses the household's local timezone. Per-household
+    // TZ resolution comes from location.js; falls back to ET when
+    // unavailable so older households without lat/lon keep working.
+    let tz = "America/New_York";
+    try {
+      const { getHouseholdTimezone } = await import("./location.js");
+      tz = (await getHouseholdTimezone(householdId)) || "America/New_York";
+    } catch { /* fall back */ }
     const localWeekday = new Date().toLocaleString("en-US", {
-      timeZone: "America/New_York",
+      timeZone: tz,
       weekday: "short",
     });
     if (localWeekday !== "Sun") return null;
@@ -479,7 +490,8 @@ async function generateWeekInReview(householdId) {
         .sort((a, b) => (a.daysBeforeExpiry ?? 99) - (b.daysBeforeExpiry ?? 99))[0];
     }
 
-    const prompt = `Write a warm, honest one-paragraph Week in Review for this household. Cover:
+    const householdRef = householdName ? `${householdName}` : "this household";
+    const prompt = `Write a warm, honest one-paragraph Week in Review for ${householdRef}. Cover:
 - How many signals were handled this week (${rested} rested, ${carriedForward} carried forward, ${lapsed} lapsed)
 - Any deadlines caught before they slipped (${deadlinesCaught} deadlines caught this week)
 - The streak if active: ${streakMilestone ? streakMilestone : streakForPrompt >= 2 ? `${streakForPrompt} days running — nothing has slipped` : "(no notable streak this week)"}
@@ -1241,7 +1253,7 @@ ${isSingleMember
         tomorrow: tomorrowEvents,
         horizon: horizonSignal,
       }),
-      generateWeekInReview(householdId),
+      generateWeekInReview(householdId, await loadHouseholdName(householdId)),
       generateMonthInReview(householdId),
       generateYearInReview(householdId),
     ]);

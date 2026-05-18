@@ -4073,9 +4073,22 @@ Return only the spoken text.`,
       console.warn("[brief] spokenSummary failed:", err?.message);
     }
 
+    // Expose householdName from the profile so mobile surfaces
+    // (Summary card, Settings header, network display) can lift it
+    // without an extra round trip.
+    let householdName = null;
+    try {
+      const rawProfile = await redis.get(`household:${householdId}:profile`);
+      const profile = rawProfile
+        ? (typeof rawProfile === "string" ? JSON.parse(rawProfile) : rawProfile)
+        : null;
+      if (profile?.householdName) householdName = profile.householdName;
+    } catch { /* skip */ }
+
     const briefResponse = {
       brief: finalBrief,
       spokenSummary,
+      householdName,
       segments,
       transparency,
       theRead,

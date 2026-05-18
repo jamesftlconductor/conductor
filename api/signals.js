@@ -1837,7 +1837,7 @@ async function handleProfile(req, res) {
   if (req.method === "POST") {
     const {
       type, ownOrRent, childrenCount, petsCount,
-      who, housing, modifiers,
+      who, housing, modifiers, householdName,
     } = req.body || {};
     if (type && !VALID_PROFILE_TYPES.has(type)) {
       return res.status(400).json({ error: "invalid type" });
@@ -1857,6 +1857,15 @@ async function handleProfile(req, res) {
         .filter((m) => typeof m === "string" && VALID_MODIFIERS.has(m));
     }
     const existing = safeJson(await redis.get(key)) || {};
+    // householdName: trim, accept null/empty to clear.
+    let nameVal = undefined;
+    if (householdName !== undefined) {
+      if (householdName === null) nameVal = null;
+      else if (typeof householdName === "string") {
+        const trimmed = householdName.trim();
+        nameVal = trimmed.length > 0 ? trimmed : null;
+      }
+    }
     const next = {
       ...existing,
       ...(type && { type }),
@@ -1866,6 +1875,7 @@ async function handleProfile(req, res) {
       ...(who && { who }),
       ...(housing && { housing }),
       ...(modArr !== undefined && { modifiers: modArr }),
+      ...(nameVal !== undefined && { householdName: nameVal }),
       setAt: new Date().toISOString(),
     };
     await redis.set(key, JSON.stringify(next));
