@@ -1066,6 +1066,39 @@ export async function runImport(userId, customQuery = null) {
           console.log(
             `[financial] signal ${signal.id} ${a.kind}: ${signal.description}`
           );
+
+          // Push notification for price_change + unusual_charge —
+          // these are immediately actionable. new_subscription
+          // surfaces in the next brief instead, no push.
+          if (a.kind === "price_change" || a.kind === "unusual_charge") {
+            try {
+              const merchant = tx.merchant || "Unknown merchant";
+              let body;
+              if (a.kind === "price_change") {
+                const prev = a.details?.previousAmount ?? tx.previousAmount;
+                const curr = a.details?.newAmount ?? tx.amount;
+                body = prev != null && curr != null
+                  ? `${merchant} went from $${prev} to $${curr}/month`
+                  : `${merchant} price changed`;
+              } else {
+                body = `Unusual charge from ${merchant}: $${tx.amount} (typical $${a.details?.typical})`;
+              }
+              if (body.length > 100) body = body.slice(0, 97) + "...";
+              await fetch("https://conductor-ivory.vercel.app/api/notify?type=tracking", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  householdId,
+                  title: "Price change detected",
+                  body,
+                  signalId: signal.id,
+                  kind: a.kind,
+                }),
+              });
+            } catch (err) {
+              console.warn("[financial] anomaly push failed:", err?.message || err);
+            }
+          }
         }
 
         imported++;
