@@ -730,6 +730,229 @@ function buildFinancialSignal(anomaly, tx) {
   };
 }
 
+// ---------- Lease auto-detection ----------
+
+const LEASE_KEYWORDS = [
+  "lease renewal",
+  "rent increase",
+  "notice to vacate",
+  "lease agreement",
+  "end of lease",
+  "lease expiration",
+  "rental agreement",
+  "month-to-month",
+  "security deposit",
+  "rent payment",
+  "landlord",
+];
+
+function isLeaseEmail(subject, body) {
+  const hay = `${subject || ""}\n${(body || "").slice(0, 4000)}`.toLowerCase();
+  // Require at least one matching keyword. Single-word "landlord" alone
+  // is fine — it strongly implies lease context.
+  return LEASE_KEYWORDS.some((k) => hay.includes(k));
+}
+
+async function extractLeaseInfo(subject, from, body) {
+  const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 600,
+      tools: [
+        {
+          name: "record_lease_email",
+          description: "Extract lease information from a lease-related email. Return null fields when the email doesn't carry the specific data.",
+          input_schema: {
+            type: "object",
+            properties: {
+              leaseType: { type: "string", enum: ["residential", "vehicle", "unknown"] },
+              address: { type: ["string", "null"] },
+              monthlyAmount: { type: ["number", "null"] },
+              leaseEnd: { type: ["string", "null"], description: "YYYY-MM-DD or null" },
+              noticeRequired: { type: ["integer", "null"], enum: [30, 60, 90, null] },
+              landlordName: { type: ["string", "null"] },
+              landlordPhone: { type: ["string", "null"] },
+              landlordEmail: { type: ["string", "null"] },
+              isRenewalOffer: { type: "boolean" },
+              isRentIncrease: { type: "boolean" },
+              newAmount: { type: ["number", "null"] },
+            },
+            required: ["leaseType", "isRenewalOffer", "isRentIncrease"],
+          },
+        },
+      ],
+      tool_choice: { type: "tool", name: "record_lease_email" },
+      messages: [
+        {
+          role: "user",
+          content: `Extract lease information from this email.
+
+Subject: ${subject}
+From: ${from}
+
+Body:
+${(body || "").slice(0, 6000)}
+
+Only populate fields when the email clearly carries that data. If nothing lease-specific is present (just a marketing/legal blurb), return null for everything except leaseType/isRenewalOffer/isRentIncrease.`,
+        },
+      ],
+    }),
+  });
+  if (!apiRes.ok) return null;
+  const data = await apiRes.json();
+  const tool = (data?.content || []).find((b) => b?.type === "tool_use");
+  if (!tool?.input) return null;
+  const lease = tool.input;
+  // Reject when nothing useful was extracted.
+  const hasUseful =
+    lease.leaseEnd ||
+    lease.monthlyAmount ||
+    lease.address ||
+    lease.isRenewalOffer ||
+    lease.isRentIncrease ||
+    lease.newAmount;
+  if (!hasUseful) return null;
+  return lease;
+}
+
+async function syncLeaseFromEmail(householdId, lease, ctx) {
+  const vaultKey = `household:${householdId}:vault`;
+  const rawVault = await redis.lrange(vaultKey, 0, -1);
+  const items = [];
+  for (const r of rawVault) {
+    try { items.push(JSON.parse(r)); } catch { /* skip malformed */ }
+  }
+
+  // Dedup: residential keys on lowercased address; vehicle on
+  // make/model/year (unavailable here since email parsing doesn't
+  // surface vehicle make/model — vehicle leases will create new
+  // items unless one with exactly matching address-like notes
+  // already exists).
+  const cat = lease.leaseType === "vehicle" ? "lease_vehicle" : "lease_residential";
+  let matchIndex = -1;
+  if (lease.address) {
+    const addrLower = String(lease.address).toLowerCase().trim();
+    for (let i = 0; i < items.length; i++) {
+      if (items[i]?.category !== cat) continue;
+      const existing = String(items[i].address || "").toLowerCase().trim();
+      if (existing && existing === addrLower) {
+        matchIndex = i;
+        break;
+      }
+    }
+  }
+
+  // Rent-increase against existing: update monthlyRent + push priceHistory.
+  if (lease.isRentIncrease && matchIndex >= 0) {
+    const item = items[matchIndex];
+    const prior = item.monthlyRent || item.amount || null;
+    const next = lease.newAmount || lease.monthlyAmount || null;
+    if (next) {
+      item.monthlyRent = next;
+      item.amount = `$${next}`;
+    }
+    if (!Array.isArray(item.priceHistory)) item.priceHistory = [];
+    item.priceHistory.push({
+      previous: prior,
+      current: item.monthlyRent || item.amount,
+      detectedAt: new Date().toISOString(),
+      source: "lease-email",
+    });
+    item.lastUpdate = new Date().toLocaleString();
+    await redis.lset(vaultKey, matchIndex, JSON.stringify(item));
+    console.log(
+      `[lease] rent change for ${item.address || item.id}: ${prior} → ${item.monthlyRent}`
+    );
+    // Also surface a deadline signal if a renewal offer accompanies
+    // the increase.
+    if (lease.isRenewalOffer) {
+      await pushLeaseRenewalSignal(householdId, item, lease, ctx);
+    }
+    return;
+  }
+
+  // No existing match → create new vault item.
+  if (matchIndex < 0) {
+    const id = `vault_lease_${Date.now()}`;
+    const newItem = {
+      id,
+      category: cat,
+      description:
+        lease.leaseType === "vehicle"
+          ? "Vehicle lease"
+          : lease.address
+          ? `Lease — ${lease.address}`
+          : "Residential lease",
+      address: lease.address || null,
+      monthlyRent: lease.monthlyAmount || null,
+      amount:
+        (lease.newAmount || lease.monthlyAmount)
+          ? `$${lease.newAmount || lease.monthlyAmount}`
+          : null,
+      leaseEnd: lease.leaseEnd || null,
+      renewalDate: lease.leaseEnd || null,
+      noticeRequired: lease.noticeRequired || null,
+      landlordName: lease.landlordName || null,
+      landlordPhone: lease.landlordPhone || null,
+      landlordEmail: lease.landlordEmail || null,
+      provider: lease.landlordName || null,
+      autoDetected: true,
+      source: "gmail",
+      confidence: "medium",
+      handled: false,
+      handledAt: null,
+      priceHistory: lease.isRentIncrease
+        ? [{
+            previous: null,
+            current: lease.newAmount || lease.monthlyAmount || null,
+            detectedAt: new Date().toISOString(),
+            source: "lease-email",
+          }]
+        : [],
+      createdAt: new Date().toISOString(),
+    };
+    await redis.lpush(vaultKey, JSON.stringify(newItem));
+    console.log(`[lease] auto-create vault ${id}: ${newItem.description}`);
+    if (lease.isRenewalOffer) {
+      await pushLeaseRenewalSignal(householdId, newItem, lease, ctx);
+    }
+  }
+}
+
+async function pushLeaseRenewalSignal(householdId, item, lease, ctx) {
+  const eta = item.leaseEnd && item.noticeRequired
+    ? (() => {
+        const d = new Date(item.leaseEnd);
+        if (isNaN(d.getTime())) return item.leaseEnd;
+        d.setDate(d.getDate() - Number(item.noticeRequired));
+        return d.toISOString().slice(0, 10);
+      })()
+    : item.leaseEnd || null;
+  const signal = {
+    id: Date.now(),
+    description: "Lease renewal decision needed",
+    type: "deadline",
+    eta,
+    sender: ctx?.from || lease.landlordName || "Landlord",
+    status: null,
+    state: "incoming",
+    source: "gmail",
+    leaseRef: item.id,
+    leaseAddress: item.address || null,
+    lastUpdate: new Date().toLocaleString(),
+    createdAt: Date.now(),
+    autoDetected: true,
+  };
+  await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
+  console.log(`[lease] renewal signal ${signal.id} eta ${eta}`);
+}
+
 // Vault auto-create for new_subscription anomalies. Returns the new
 // vault id when created, or null when an existing matching item was
 // updated (price_change path) or nothing was done.
@@ -1101,6 +1324,28 @@ export async function runImport(userId, customQuery = null) {
           }
         }
 
+        imported++;
+        await new Promise((r) => setTimeout(r, 1000));
+        continue;
+      }
+
+      // Lease branch — runs before the shipping/order classifier so
+      // a "lease renewal" email doesn't get misclassified as a
+      // package. Keyword-gated for cost: we only invoke Haiku when
+      // the subject + body contain lease vocabulary.
+      if (isLeaseEmail(subject, emailText)) {
+        await redis.sadd(importedSetKey, message.id);
+        try {
+          const lease = await extractLeaseInfo(subject, from, emailText);
+          if (lease) {
+            await syncLeaseFromEmail(householdId, lease, { subject, from });
+            console.log(`[lease] handled "${subject.slice(0, 60)}"`);
+          } else {
+            console.log(`[lease] no lease data extracted from "${subject.slice(0, 60)}"`);
+          }
+        } catch (err) {
+          console.warn(`[lease] handler failed: ${err?.message}`);
+        }
         imported++;
         await new Promise((r) => setTimeout(r, 1000));
         continue;

@@ -2141,6 +2141,34 @@ async function handleDeleteAccount(req, res) {
   });
 }
 
+async function handlePriorities(req, res) {
+  const userId = req.method === "GET" ? req.query?.userId : req.body?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+  const key = `household:${householdId}:priorities`;
+  if (req.method === "GET") {
+    const raw = await redis.get(key);
+    return res.status(200).json({ ok: true, priorities: safeJson(raw) || [] });
+  }
+  if (req.method === "POST") {
+    const { priorities } = req.body || {};
+    if (!Array.isArray(priorities)) {
+      return res.status(400).json({ error: "priorities (array) required" });
+    }
+    const sanitized = priorities
+      .map((p) => (typeof p === "string" ? p.trim() : null))
+      .filter(Boolean);
+    await redis.set(key, JSON.stringify({
+      values: sanitized,
+      setAt: new Date().toISOString(),
+    }));
+    return res.status(200).json({ ok: true, household: householdId, priorities: sanitized });
+  }
+  res.setHeader("Allow", "GET, POST");
+  return res.status(405).json({ error: "Method not allowed" });
+}
+
 async function handleExport(req, res) {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
@@ -3315,6 +3343,10 @@ export default async function handler(req, res) {
 
     if (queryType === "export") {
       return handleExport(req, res);
+    }
+
+    if (queryType === "priorities" || bodyType === "priorities") {
+      return handlePriorities(req, res);
     }
 
     if (req.method === "GET") {
