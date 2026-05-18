@@ -165,7 +165,36 @@ export default async function handler(req, res) {
     const results = [];
     let sent = 0;
 
+    // Lazy-load the timezone helper so this file imports cleanly
+    // even if location.js is offline.
+    let getHouseholdLocalHour = null;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      ({ getHouseholdLocalHour } = await import("./location.js"));
+    } catch { /* skip — gate becomes a no-op */ }
+
     for (const [hid, members] of targets) {
+      // Timezone gate — only fire takeoff/clearance/midday if the
+      // current local hour for this household is within the expected
+      // window. Cron fires at fixed UTC times, but a California
+      // household shouldn't receive their 7am brief at 4am Pacific.
+      // The window is ±1 hour around the canonical hour to absorb
+      // cron drift.
+      if (getHouseholdLocalHour && !householdIdInput) {
+        try {
+          const localHour = await getHouseholdLocalHour(hid);
+          const okWindow =
+            type === "takeoff" ? localHour >= 6 && localHour <= 8
+            : type === "midday" ? localHour >= 12 && localHour <= 14
+            : type === "clearance" ? localHour >= 20 && localHour <= 22
+            : true;
+          if (!okWindow) {
+            results.push({ household: hid, skipped: "outside local time window", localHour });
+            continue;
+          }
+        } catch { /* fall through */ }
+      }
+
       const tokensByUser = [];
       for (const userId of members) {
         const token = await redis.get(`user:${userId}:expoPushToken`);

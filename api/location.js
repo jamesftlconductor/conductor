@@ -17,6 +17,58 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+// IANA timezone resolver from coordinates. Lazy-loaded so this module
+// imports cleanly even if the package isn't installed.
+let tzLookupFn = null;
+function getTimezoneFromCoords(lat, lon) {
+  if (typeof lat !== "number" || typeof lon !== "number") return null;
+  if (isNaN(lat) || isNaN(lon)) return null;
+  if (!tzLookupFn) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      tzLookupFn = require("tz-lookup");
+    } catch {
+      return null;
+    }
+  }
+  try { return tzLookupFn(lat, lon); } catch { return null; }
+}
+
+// Public helper — used by brief.js, sync.js, notify.js to derive the
+// "now" timestamp in the household's local time without needing to
+// rewrite location reads everywhere.
+export async function getHouseholdTimezone(householdId) {
+  if (!householdId) return "America/New_York";
+  try {
+    const raw = await redis.get(`household:${householdId}:location`);
+    const loc = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
+    if (loc?.timezone) return loc.timezone;
+    if (loc?.lat != null && loc?.lon != null) {
+      const tz = getTimezoneFromCoords(loc.lat, loc.lon);
+      if (tz) return tz;
+    }
+  } catch { /* skip */ }
+  return "America/New_York";
+}
+
+// Returns the current hour in the household's local time as an
+// integer 0..23. Used by mode-window checks (Takeoff 7am, Clearance
+// 9pm, Overwatch 10pm) so a California household doesn't get pinged
+// at the Eastern equivalent.
+export async function getHouseholdLocalHour(householdId) {
+  const tz = await getHouseholdTimezone(householdId);
+  try {
+    const formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      hour: "numeric",
+      hour12: false,
+    });
+    const hour = parseInt(formatter.format(new Date()), 10);
+    if (Number.isFinite(hour)) return hour;
+  } catch { /* skip */ }
+  return new Date().getHours();
+}
+
 // Fort Lauderdale defaults — used both as the literal fallback for
 // brief.js's weather fetch and as the marketRegion when location data
 // is missing entirely. Kept here so the rest of the code doesn't need
@@ -172,8 +224,14 @@ export async function detectOrLoadLocation(householdId, req) {
   const ip = clientIp(req);
   const geo = await geolocateFromIp(ip);
   if (geo && geo.city && geo.state) {
+    const tzFromCoords =
+      geo.lat != null && geo.lon != null
+        ? getTimezoneFromCoords(geo.lat, geo.lon)
+        : null;
     const located = {
       ...geo,
+      timezone: geo.timezone || tzFromCoords || "America/New_York",
+      timezoneDefaulted: !geo.timezone && !tzFromCoords,
       marketRegion: marketRegionFor(geo.city, geo.state),
       detectedAt: Date.now(),
     };
@@ -196,12 +254,20 @@ export async function detectOrLoadLocation(householdId, req) {
 // is consistent with the user's input.
 export async function saveHouseholdLocation(householdId, { city, state, lat, lon, timezone }) {
   if (!city || !state) throw new Error("city and state required");
+  const latNum = typeof lat === "number" ? lat : (lat ? parseFloat(lat) : null);
+  const lonNum = typeof lon === "number" ? lon : (lon ? parseFloat(lon) : null);
+  const tzFromCoords =
+    latNum != null && lonNum != null
+      ? getTimezoneFromCoords(latNum, lonNum)
+      : null;
+  const resolvedTz = timezone || tzFromCoords || "America/New_York";
   const located = {
     city: String(city).trim(),
     state: String(state).trim().toUpperCase(),
-    lat: typeof lat === "number" ? lat : (lat ? parseFloat(lat) : null),
-    lon: typeof lon === "number" ? lon : (lon ? parseFloat(lon) : null),
-    timezone: timezone || "America/New_York",
+    lat: latNum,
+    lon: lonNum,
+    timezone: resolvedTz,
+    timezoneDefaulted: !timezone && !tzFromCoords,
     marketRegion: marketRegionFor(city, state),
     source: "manual",
     detectedAt: Date.now(),
