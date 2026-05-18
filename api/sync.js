@@ -1,7 +1,109 @@
+import { Client } from "@upstash/qstash";
 import { Redis } from "@upstash/redis";
 import { runImport } from "./import.js";
 import { runCalendarSync } from "./calendar.js";
 import { runOuraSync } from "./oura-sync.js";
+
+const qstash = process.env.QSTASH_TOKEN
+  ? new Client({
+      token: process.env.QSTASH_TOKEN,
+      ...(process.env.QSTASH_URL ? { baseUrl: process.env.QSTASH_URL } : {}),
+    })
+  : null;
+const WORKER_URL = "https://conductor-ivory.vercel.app/api/onboard-worker";
+
+// Partial-onboard self-healing — fires once per day on the sync
+// cron when household:{id}:vault / :crew / :horizon are still
+// empty 24+ hours after the household was created. Each job is
+// dispatched to /api/onboard-worker just like the original onboard
+// fan-out so it inherits the 60s budget, qstash retries, and
+// per-job status accounting.
+//
+// Skips households younger than 24h to avoid racing the first
+// post-signup onboard. Each job runs at most once per sync because
+// the sync cron itself is hourly.
+async function selfHealHousehold(redis, householdId, members) {
+  if (!members || members.length === 0) return;
+  const primaryUser = members[0];
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  // Households without a name key haven't been fully onboarded
+  // either — skip self-heal so we don't kick off jobs against an
+  // incomplete record.
+  const nameRaw = await redis.get(`household:${householdId}:name`);
+  if (!nameRaw) return;
+
+  // Age check — use the earliest member's connectedAt as the
+  // household creation proxy (mirrors the anniversary detector).
+  let earliest = null;
+  for (const uid of members) {
+    try {
+      const raw = await redis.get(`user:${uid}:profile`);
+      const profile = typeof raw === "string" ? JSON.parse(raw) : raw;
+      const ts = profile?.connectedAt;
+      if (typeof ts === "number" && (earliest == null || ts < earliest)) {
+        earliest = ts;
+      }
+    } catch { /* skip */ }
+  }
+  if (earliest == null) return;
+  if (Date.now() - earliest < DAY_MS) return;
+
+  async function dispatch(job) {
+    if (qstash) {
+      try {
+        await qstash.publishJSON({
+          url: WORKER_URL,
+          body: { userId: primaryUser, householdId, job },
+          retries: 1,
+        });
+        console.log(`[self-heal] enqueued ${job} for ${householdId}`);
+        return;
+      } catch (err) {
+        console.warn(`[self-heal] qstash publish failed for ${job}:`, err?.message);
+      }
+    }
+    // Fallback: direct fire-and-forget POST.
+    fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId: primaryUser, householdId, job }),
+    }).catch(() => {});
+    console.log(`[self-heal] direct-dispatched ${job} for ${householdId}`);
+  }
+
+  // Vault — list emptiness check.
+  try {
+    const vaultLen = await redis.llen(`household:${householdId}:vault`);
+    if (!vaultLen || vaultLen === 0) await dispatch("vault");
+  } catch (err) {
+    console.warn(`[self-heal] vault probe failed:`, err?.message);
+  }
+
+  // Crew — JSON-string key; treat null / empty array as missing.
+  try {
+    const crewRaw = await redis.get(`household:${householdId}:crew`);
+    const crew = (() => {
+      if (!crewRaw) return [];
+      try { return Array.isArray(crewRaw) ? crewRaw : JSON.parse(crewRaw); }
+      catch { return []; }
+    })();
+    if (!Array.isArray(crew) || crew.length === 0) await dispatch("crew");
+  } catch (err) {
+    console.warn(`[self-heal] crew probe failed:`, err?.message);
+  }
+
+  // Horizon — only re-trigger if vault has items (horizon depends
+  // on the vault sweep's output). Otherwise queue-ordering risks
+  // running horizon against a still-empty vault.
+  try {
+    const horizonRaw = await redis.get(`household:${householdId}:horizon`);
+    const vaultLen = await redis.llen(`household:${householdId}:vault`);
+    if (!horizonRaw && vaultLen > 0) await dispatch("horizon");
+  } catch (err) {
+    console.warn(`[self-heal] horizon probe failed:`, err?.message);
+  }
+}
 
 // Anticipated-signal generator. Reads household:{id}:patterns; for each
 // pattern whose last signal is overdue by >20% of its interval, drops
@@ -161,6 +263,17 @@ export default async function handler(req, res) {
         await generateAnticipatedSignals(redis, householdId);
       } catch (err) {
         errors.push({ stage: "anticipated", householdId, message: err.message });
+      }
+
+      // Self-healing — partial onboards leave vault/crew/horizon
+      // empty. After the first full day with no manual intervention,
+      // re-trigger the missing jobs so the household catches up
+      // organically. Driven off the same household:{id}:lastSync
+      // age and per-job emptiness checks.
+      try {
+        await selfHealHousehold(redis, householdId, members);
+      } catch (err) {
+        errors.push({ stage: "self-heal", householdId, message: err.message });
       }
 
       try {
