@@ -4068,6 +4068,38 @@ Never manufacture urgency. Never apologize for having nothing to say. The quiet 
       );
     }
 
+    // Brief quality score — surfaced via /api/admin/quality. Pure
+    // post-hoc; never affects the response. Captures signals about
+    // brief generation health: prompt-rule violations, retries, length
+    // sanity, and Pulse presence.
+    try {
+      const wordCount = (brief || "").trim().split(/\s+/).filter(Boolean).length;
+      let score = 100;
+      score -= (lastViolations?.length || 0) * 10;
+      if (!synthesisState?.synthesisNote) score -= 5;
+      if (wordCount < 30) score -= 10;
+      if (wordCount > 200) score -= 10;
+      if (attempts > 1) score -= 5 * (attempts - 1);
+      score = Math.max(0, Math.min(100, score));
+      const qualityRecord = {
+        score,
+        wordCount,
+        attempts,
+        violationCount: lastViolations?.length || 0,
+        hasPulse: !!synthesisState?.synthesisNote,
+        householdId,
+        timestamp: new Date().toISOString(),
+      };
+      await Promise.all([
+        redis.lpush(`household:${householdId}:briefQuality`, JSON.stringify(qualityRecord)),
+        redis.ltrim(`household:${householdId}:briefQuality`, 0, 29),
+        redis.lpush("global:briefQuality", JSON.stringify(qualityRecord)),
+        redis.ltrim("global:briefQuality", 0, 199),
+      ]);
+    } catch (err) {
+      console.warn("[brief] quality scoring failed:", err?.message);
+    }
+
     // Stash the most-recent generated brief at a stable key with a 48h TTL
     // so the Yesterday's Programme modal can always recover it. Naming is
     // product copy ("yesterday") rather than literal — the key holds the
