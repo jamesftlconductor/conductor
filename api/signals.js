@@ -1409,6 +1409,101 @@ async function writeCommonsRecord(householdId, signal) {
   }
 }
 
+async function handleSpend(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const userId = req.query?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+
+  // Pull recent transactions + vault to compose the spend picture.
+  const [rawTx, rawVault] = await Promise.all([
+    redis.lrange(`household:${householdId}:transactions`, 0, 499).catch(() => []),
+    redis.lrange(`household:${householdId}:vault`, 0, -1).catch(() => []),
+  ]);
+  const transactions = (rawTx || []).map((r) => safeJson(r)).filter(Boolean);
+  const vaultItems = (rawVault || []).map((r) => safeJson(r)).filter(Boolean);
+
+  // Active subscriptions: vault items in subscription category that
+  // aren't handled.
+  const subs = vaultItems.filter(
+    (v) =>
+      v &&
+      !v.handled &&
+      (v.category === "subscription" || v.category === "subscriptions")
+  );
+  const parseAmt = (v) => {
+    if (typeof v?.amount === "number") return v.amount;
+    if (typeof v?.amount === "string") {
+      const m = v.amount.match(/[\d.]+/);
+      return m ? parseFloat(m[0]) : 0;
+    }
+    return 0;
+  };
+  const monthlySubscriptionTotal = Math.round(
+    subs.reduce((a, v) => a + parseAmt(v), 0)
+  );
+  const subscriptionCount = subs.length;
+
+  // Price changes: count transactions OR vault items with
+  // priceHistory entries in the last 30 days.
+  const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - THIRTY_DAYS_MS;
+  let priceChangesDetected = 0;
+  for (const v of vaultItems) {
+    const hist = Array.isArray(v?.priceHistory) ? v.priceHistory : [];
+    for (const h of hist) {
+      const ms = h?.detectedAt ? Date.parse(h.detectedAt) : NaN;
+      if (!isNaN(ms) && ms >= cutoff) priceChangesDetected += 1;
+    }
+  }
+
+  // Top categories — group transactions by category, sum.
+  const categoryTotals = new Map();
+  for (const t of transactions) {
+    if (!t) continue;
+    const ms = t.date ? Date.parse(t.date) : t.storedAt || 0;
+    if (!ms || ms < cutoff) continue;
+    const cat = (t.merchant || "uncategorized").toLowerCase();
+    categoryTotals.set(cat, (categoryTotals.get(cat) || 0) + (Number(t.amount) || 0));
+  }
+  const topCategories = Array.from(categoryTotals.entries())
+    .map(([category, total]) => ({ category, total: Math.round(total * 100) / 100 }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 5);
+
+  // Unused subscriptions — vault subs whose provider has not
+  // generated any signal in the last 30 days. (Pragmatic proxy:
+  // signals would show usage indirectly. We don't yet track per-sub
+  // usage signals, so use a stale-vault-lastUpdate fallback.)
+  const unusedSubscriptions = [];
+  for (const s of subs) {
+    const last = s?.lastUpdate ? new Date(s.lastUpdate).getTime() : (s?.createdAt ? Date.parse(s.createdAt) : NaN);
+    if (isNaN(last)) continue;
+    const days = Math.floor((Date.now() - last) / (24 * 60 * 60 * 1000));
+    if (days >= 30) {
+      unusedSubscriptions.push({ merchant: s.provider || s.description, lastSignalDays: days });
+    }
+  }
+
+  // Compared to last month — count of price-changes vs zero is the
+  // only signal we have. Future: total spend last 30d vs prior 30d.
+  const comparedToLastMonth = priceChangesDetected > 0 ? null : 0;
+
+  return res.status(200).json({
+    ok: true,
+    monthlySubscriptionTotal,
+    subscriptionCount,
+    priceChangesDetected,
+    topCategories,
+    unusedSubscriptions,
+    comparedToLastMonth,
+  });
+}
+
 async function handleCommons(req, res) {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
@@ -3621,6 +3716,10 @@ export default async function handler(req, res) {
 
     if (queryType === "commons") {
       return handleCommons(req, res);
+    }
+
+    if (queryType === "spend") {
+      return handleSpend(req, res);
     }
 
     if (req.method === "GET") {
