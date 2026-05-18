@@ -173,6 +173,75 @@ function parseDateLoose(value) {
   return isNaN(ms) ? null : new Date(ms);
 }
 
+// Household profile → single combined HOUSEHOLD block in the prompt.
+// Reads new-schema fields (who/housing/modifiers) with legacy
+// fallback so we don't break briefs for households that completed
+// onboarding before the schema change.
+function buildHouseholdProfileRule(profile) {
+  if (!profile || typeof profile !== "object") return null;
+
+  // Resolve "who" — prefer new, derive from legacy type when missing.
+  let who = profile.who;
+  if (!who && profile.type) {
+    const TYPE_TO_WHO = {
+      single: "solo",
+      couple: "couple",
+      family: "family",
+      multigenerational: "multigenerational",
+      roommates: null,
+      other: null,
+    };
+    who = TYPE_TO_WHO[profile.type] || null;
+  }
+
+  // Resolve "housing" — prefer new, derive from legacy ownOrRent.
+  let housing = profile.housing;
+  if (!housing && profile.ownOrRent) {
+    if (profile.ownOrRent === "rent") housing = "rent";
+    else if (profile.ownOrRent === "own") housing = "own";
+  }
+
+  const modifiers = Array.isArray(profile.modifiers) ? profile.modifiers : [];
+  if (!who && !housing && modifiers.length === 0) return null;
+
+  const WHO_VOICE = {
+    solo: "Personal voice — address the reader as 'you', never 'the household'. Lead with personal health and financial signals when relevant.",
+    couple: "Collaborative voice — coordination across two adults matters. Handoff detection is active. Occasional 'you two' is fine, don't lean on it.",
+    family: "Crew-forward voice — children's schedules matter. Junior-added signals (source: 'junior') get elevated priority and warm framing.",
+    multigenerational: "Gentle tone throughout. Health awareness across multiple generations is more prominent. Medication tracking and appointment signals get elevated priority.",
+  };
+
+  const HOUSING_RULE = {
+    own: "Full home-maintenance phrasing in play. Maintenance plan + complete inventory. Exterior items (roof, lawn, etc.) are fair game.",
+    rent: "Skip home-maintenance offers and exterior items. Lease tracking is prominent — surface lease notice deadlines aggressively. Apartment-scale inventory only.",
+    living_with_family: "Simplified framing. No home maintenance plan, no lease tracking. Focus on personal-scope signals only — schedules, deadlines, health, finance.",
+  };
+
+  const MODIFIER_RULES = {
+    has_pets: "Pet-care signals (vet appointments, prescriptions, food refills) are elevated.",
+    co_parent: "Co-parenting context — keep language neutral about the other parent. Children's schedule is the primary signal type; never reference the co-parent by relationship.",
+    health_needs: "Ongoing health needs in the household. Medication tracking and care appointments are elevated. The Pulse can lean into body-state observations when relevant.",
+    major_change: "Major life change in progress. Tone is supportive throughout. Surface life-transition vault items ahead of older signals when timing demands.",
+    students: "Students in the household. Academic-calendar awareness — semesters, finals, financial-aid deadlines get elevated priority.",
+    work_from_home: "Work-from-home context. Calendar blocking is more important. Midday-window framings are more relevant; commute and time-of-day cues are less so.",
+  };
+
+  const parts = [];
+  const headerBits = [];
+  if (who) headerBits.push(who);
+  if (housing) headerBits.push(housing);
+  if (modifiers.length > 0) headerBits.push(`+ ${modifiers.join(", ")}`);
+  parts.push(`HOUSEHOLD: ${headerBits.join(" / ")}`);
+
+  if (who && WHO_VOICE[who]) parts.push(WHO_VOICE[who]);
+  if (housing && HOUSING_RULE[housing]) parts.push(HOUSING_RULE[housing]);
+  for (const m of modifiers) {
+    if (MODIFIER_RULES[m]) parts.push(MODIFIER_RULES[m]);
+  }
+
+  return `- ${parts.join(" ")}`;
+}
+
 // User-tunable voice preferences → prompt rule fragment. Returns null
 // when no preference is set, so the brief preserves its default voice
 // for households that haven't touched the settings.
@@ -3607,34 +3676,22 @@ ${isSingleMember
       if (rule) composedRules = `${baseRules}\n${rule}`;
     }
 
-    // Household profile voice adjustments. The profile is set during
-    // onboarding (POST /api/signals?type=profile) — single/couple/
-    // family/roommates/multigenerational/other + own/rent. We append
-    // a voice rule so the brief speaks differently to each shape.
+    // Household profile voice adjustments. Profile is set during
+    // onboarding (POST /api/signals?type=profile). New schema:
+    //   { who, housing, modifiers[] }
+    // Legacy schema (older households):
+    //   { type, ownOrRent }
+    // We prefer the new fields and fall back to legacy so existing
+    // briefs don't lose their voice on the day this ships.
     try {
       const rawProfile = await redis.get(`household:${householdId}:profile`);
       const profile = rawProfile
         ? (typeof rawProfile === "string" ? JSON.parse(rawProfile) : rawProfile)
         : null;
-      if (profile?.type) {
-        const PROFILE_VOICE = {
-          single: "- HOUSEHOLD PROFILE: SINGLE. Use 'you' not 'the household'. More personal tone — this person is the household. 'Your week' not 'the household's week'. Lead with personal health and financial signals when both are present.",
-          couple: "- HOUSEHOLD PROFILE: COUPLE. Collaborative language is natural. Handoff detection is active. Occasional 'you two' is fine but don't lean on it.",
-          family: "- HOUSEHOLD PROFILE: FAMILY WITH CHILDREN. Crew-forward voice — kids' schedules matter. Junior-added signals (source: 'junior') get elevated priority and warm framing.",
-          roommates: "- HOUSEHOLD PROFILE: ROOMMATES. Lighter assumptions about shared life. Financial signals (shared expenses, utilities) get elevated priority. Skip family-coded framings like 'the household's week together'.",
-          multigenerational: "- HOUSEHOLD PROFILE: MULTIGENERATIONAL. Health awareness for all ages is more prominent. Medication tracking and appointment signals get elevated priority. Voice is gentle throughout.",
-          other: "",
-        };
-        const profileRule = PROFILE_VOICE[profile.type] || "";
-        const ownRentRule =
-          profile.ownOrRent === "rent"
-            ? "- OWN VS RENT: RENTING. Skip any home-maintenance phrasing. Lease tracking is prominent — surface lease notice deadlines aggressively. Apartment-scale inventory only — never reference roof/exterior/landscape items."
-            : profile.ownOrRent === "own"
-            ? "- OWN VS RENT: OWNS HOME. Full maintenance plan + inventory + exterior items in play."
-            : "";
-        const combined = [profileRule, ownRentRule].filter(Boolean).join("\n");
-        if (combined) {
-          composedRules = `${composedRules}\n${combined}`;
+      if (profile) {
+        const block = buildHouseholdProfileRule(profile);
+        if (block) {
+          composedRules = `${composedRules}\n${block}`;
         }
       }
     } catch (err) {

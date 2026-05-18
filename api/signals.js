@@ -1796,6 +1796,12 @@ async function handleChoreComplete(req, res) {
 
 // ---------- Household Profile ----------
 
+// Legacy schema (kept for back-compat in storage + reads): type +
+// ownOrRent. New schema: who + housing + modifiers. handleProfile
+// accepts EITHER shape on POST and shallow-merges, so a client
+// posting only the new fields preserves any prior legacy fields and
+// vice versa. brief.js reads the new fields preferentially with a
+// fallback to legacy.
 const VALID_PROFILE_TYPES = new Set([
   "single",
   "couple",
@@ -1803,6 +1809,17 @@ const VALID_PROFILE_TYPES = new Set([
   "roommates",
   "multigenerational",
   "other",
+]);
+
+const VALID_WHO = new Set(["solo", "couple", "family", "multigenerational"]);
+const VALID_HOUSING = new Set(["own", "rent", "living_with_family"]);
+const VALID_MODIFIERS = new Set([
+  "has_pets",
+  "co_parent",
+  "health_needs",
+  "major_change",
+  "students",
+  "work_from_home",
 ]);
 
 async function handleProfile(req, res) {
@@ -1818,9 +1835,26 @@ async function handleProfile(req, res) {
     return res.status(200).json({ ok: true, household: householdId, profile });
   }
   if (req.method === "POST") {
-    const { type, ownOrRent, childrenCount, petsCount } = req.body || {};
+    const {
+      type, ownOrRent, childrenCount, petsCount,
+      who, housing, modifiers,
+    } = req.body || {};
     if (type && !VALID_PROFILE_TYPES.has(type)) {
       return res.status(400).json({ error: "invalid type" });
+    }
+    if (who && !VALID_WHO.has(who)) {
+      return res.status(400).json({ error: "invalid who" });
+    }
+    if (housing && !VALID_HOUSING.has(housing)) {
+      return res.status(400).json({ error: "invalid housing" });
+    }
+    let modArr = undefined;
+    if (modifiers !== undefined) {
+      if (!Array.isArray(modifiers)) {
+        return res.status(400).json({ error: "modifiers must be an array" });
+      }
+      modArr = modifiers
+        .filter((m) => typeof m === "string" && VALID_MODIFIERS.has(m));
     }
     const existing = safeJson(await redis.get(key)) || {};
     const next = {
@@ -1829,6 +1863,9 @@ async function handleProfile(req, res) {
       ...(ownOrRent && { ownOrRent }),
       ...(childrenCount != null && { childrenCount: Number(childrenCount) }),
       ...(petsCount != null && { petsCount: Number(petsCount) }),
+      ...(who && { who }),
+      ...(housing && { housing }),
+      ...(modArr !== undefined && { modifiers: modArr }),
       setAt: new Date().toISOString(),
     };
     await redis.set(key, JSON.stringify(next));
