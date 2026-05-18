@@ -529,6 +529,39 @@ export default async function handler(req, res) {
   }
   const trimmedQuestion = question.trim();
 
+  // Rate limiting — per-user daily count. Default cap 50; founding
+  // households 200. Resets at UTC midnight via 24h TTL. Counted
+  // BEFORE any Claude calls so cache-only hits still tick (intentional
+  // — counts user intent, not server cost).
+  try {
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const askKey = `user:${userId}:askCount:${todayKey}`;
+    const count = await redis.incr(askKey);
+    if (count === 1) {
+      await redis.expire(askKey, 86400);
+    }
+    // Resolve founding status via the user's household.
+    let limit = 50;
+    try {
+      const householdId = await redis.get(`user:${userId}:household`);
+      if (householdId) {
+        const founding = await redis.get(`household:${householdId}:foundingHousehold`);
+        if (founding === "1" || founding === 1 || founding === true) limit = 200;
+      }
+    } catch { /* skip */ }
+    if (count > limit) {
+      return res.status(200).json({
+        answer: "You've reached today's Ask Conductor limit. It resets tomorrow morning.",
+        confidence: "high",
+        limitReached: true,
+        cached: false,
+      });
+    }
+  } catch (err) {
+    console.warn("[ask] rate-limit check failed:", err?.message);
+    // Fail-open: if Redis is down, let the user through.
+  }
+
   // Cache: SHA256 over (userId|question). 30min TTL means rapid repeated
   // taps share one Sonnet call; questions worded identically against the
   // same user share a cache key.
