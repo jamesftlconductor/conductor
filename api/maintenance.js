@@ -53,9 +53,9 @@ async function evaluateOfferReady(householdId) {
   const plan = safeJson(planRaw);
   const offerDismissed = dismissed === true || dismissed === "true";
 
-  // Need at least 2 of: roof, hvac, waterHeater, vehicles. A slot
-  // counts as "filled" when it has any of its substantive fields
-  // populated (an empty object literal doesn't count).
+  // ANY inventory data is enough. A partial plan with only an HVAC
+  // entry is more useful than no plan — the generator skips empty
+  // sections and notes which data would round out coverage.
   const inv = safeJson(invRaw) || {};
   function filled(obj, fields) {
     if (!obj || typeof obj !== "object") return false;
@@ -65,8 +65,11 @@ async function evaluateOfferReady(householdId) {
   if (filled(inv.roof, ["material", "yearInstalled", "lastInspected"])) count++;
   if (filled(inv.hvac, ["brand", "yearInstalled", "lastServiced", "filterSize"])) count++;
   if (filled(inv.waterHeater, ["yearInstalled", "type"])) count++;
+  if (filled(inv.electrical, ["panelAmps", "yearUpdated"])) count++;
   if (Array.isArray(inv.vehicles) && inv.vehicles.length > 0) count++;
-  const hasInventory = count >= 2;
+  if (Array.isArray(inv.appliances) && inv.appliances.length > 0) count++;
+  if (inv.homeBuiltYear != null && inv.homeBuiltYear !== "") count++;
+  const hasInventory = count >= 1;
 
   // Existing plan blocks new offer unless it's older than 365 days.
   let planTooOld = true;
@@ -157,7 +160,9 @@ Recent service history (last 90d): ${JSON.stringify(recentService)}
 MARKET RATES (use these for cost estimates):
 ${ratesBlock}
 
-Cover the next 12 calendar months starting this month. Keep each month to 2-4 items max — only the genuinely-due tasks plus key seasonal items. Quiet months can have 0-2 items. Use the rates above for costLow/costHigh estimates — don't invent prices outside that range. If a known provider exists for a service type, populate knownProvider + providerPhone; otherwise null. diyPossible only when the task is realistically homeowner-feasible (filter change, drain check) — not roof replacement or AC service.
+Cover the next 12 calendar months starting this month. Keep each month to 2-4 items max — only the genuinely-due tasks plus key seasonal items. Quiet months can have 0-2 items.
+
+Partial-data handling: skip categories where no inventory data is available rather than inventing items. For example, if no roof information is present, leave roof out of the plan entirely. Use the householdNotes array to call out which missing data would round out coverage (e.g., "No roof history provided — adding install year would let Conductor schedule inspections appropriately"). The plan stays useful with whatever inventory exists. Use the rates above for costLow/costHigh estimates — don't invent prices outside that range. If a known provider exists for a service type, populate knownProvider + providerPhone; otherwise null. diyPossible only when the task is realistically homeowner-feasible (filter change, drain check) — not roof replacement or AC service.
 
 ${marketRegion === "south_florida" ? `Fort Lauderdale specifics:
 - Hurricane prep season May-June: roof inspection, tree trimming, generator service
