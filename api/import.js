@@ -590,9 +590,11 @@ async function extractTransaction(subject, from, emailText) {
   "date": "YYYY-MM-DD",
   "cardLast4": "string | null",
   "isRecurring": boolean,
-  "priceChangeDetected": boolean
+  "priceChangeDetected": boolean,
+  "currency": "USD" | "EUR" | "GBP" | "CAD" | "MXN" | "other",
+  "isInternational": boolean
 }
-Return the literal word null (no JSON) if the email is purely promotional or contains no real transaction.
+Default currency is USD if not specified. isInternational is true when currency is anything other than USD. Return the literal word null (no JSON) if the email is purely promotional or contains no real transaction.
 
 Subject: ${subject}
 From: ${from}
@@ -646,11 +648,25 @@ function detectAnomalies(tx, history) {
   const cutoff = Date.now() - NINETY_DAYS_MS;
   const merchantLower = (tx.merchant || "").toLowerCase().trim();
 
+  // Only compare against same-currency history. A €120 charge should
+  // never anomaly-flag against $120 USD priors. International charges
+  // also skip price-change detection entirely — too noisy without
+  // exchange-rate normalization.
+  const txCurrency = (tx.currency || "USD").toUpperCase();
   const merchantHistory = (history || []).filter((h) => {
     if (!h || (h.merchant || "").toLowerCase().trim() !== merchantLower) return false;
+    const hCurrency = (h.currency || "USD").toUpperCase();
+    if (hCurrency !== txCurrency) return false;
     const ms = h.date ? Date.parse(h.date) : NaN;
     return !isNaN(ms) && ms >= cutoff;
   });
+
+  // Skip the entire price-change / unusual-charge path for
+  // international charges — store the transaction but emit no
+  // anomalies. The signal builder below tags it with currency.
+  if (tx.isInternational || txCurrency !== "USD") {
+    return anomalies;
+  }
 
   // price_change: model already flagged it OR prior amount differs.
   if (tx.priceChangeDetected) {

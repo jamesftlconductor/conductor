@@ -84,6 +84,44 @@ export default async function handler(req, res) {
       return res.status(200).json({ householdId, reveal });
     }
 
+    // Preview a household the user is about to join via invite code.
+    // Used by the abbreviated onboarding flow so the joining user
+    // sees what they're connecting to before tapping Join.
+    if (action === "householdPreview") {
+      const previewHid = req.query?.householdId || householdId;
+      if (!previewHid) return res.status(400).json({ error: "householdId required" });
+      const safeLen = async (k) => {
+        try { return (await redis.llen(k)) || 0; } catch { return 0; }
+      };
+      const safeArrLen = async (k) => {
+        try {
+          const raw = await redis.get(k);
+          const arr = safeJson(raw);
+          return Array.isArray(arr) ? arr.length : 0;
+        } catch { return 0; }
+      };
+      const safeMemberCount = async (hid) => {
+        try { return (await redis.scard(`household:${hid}:members`)) || 1; } catch { return 1; }
+      };
+      const [signalCount, vaultCount, crewCount, members, profileRaw] = await Promise.all([
+        safeLen(`household:${previewHid}:signals`),
+        safeArrLen(`household:${previewHid}:vault`).then((n) => n || safeLen(`household:${previewHid}:vault`)),
+        safeArrLen(`household:${previewHid}:crew`),
+        safeMemberCount(previewHid),
+        redis.get(`household:${previewHid}:profile`).catch(() => null),
+      ]);
+      const profile = safeJson(profileRaw);
+      return res.status(200).json({
+        ok: true,
+        householdId: previewHid,
+        householdName: profile?.householdName || null,
+        memberCount: members,
+        signalCount,
+        vaultCount,
+        crewCount,
+      });
+    }
+
     const status = await readStatus(householdId);
     return res.status(200).json({ householdId, status });
   }
