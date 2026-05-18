@@ -54,6 +54,9 @@ async function fetchWeather(location) {
       `https://api.open-meteo.com/v1/forecast` +
       `?latitude=${lat}&longitude=${lon}` +
       `&current=temperature_2m,relative_humidity_2m,precipitation,weathercode` +
+      `&hourly=temperature_2m,precipitation_probability,uv_index,weathercode` +
+      `&daily=sunrise,sunset,uv_index_max` +
+      `&forecast_days=1` +
       `&temperature_unit=fahrenheit` +
       `&timezone=${encodeURIComponent(timezone)}`;
     const res = await fetch(url, { signal: controller.signal });
@@ -68,12 +71,94 @@ async function fetchWeather(location) {
       : null;
     const isRaining = (current.precipitation ?? 0) > 0;
     const weatherCode = current.weathercode ?? 0;
+
+    // Derive today's timeline from the hourly + daily arrays. All
+    // entries are timezone-correct for the household's location.
+    const hourly = data?.hourly || {};
+    const daily = data?.daily || {};
+    const times = Array.isArray(hourly.time) ? hourly.time : [];
+    const temps = Array.isArray(hourly.temperature_2m) ? hourly.temperature_2m : [];
+    const rainProbs = Array.isArray(hourly.precipitation_probability) ? hourly.precipitation_probability : [];
+    const uvHourly = Array.isArray(hourly.uv_index) ? hourly.uv_index : [];
+
+    function fmtHourFromIso(iso) {
+      if (!iso) return null;
+      // hourly.time entries are "YYYY-MM-DDTHH:00" in local zone.
+      const m = String(iso).match(/T(\d{2}):/);
+      if (!m) return null;
+      const h = parseInt(m[1], 10);
+      const ampm = h >= 12 ? "pm" : "am";
+      const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+      return `${h12}${ampm}`;
+    }
+    function fmtTimeFromIso(iso) {
+      // Daily sunrise/sunset arrive as "YYYY-MM-DDTHH:MM" local.
+      if (!iso) return null;
+      const m = String(iso).match(/T(\d{2}):(\d{2})/);
+      if (!m) return null;
+      const h = parseInt(m[1], 10);
+      const min = parseInt(m[2], 10);
+      const ampm = h >= 12 ? "pm" : "am";
+      const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+      return `${h12}:${String(min).padStart(2, "0")}${ampm}`;
+    }
+
+    // Rain window — contiguous hours with > 60% probability, capped
+    // at the first window found.
+    let rainWindow = null;
+    if (rainProbs.length > 0) {
+      let start = -1;
+      let end = -1;
+      for (let i = 0; i < rainProbs.length; i++) {
+        if ((rainProbs[i] || 0) > 60) {
+          if (start === -1) start = i;
+          end = i;
+        } else if (start !== -1) {
+          break;
+        }
+      }
+      if (start !== -1 && end !== -1) {
+        const startLabel = fmtHourFromIso(times[start]);
+        const endLabel = fmtHourFromIso(times[end + 1] || times[end]);
+        if (startLabel && endLabel) rainWindow = `${startLabel}–${endLabel}`;
+      }
+    }
+
+    // Temperature peak — max of hourly.temperature_2m.
+    let temperaturePeak = null;
+    if (temps.length > 0) {
+      let maxI = 0;
+      for (let i = 1; i < temps.length; i++) if (temps[i] > temps[maxI]) maxI = i;
+      const t2 = Math.round(temps[maxI]);
+      const at = fmtHourFromIso(times[maxI]);
+      if (at) temperaturePeak = { tempF: t2, time: at };
+    }
+
+    // UV peak — max of hourly.uv_index. uv_index_max in daily is a
+    // single number; we prefer the hourly index so the time is known.
+    let uvPeak = null;
+    if (uvHourly.length > 0) {
+      let maxI = 0;
+      for (let i = 1; i < uvHourly.length; i++) if (uvHourly[i] > uvHourly[maxI]) maxI = i;
+      const v = Math.round(uvHourly[maxI]);
+      const at = fmtHourFromIso(times[maxI]);
+      if (at) uvPeak = { value: v, time: at };
+    }
+
+    const sunrise = Array.isArray(daily.sunrise) && daily.sunrise[0] ? fmtTimeFromIso(daily.sunrise[0]) : null;
+    const sunset = Array.isArray(daily.sunset) && daily.sunset[0] ? fmtTimeFromIso(daily.sunset[0]) : null;
+
     return {
       tempF,
       humidity,
       isRaining,
       weatherCode,
       summary: classifyWeather(weatherCode, tempF),
+      rainWindow,
+      temperaturePeak,
+      uvPeak,
+      sunrise,
+      sunset,
     };
   } catch (err) {
     console.error("Weather fetch failed:", err?.message || err);
@@ -1369,6 +1454,10 @@ function synthesizeHouseholdState({
     hrvBaseline,
     tempF,
     humidity,
+    // UV peak — surfaced into the Pulse prompt when it's extreme
+    // (above 10) so the model can mention midday-sun risk.
+    uvPeakValue: weather?.uvPeak?.value ?? null,
+    uvPeakTime: weather?.uvPeak?.time ?? null,
     synthesisFlags: flags,
     synthesisNote: null,           // populated by generatePulseNote after this returns
     pulseWord,
@@ -1835,6 +1924,7 @@ async function generatePulseNote(state) {
 ${anniversaryLine ? anniversaryLine + "\n\n" : ""}Flags active: ${flagsLine}
 Health: ${healthLine}
 Weather: ${weatherLine}
+${state.uvPeakValue != null ? `UV peak today: ${state.uvPeakValue} at ${state.uvPeakTime || "midday"}` : ""}
 Signal load: ${state.signalLoad}, ${state.urgentCount} urgent
 Location: ${locationLabel}
 ${ouraLine ? `\n${ouraLine}\n\nOura observations (use when readiness is notable, but follow the numeral-ban rule below — translate the tier, never echo the score):\n- Readiness low (under 50): 'Oura says recovery is low today', 'the ring says rest if you can'\n- Readiness moderate (50-69): 'recovery is moderate', 'solid but not peak'\n- Readiness high (85+): 'Oura says you're well recovered', 'the ring likes today'\n- Temperature elevated: 'body temperature is slightly up — worth watching'` : ""}
@@ -1845,6 +1935,7 @@ If no synthesis flags are active and conditions are normal: write one quiet obse
 If green_light: acknowledge it warmly — this is a good day.
 If dehydration_risk: lead with practical action, not alarm.
 If high_stress_load: acknowledge the weight without adding to it.
+If UV index peak today is above 10 (extreme): mention it briefly as "extreme UV today" or "midday sun is genuinely not worth it" — specific to the household's location context. Otherwise omit UV entirely.
 
 NEVER quote specific numbers, percentages, or units directly. The structured values above (humidity %, temperature °F, HRV, steps, sleep hours, calories) are inputs for YOUR observation — translate them into human language, never echo them back:
 - "77% humidity" → "heavy humidity" or "the air is thick today" or "the humidity has opinions"
@@ -3701,6 +3792,14 @@ ${isSingleMember
         heatIndex: synthesisState.heatIndex,
         humidity: weather.humidity ?? null,
         conditions: conditionsLabel(weather),
+        // Today's timeline — populated from the new Open-Meteo
+        // hourly/daily fetch. All four may be null if the location
+        // is at extreme latitude (no sunset in summer / no rain).
+        rainWindow: weather.rainWindow ?? null,
+        uvPeak: weather.uvPeak ?? null,
+        temperaturePeak: weather.temperaturePeak ?? null,
+        sunrise: weather.sunrise ?? null,
+        sunset: weather.sunset ?? null,
       } : null,
       signalLoad: synthesisState.signalLoad,
       urgentCount: synthesisState.urgentCount,
