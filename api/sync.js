@@ -3,6 +3,7 @@ import { Redis } from "@upstash/redis";
 import { runImport } from "./import.js";
 import { runCalendarSync } from "./calendar.js";
 import { runOuraSync } from "./oura-sync.js";
+import { refreshLocalEventsCache } from "./events.js";
 
 const qstash = process.env.QSTASH_TOKEN
   ? new Client({
@@ -255,6 +256,22 @@ export default async function handler(req, res) {
         await generateAnticipatedSignals(redis, householdId);
       } catch (err) {
         errors.push({ stage: "anticipated", householdId, message: err.message });
+      }
+      // Eventbrite local-events cache refresh. Credential-gated; no-ops
+      // when EVENTBRITE_API_KEY isn't set. Only attempts when the
+      // household has a known centroid (location.lat/lon) — otherwise
+      // there's nothing to anchor the radius search to.
+      try {
+        const rawLoc = await redis.get(`household:${householdId}:location`);
+        const loc = (() => {
+          if (!rawLoc) return null;
+          try { return typeof rawLoc === "string" ? JSON.parse(rawLoc) : rawLoc; } catch { return null; }
+        })();
+        if (loc && typeof loc.lat === "number" && typeof loc.lon === "number") {
+          await refreshLocalEventsCache(redis, householdId, loc.lat, loc.lon);
+        }
+      } catch (err) {
+        errors.push({ stage: "eventbrite", householdId, message: err.message });
       }
       try {
         await selfHealHousehold(redis, householdId, members);

@@ -6,6 +6,7 @@ import {
   trackPackage,
 } from "./carrier.js";
 import { writeCommonsRecord, logAutoResolvedMemory } from "./commons.js";
+import { extractSignalLocation } from "./places.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -1670,6 +1671,30 @@ ${emailText.substring(0, 1000)}`,
         await detectAndStampThread(householdId, signal);
       } catch (err) {
         console.error("[thread] detection error:", err?.message || err);
+      }
+
+      // Location extraction — service / appointment / reservation
+      // signals get a Google Places lookup so the brief and Hover
+      // can surface address/lat/lng and (downstream) compute travel
+      // time vs. household location. Best-effort + credential-gated;
+      // returns null when GOOGLE_PLACES_KEY isn't set or no match.
+      if (
+        !signal.location &&
+        (signal.type === "service" ||
+          signal.type === "appointment" ||
+          signal.type === "reservation")
+      ) {
+        try {
+          const place = await extractSignalLocation(signal.description, signal.sender);
+          if (place) {
+            signal.location = place;
+            console.log(
+              `[places] resolved location for ${signal.sender || "unknown"}: ${place.name}`
+            );
+          }
+        } catch (err) {
+          console.warn("[places] location lookup error:", err?.message || err);
+        }
       }
 
       // Tracking extraction — package-typed signals get scanned for

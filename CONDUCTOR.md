@@ -841,6 +841,14 @@ Per signal tap: 0 calls on cache hit, 1 Haiku call on miss (12h TTL).
 | `QSTASH_TOKEN` | `onboard.js` (4-message fan-out) |
 | `QSTASH_CURRENT_SIGNING_KEY` | `onboard-worker.js` |
 | `QSTASH_NEXT_SIGNING_KEY` | `onboard-worker.js` |
+| `ADMIN_SECRET` | `admin.js` (quality dashboard) — endpoint returns 401 when unset |
+| `GOOGLE_PLACES_KEY` | `places.js` — extractSignalLocation (Places Text Search) |
+| `GOOGLE_MAPS_KEY` | `places.js` — getTravelTime (Distance Matrix). Falls back to `GOOGLE_PLACES_KEY` if the Maps API is enabled on the same key |
+| `EVENTBRITE_API_KEY` | `events.js` — fetchLocalEvents (private OAuth token from eventbrite.com/account/api-keys) |
+
+Each integration is credential-gated and degrades silently to a no-op
+when the relevant key isn't set. Add a key + redeploy → the feature
+activates automatically.
 
 Mobile: `app.json` carries `expo.extra.eas.projectId` and the OTA
 `updates.url`. No other secrets.
@@ -874,10 +882,39 @@ Mobile: `app.json` carries `expo.extra.eas.projectId` and the OTA
 > must wait for a fresh deploy or they'll hit the old build.
 >
 > Root cause is the Vercel ↔ GitHub App integration on this project —
-> not a code-level fix. To repair: open the project at
-> `vercel.com/jamestotalhome-5918s-projects/conductor`, Settings → Git
-> → disconnect, then reconnect to `JamesFTL/conductor` and re-grant
-> repo access in the GitHub Apps page.
+> not a code-level fix. To repair (dashboard-only, can't be done via
+> the CLI):
+>
+> 1. Open `vercel.com/jamestotalhome-5918s-projects/conductor`
+> 2. Settings → Git → "Disconnect from Git"
+> 3. "Connect Git Repository" → choose `JamesFTL/conductor`
+> 4. Verify the "Production Branch" field is set to `master`
+> 5. Push a trivial commit to master and watch the Deployments tab —
+>    a new entry should appear within ~30s, attributed to `github` /
+>    `vercel[bot]` rather than your CLI user
+> 6. If still no deploy fires: go to `github.com/settings/installations`,
+>    find the Vercel app, click Configure, re-grant repo access to
+>    `JamesFTL/conductor`
+
+### Admin quality dashboard (`api/admin.js`)
+
+The quality dashboard is secret-gated. To activate:
+
+```
+vercel env add ADMIN_SECRET production
+# paste a strong random string (e.g. `openssl rand -hex 32`)
+vercel --prod --yes
+```
+
+Then query:
+
+```
+curl 'https://conductor-ivory.vercel.app/api/admin?action=quality&secret=YOUR_SECRET'
+```
+
+Returns `{ last24hAvg, byHousehold (sorted worst-first), recentLowScores }`.
+Defaults to 401 when ADMIN_SECRET isn't set so the endpoint is safe to
+leave deployed without credentials.
 
 ### Mobile (from `C:\Users\james\conductor-mobile`)
 

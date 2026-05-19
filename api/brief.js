@@ -2697,6 +2697,7 @@ export default async function handler(req, res) {
       networkContext,
       rawActiveTransition,
       rawMemoryEntries,
+      rawLocalEvents,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       // Multi-driver: merges per-user calendar slices, falls back to
@@ -2749,7 +2750,20 @@ export default async function handler(req, res) {
       // can carry voice cues calibrated to how this household
       // actually behaves over time.
       redis.lrange(`household:${householdId}:memory`, 0, -1).catch(() => []),
+      // Eventbrite live local-events cache — refreshed weekly by
+      // sync.js when EVENTBRITE_API_KEY is set. Empty array when the
+      // key is missing or the cache hasn't been populated yet.
+      redis.get(`household:${householdId}:localEvents`).catch(() => null),
     ]);
+    const localEvents = (() => {
+      if (!rawLocalEvents) return [];
+      try {
+        const parsed = typeof rawLocalEvents === "string"
+          ? JSON.parse(rawLocalEvents)
+          : rawLocalEvents;
+        return Array.isArray(parsed) ? parsed : [];
+      } catch { return []; }
+    })();
     let isSingleMember = (rawMembers || []).length <= 1;
 
     // Parse the active-transition record. Divorce flips the household
@@ -3800,18 +3814,46 @@ ${isSingleMember
           householdLocation?.marketRegion || "south_florida",
           new Date().toISOString()
         );
-        if (annual.length === 0) return "No major local events this week.";
-        return annual
+        // localEvents is the Eventbrite-cached live feed (refreshed
+        // hourly by sync.js when EVENTBRITE_API_KEY is set). Falls
+        // back to [] when the cache key is missing — annual events
+        // alone still surface.
+        const liveEvents = Array.isArray(localEvents) ? localEvents : [];
+        const liveLines = liveEvents
+          .filter((e) => e && e.date)
+          .slice(0, 5)
           .map((e) => {
+            const ms = Date.parse(e.date);
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const daysUntil = !isNaN(ms)
+              ? Math.floor((ms - today.getTime()) / 86400000)
+              : null;
             const whenLabel =
-              e.daysUntil === 0
-                ? "today"
-                : e.daysUntil < 0
-                  ? "happening now"
-                  : `in ${e.daysUntil} days`;
-            return `- [tier ${e.tier}] ${e.name} — ${whenLabel}: ${e.note}`;
-          })
-          .join("\n");
+              daysUntil == null
+                ? e.date
+                : daysUntil === 0
+                  ? "today"
+                  : daysUntil < 0
+                    ? "happening now"
+                    : `in ${daysUntil} days`;
+            const cap = e.capacity ? ` (cap ${e.capacity})` : "";
+            const prox = e.proximityKm != null ? ` (~${e.proximityKm}km away)` : "";
+            return `- [live] ${e.name} — ${whenLabel}${cap}${prox}`;
+          });
+        const annualLines = annual.map((e) => {
+          const whenLabel =
+            e.daysUntil === 0
+              ? "today"
+              : e.daysUntil < 0
+                ? "happening now"
+                : `in ${e.daysUntil} days`;
+          return `- [tier ${e.tier}] ${e.name} — ${whenLabel}: ${e.note}`;
+        });
+        const lines = [...liveLines, ...annualLines];
+        return lines.length > 0
+          ? lines.join("\n")
+          : "No major local events this week.";
       })(),
       ``,
       `CHILDCARE (mention if affects today or tomorrow):`,
