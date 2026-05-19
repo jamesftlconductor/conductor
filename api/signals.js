@@ -929,6 +929,141 @@ async function handleCalendarRead(req, res) {
   return res.status(200).json({ household: householdId, events });
 }
 
+// Monthly view: rolls signals (by eta), vault renewals (by renewalDate),
+// and crew birthdays/anniversaries into per-day buckets for a single
+// calendar month. Returns { month, days: { 'YYYY-MM-DD': { signals,
+// vault, crewEvents } } } — empty days are omitted, the client fills
+// the rest of the grid as quiet days. month input is 'YYYY-MM'; the
+// handler treats day boundaries in UTC (signals have no timezone
+// metadata, so we can't be cleverer without dragging tz-lookup into
+// every signal record). The client renders day numbers in local time —
+// off-by-one issues across timezones are accepted v1 trade-off.
+async function handleCalendarMonth(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for calendar-month" });
+  }
+  const monthParam = String(req.query?.month || "").trim();
+  const m = monthParam.match(/^(\d{4})-(\d{2})$/);
+  if (!m) {
+    return res.status(400).json({ error: "month must be YYYY-MM" });
+  }
+  const year = parseInt(m[1], 10);
+  const monthIdx = parseInt(m[2], 10) - 1;
+  if (monthIdx < 0 || monthIdx > 11) {
+    return res.status(400).json({ error: "invalid month" });
+  }
+  const monthStart = Date.UTC(year, monthIdx, 1);
+  const monthEnd = Date.UTC(year, monthIdx + 1, 1); // exclusive
+
+  const householdId = await resolveHouseholdId(req.query.userId);
+  const [{ signals }, rawVault, rawCrew] = await Promise.all([
+    loadSignals(householdId),
+    redis.lrange(`household:${householdId}:vault`, 0, -1).catch(() => []),
+    redis.get(`household:${householdId}:crew`).catch(() => null),
+  ]);
+
+  const days = {};
+  function bucket(ymd) {
+    if (!days[ymd]) days[ymd] = { signals: [], vault: [], crewEvents: [] };
+    return days[ymd];
+  }
+  function ymdOf(ms) {
+    const d = new Date(ms);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(d.getUTCDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  for (const s of signals || []) {
+    if (!s || !s.eta) continue;
+    const ms = Date.parse(s.eta);
+    if (isNaN(ms) || ms < monthStart || ms >= monthEnd) continue;
+    bucket(ymdOf(ms)).signals.push({
+      id: s.id,
+      description: s.description || "",
+      type: s.type || "unknown",
+      eta: s.eta,
+      state: s.state || null,
+      status: s.status || null,
+      crewMemberId: s.crewMemberId || null,
+      sender: s.sender || null,
+    });
+  }
+
+  for (const r of rawVault || []) {
+    const v = typeof r === "string" ? safeJson(r) : r;
+    if (!v || v.handled) continue;
+    const dateStr = v.renewalDate || v.eta;
+    if (!dateStr) continue;
+    const ms = Date.parse(dateStr);
+    if (isNaN(ms) || ms < monthStart || ms >= monthEnd) continue;
+    bucket(ymdOf(ms)).vault.push({
+      id: v.id,
+      description: v.description || "",
+      category: v.category || null,
+      renewalDate: dateStr,
+      amount: v.amount ?? null,
+    });
+  }
+
+  const crew = Array.isArray(safeJson(rawCrew)) ? safeJson(rawCrew) : [];
+  for (const member of crew || []) {
+    if (!member || typeof member !== "object") continue;
+    const name = member.name || "Crew member";
+    // birthday / anniversary as MM-DD — surface them on the matching
+    // day of the requested month + year. mmddCheck handles 'MM-DD'
+    // and 'MM-DD-YYYY' tolerantly (matches normalizeMMDD on brief.js).
+    function mmddDayOfMonth(mmdd) {
+      if (!mmdd) return null;
+      const a = mmdd.match(/^(\d{1,2})-(\d{1,2})/);
+      if (!a) return null;
+      const mo = parseInt(a[1], 10);
+      const da = parseInt(a[2], 10);
+      if (mo - 1 !== monthIdx) return null;
+      return da;
+    }
+    const bday = mmddDayOfMonth(member.birthday);
+    if (bday) {
+      const ms = Date.UTC(year, monthIdx, bday);
+      bucket(ymdOf(ms)).crewEvents.push({
+        kind: "birthday",
+        memberName: name,
+        memberType: member.memberType || null,
+      });
+    }
+    const anniv = mmddDayOfMonth(member.anniversary);
+    if (anniv) {
+      const ms = Date.UTC(year, monthIdx, anniv);
+      bucket(ymdOf(ms)).crewEvents.push({
+        kind: "anniversary",
+        memberName: name,
+        memberType: member.memberType || null,
+      });
+    }
+    // upcomingEvents (free-form crew calendar entries) — dated by ISO
+    // string so we can filter to the requested month directly.
+    for (const ev of member.upcomingEvents || []) {
+      if (!ev?.date) continue;
+      const ms = Date.parse(ev.date);
+      if (isNaN(ms) || ms < monthStart || ms >= monthEnd) continue;
+      bucket(ymdOf(ms)).crewEvents.push({
+        kind: "event",
+        memberName: name,
+        description: ev.description || "",
+        date: ev.date,
+      });
+    }
+  }
+
+  return res.status(200).json({
+    household: householdId,
+    month: monthParam,
+    days,
+  });
+}
+
 async function handleHorizon(req, res) {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
@@ -2843,6 +2978,15 @@ export default async function handler(req, res) {
     // fallback handled in api/calendar-loader.js.
     if (queryType === "calendar") {
       return handleCalendarRead(req, res);
+    }
+
+    // Calendar-month — signals + vault + crew events grouped by YMD for
+    // a single calendar month. Feeds the mobile Calendar screen's grid +
+    // tap-day half-sheet. Distinct from `calendar` (Google events only,
+    // 14-day horizon) — this view rolls up everything that lands on a
+    // date for the requested month.
+    if (queryType === "calendar-month") {
+      return handleCalendarMonth(req, res);
     }
 
     // Compass — longitudinal household intelligence over the memory log.
