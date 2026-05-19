@@ -1,6 +1,8 @@
 import { Redis } from "@upstash/redis";
 import { Client, Receiver } from "@upstash/qstash";
 import { getValidToken } from "./refresh.js";
+import { runOutlookContactsImport } from "./outlook-contacts.js";
+import { runDriveDocumentScan } from "./drive.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -33,7 +35,19 @@ export const config = {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-const ALL_JOBS = ["emails", "calendar", "vault", "crew", "horizon", "inventory"];
+const ALL_JOBS = [
+  "emails",
+  "calendar",
+  "vault",
+  "crew",
+  "horizon",
+  "inventory",
+  // Supplementary intelligence jobs. Both are credential / scope
+  // gated — they silently skip when tokens or scopes are absent, so
+  // adding them to ALL_JOBS doesn't break Gmail-only households.
+  "outlookContacts",
+  "driveDocs",
+];
 const TERMINAL_STATES = new Set(["complete", "failed", "skipped"]);
 
 // ---------- helpers ----------
@@ -126,6 +140,22 @@ async function maybeFinalize(householdId) {
       crewProcessed: jobs.crew?.processed || 0,
       crewMembers: jobs.crew?.members || 0,
       horizonSignal: jobs.horizon?.selected || null,
+      // Supplementary intelligence summaries — surface 0 when the
+      // job was skipped so the reveal can show a neutral line
+      // ("No Outlook connected yet") instead of a missing field.
+      outlookContactsScanned: jobs.outlookContacts?.contactsScanned || 0,
+      outlookCrewFound: jobs.outlookContacts?.crewFound || 0,
+      outlookProvidersFound: jobs.outlookContacts?.providersFound || 0,
+      outlookBirthdaysFound: jobs.outlookContacts?.birthdaysFound || 0,
+      outlookEventsScanned: jobs.outlookContacts?.eventsScanned || 0,
+      outlookRecurringPatterns: jobs.outlookContacts?.recurringPatternsFound || 0,
+      driveDocsScanned: jobs.driveDocs?.documentsScanned || 0,
+      driveVaultItemsFound: jobs.driveDocs?.vaultItemsFound || 0,
+      // Reasons for skipped supplementary jobs so the reveal UI can
+      // explain "Connect Outlook to add 200+ contacts" if it sees a
+      // skip with this reason.
+      outlookSkipReason: jobs.outlookContacts?.reason || null,
+      driveSkipReason: jobs.driveDocs?.reason || null,
     }),
   });
 
@@ -2017,6 +2047,75 @@ ${emailsList}`;
   console.log(`[inventory] scanned=${scanned} extracted=${extracted}`);
 }
 
+// Supplementary intelligence job — Microsoft Graph contacts + extended
+// calendar deep-scan. No-ops silently when the user hasn't connected
+// Outlook (no tokens at user:{id}:outlookTokens). Marks 'skipped' so
+// the worker continues and the reveal can credit a 0 line item
+// cleanly rather than showing a failure state.
+async function runOutlookContactsJob(userId, householdId) {
+  await patchJob(householdId, "outlookContacts", {
+    state: "running",
+    startedAt: Date.now(),
+  });
+  const hasTokens = await redis.exists(`user:${userId}:outlookTokens`);
+  if (!hasTokens) {
+    await patchJob(householdId, "outlookContacts", {
+      state: "skipped",
+      reason: "no outlookTokens",
+      finishedAt: Date.now(),
+    });
+    return;
+  }
+  const result = await runOutlookContactsImport(userId);
+  await patchJob(householdId, "outlookContacts", {
+    state: "complete",
+    finishedAt: Date.now(),
+    contactsScanned: result.contactsScanned,
+    crewFound: result.crewFound,
+    providersFound: result.providersFound,
+    birthdaysFound: result.birthdaysFound,
+    eventsScanned: result.eventsScanned,
+    recurringPatternsFound: result.recurringPatternsFound,
+  });
+}
+
+// Supplementary intelligence job — Google Drive document discovery.
+// Double-gated: user must have opted in (user:{id}:driveScanEnabled)
+// AND the OAuth token must carry drive.readonly scope. Either gate
+// missing → silent skip with a reason stamped on the job record.
+async function runDriveDocsJob(userId, householdId) {
+  await patchJob(householdId, "driveDocs", {
+    state: "running",
+    startedAt: Date.now(),
+  });
+  let result;
+  try {
+    result = await runDriveDocumentScan(userId);
+  } catch (err) {
+    await patchJob(householdId, "driveDocs", {
+      state: "failed",
+      error: err.message,
+      finishedAt: Date.now(),
+    });
+    return;
+  }
+  if (result.skipped) {
+    await patchJob(householdId, "driveDocs", {
+      state: "skipped",
+      reason: result.skipped,
+      finishedAt: Date.now(),
+    });
+    return;
+  }
+  await patchJob(householdId, "driveDocs", {
+    state: "complete",
+    finishedAt: Date.now(),
+    documentsScanned: result.documentsScanned,
+    vaultItemsFound: result.vaultItemsFound,
+    documentTypes: result.documentTypes,
+  });
+}
+
 async function runHorizonJob(householdId) {
   await patchJob(householdId, "horizon", { state: "running", startedAt: Date.now() });
 
@@ -2122,6 +2221,8 @@ export default async function handler(req, res) {
     else if (job === "crew") await runCrewJob(userId, householdId);
     else if (job === "horizon") await runHorizonJob(householdId);
     else if (job === "inventory") await runInventoryJob(userId, householdId);
+    else if (job === "outlookContacts") await runOutlookContactsJob(userId, householdId);
+    else if (job === "driveDocs") await runDriveDocsJob(userId, householdId);
   } catch (err) {
     console.error(`${job} job failed:`, err);
     await patchJob(householdId, job, {
