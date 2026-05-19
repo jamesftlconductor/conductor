@@ -3514,6 +3514,8 @@ export default async function handler(req, res) {
               e.source === "tracking" ||
               e.source === "cron" ||
               e.source === "auto" ||
+              e.resolvedBy === "tracking" ||
+              e.resolvedBy === "carrier" ||
               e.action === "expired",
           });
         } catch {

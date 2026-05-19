@@ -258,11 +258,51 @@ export async function applyTrackingUpdate(householdId, signal) {
     parsed.trackingLocation = tracking.location || null;
     parsed.trackingLastUpdate = tracking.lastUpdate || null;
     parsed.trackingUpdatedAt = new Date().toISOString();
-    if (tracking.status === "Delivered" && parsed.state !== "resolved") {
+    const becameResolved =
+      tracking.status === "Delivered" && parsed.state !== "resolved";
+    if (becameResolved) {
       parsed.state = "resolved";
       parsed.resolvedAt = new Date().toISOString();
+      // Mark the auto-resolve path so the Took Care Of band can pick
+      // it up via either the source-based or resolvedBy-based filter.
+      // Keeps the original source ("import" / "manual" / "scan") so we
+      // don't lose the original-origin breadcrumb.
+      parsed.resolvedBy = "tracking";
     }
     await redis.lset(key, i, JSON.stringify(parsed));
+    if (becameResolved) {
+      // Memory-log the auto-resolution so handleAutoResolutions can
+      // surface it. Stamps source:'tracking' on the entry (separate
+      // from the signal's original source) so the wasAutomatic
+      // filter classifies it correctly without us mutating the
+      // signal record's source field.
+      try {
+        const daysInSystem = (() => {
+          if (!parsed.lastUpdate) return null;
+          const ms = Date.parse(parsed.lastUpdate);
+          if (isNaN(ms)) return null;
+          return Math.max(0, Math.round((Date.now() - ms) / (24 * 60 * 60 * 1000)));
+        })();
+        const entry = {
+          signalId: parsed.id ?? null,
+          description: parsed.description ?? null,
+          type: parsed.type ?? null,
+          sender: parsed.sender ?? null,
+          eta: parsed.eta ?? null,
+          action: "resolved",
+          actionAt: parsed.resolvedAt,
+          userId: parsed.userId ?? null,
+          source: "tracking",
+          resolvedBy: "tracking",
+          daysInSystem,
+        };
+        const memKey = `household:${householdId}:memory`;
+        await redis.lpush(memKey, JSON.stringify(entry));
+        await redis.ltrim(memKey, 0, 999);
+      } catch (err) {
+        console.warn("[tracking] memory log write failed:", err?.message || err);
+      }
+    }
     console.log(
       `[tracking] ${signal.trackingNumber} (${tracking.carrier}): ${previousStatus || "?"} → ${tracking.status}`
     );
