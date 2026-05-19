@@ -1506,6 +1506,83 @@ ${emailText.substring(0, 1000)}`,
         }
       }
 
+      // Broader same-sender merge: catches the case where the existing
+      // status-update triggers didn't fire (no Confirmed/Delivered/etc.
+      // keyword on the new signal) and isSemanticDuplicate's 5-day-ETA
+      // window misses it, but the new email is *clearly* a follow-up
+      // from the same sender adding tracking/ETA/confirmation that the
+      // existing signal didn't have. The merge updates the existing
+      // record in place rather than creating a duplicate.
+      //
+      // Eligibility: same normalized sender + same type + existing in
+      // incoming/active. "More info" means any of:
+      //   - new has trackingNumber and existing doesn't
+      //   - new has eta and existing doesn't (or existing eta is
+      //     a vague no-time bare-date and new has a time component)
+      //   - new has confirmationNumber and existing doesn't
+      //   - new description is materially longer than existing's
+      // If none of those apply we fall through to isSemanticDuplicate
+      // and let the standard confidence-replace path handle it.
+      const newSenderNorm = normalizeSender(signal.sender);
+      let absorbedByFollowUpMerge = false;
+      if (newSenderNorm) {
+        for (let i = 0; i < recent.length; i++) {
+          const ex = recent[i];
+          if (!ex || ex.type !== signal.type) continue;
+          if (ex.state && ex.state !== "incoming" && ex.state !== "active") continue;
+          const exSenderNorm = normalizeSender(ex.sender);
+          if (!exSenderNorm || exSenderNorm !== newSenderNorm) continue;
+
+          const newHasTracking = !!signal.trackingNumber;
+          const exHasTracking = !!ex.trackingNumber;
+          const newHasEta = !!signal.eta && !isNaN(Date.parse(signal.eta));
+          const exHasEta = !!ex.eta && !isNaN(Date.parse(ex.eta));
+          const newEtaHasTime = !!signal.eta && /T\d|:\d{2}/.test(String(signal.eta));
+          const exEtaHasTime = !!ex.eta && /T\d|:\d{2}/.test(String(ex.eta));
+          const newHasConf = !!signal.confirmationNumber;
+          const exHasConf = !!ex.confirmationNumber;
+          const newDescLen = (signal.description || "").length;
+          const exDescLen = (ex.description || "").length;
+
+          const addsTracking = newHasTracking && !exHasTracking;
+          const addsEta = (newHasEta && !exHasEta) || (newEtaHasTime && exHasEta && !exEtaHasTime);
+          const addsConf = newHasConf && !exHasConf;
+          const longerDesc = newDescLen > exDescLen + 20;
+          if (!addsTracking && !addsEta && !addsConf && !longerDesc) continue;
+
+          const merged = {
+            ...ex,
+            description: longerDesc ? signal.description : ex.description,
+            eta: addsEta ? signal.eta : ex.eta,
+            trackingNumber: addsTracking ? signal.trackingNumber : ex.trackingNumber,
+            carrier: addsTracking ? (signal.carrier || ex.carrier) : ex.carrier,
+            confirmationNumber: addsConf ? signal.confirmationNumber : ex.confirmationNumber,
+            // Mark the merge so debugging tools can tell the difference
+            // between an organic signal and one that absorbed a follow-up.
+            source: "merged",
+            lastUpdate: new Date().toLocaleString(),
+            mergedFromMessageIds: Array.isArray(ex.mergedFromMessageIds)
+              ? [...ex.mergedFromMessageIds, message.id]
+              : (ex.messageId ? [ex.messageId, message.id] : [message.id]),
+          };
+          await redis.lset(signalsKey, i, JSON.stringify(merged));
+          await redis.sadd(fingerprintSetKey, fp);
+          console.log(
+            `[import] Merged signal from ${signal.sender} — updated existing ${ex.id} rather than creating duplicate (adds: ${[
+              addsTracking && "tracking",
+              addsEta && "eta",
+              addsConf && "conf",
+              longerDesc && "longerDesc",
+            ].filter(Boolean).join("+")})`
+          );
+          imported++;
+          await new Promise(r => setTimeout(r, 1000));
+          absorbedByFollowUpMerge = true;
+          break;
+        }
+      }
+      if (absorbedByFollowUpMerge) continue;
+
       let dupIndex = -1;
       let dupExisting = null;
       for (let i = 0; i < recent.length; i++) {
