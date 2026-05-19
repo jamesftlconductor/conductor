@@ -852,6 +852,9 @@ Per signal tap: 0 calls on cache hit, 1 Haiku call on miss (12h TTL).
 | `RING_CLIENT_ID` | `ring/*` + `ring-token.js` — Ring developer client id |
 | `RING_CLIENT_SECRET` | Ring developer client secret |
 | `RING_REDIRECT_URI` | Optional override. Defaults to `https://conductor-ivory.vercel.app/api/ring/callback` |
+| `NEXTDOOR_CLIENT_ID` | `nextdoor/*` + `nextdoor-token.js` + `nextdoor-scan.js` — Nextdoor Partner API client id |
+| `NEXTDOOR_CLIENT_SECRET` | Nextdoor Partner API secret |
+| `NEXTDOOR_REDIRECT_URI` | Optional override. Defaults to `https://conductor-ivory.vercel.app/api/nextdoor/callback` |
 
 Each integration is credential-gated and degrades silently to a no-op
 when the relevant key isn't set. Add a key + redeploy → the feature

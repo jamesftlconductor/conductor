@@ -6,6 +6,7 @@ import { runOuraSync } from "./oura-sync.js";
 import { refreshLocalEventsCache } from "./events.js";
 import { runOutlookImport } from "./outlook-import.js";
 import { runImapImport } from "./imap-import.js";
+import { runNextdoorScan } from "./nextdoor-scan.js";
 
 const qstash = process.env.QSTASH_TOKEN
   ? new Client({
@@ -268,6 +269,18 @@ export default async function handler(req, res) {
           }
         } catch (err) {
           errors.push({ stage: "imap", householdId, userId, message: err.message });
+        }
+      }
+      // Nextdoor neighborhood scan per member who has connected.
+      // Surfaces safety alerts as high-urgency signals + feeds
+      // Commons + local-event surfaces. Tokens-absent silent skip.
+      for (const userId of members) {
+        try {
+          const hasNextdoor = await redis.exists(`user:${userId}:nextdoorTokens`);
+          if (!hasNextdoor) continue;
+          await runNextdoorScan(userId);
+        } catch (err) {
+          errors.push({ stage: "nextdoor", householdId, userId, message: err.message });
         }
       }
       for (const userId of members) {

@@ -3815,12 +3815,23 @@ ${isSingleMember
           new Date().toISOString()
         );
         // localEvents is the Eventbrite-cached live feed (refreshed
-        // hourly by sync.js when EVENTBRITE_API_KEY is set). Falls
-        // back to [] when the cache key is missing — annual events
-        // alone still surface.
+        // hourly by sync.js when EVENTBRITE_API_KEY is set) AND now
+        // also the Nextdoor neighborhood feed (safety/recommendations
+        // bypass this list; lost_found + deals land here). Falls back
+        // to [] when the cache key is missing — annual events alone
+        // still surface.
+        //
+        // Pet-relevant lost/found entries from Nextdoor surface only
+        // when the household actually has a Crew pet — otherwise it's
+        // just noise. crewMembers is in scope from the synthesis
+        // block above.
+        const hasPet =
+          Array.isArray(crewMembers) &&
+          crewMembers.some((m) => m?.memberType === "pet");
         const liveEvents = Array.isArray(localEvents) ? localEvents : [];
         const liveLines = liveEvents
           .filter((e) => e && e.date)
+          .filter((e) => !e.petRelevant || hasPet)
           .slice(0, 5)
           .map((e) => {
             const ms = Date.parse(e.date);
@@ -3839,7 +3850,8 @@ ${isSingleMember
                     : `in ${daysUntil} days`;
             const cap = e.capacity ? ` (cap ${e.capacity})` : "";
             const prox = e.proximityKm != null ? ` (~${e.proximityKm}km away)` : "";
-            return `- [live] ${e.name} — ${whenLabel}${cap}${prox}`;
+            const src = e.source === "nextdoor" ? " [Nextdoor]" : "";
+            return `- [live]${src} ${e.name} — ${whenLabel}${cap}${prox}`;
           });
         const annualLines = annual.map((e) => {
           const whenLabel =
@@ -3970,6 +3982,7 @@ ${isSingleMember
 - When referring to a future date, lift the day-and-date verbatim from the friendly string already provided in the ETA field (e.g., "Sunday, May 10"). NEVER compute, infer, or recalculate a day-of-week or date — the resolved string is authoritative. Ignore the "raw:" portion. Drop the year unless it differs from the current year.
 - If a signal's ETA is "Unknown" or missing, do NOT invent or guess a date for it — even if the description mentions a holiday or named event. Either omit the date or use a phrase like "no confirmed date yet". Do NOT translate "Mother's Day", "the weekend", or similar phrases into specific calendar dates yourself.
 - Anticipated signals: signals with type "anticipated" OR anticipated:true represent a recurring sender that's overdue — they're inferred, not confirmed. Frame them as expected-but-unconfirmed: "Your usual [description] from [sender] is due — hasn't arrived yet." Never frame as definite ("the renewal is here"); never invent timing for them beyond what the expectedByDate field carries.
+- LOCAL SAFETY (Nextdoor): signals with type "local_safety" come from the household's Nextdoor neighborhood feed (sender: "Nextdoor"). These are tier-1 — surface them regardless of signal load, and lead with them when present today. Frame as neighborhood awareness, not panic: "A break-in was reported on the next block — worth locking the side gate before bed." Never invent details beyond what the description carries; if the description is sparse, keep the mention short and add "from a Nextdoor post" so the user can verify in-app.
 - Threaded signals: when multiple signals share the same threadId, narrate them as ONE item rather than separately. Use the thread summary as the subject and weave the individual pieces into the same sentence. Example: instead of "Your hotel reservation is confirmed. Your dinner reservation is set. Your airport transfer is booked." write "Your Paris trip has three things moving — hotel, dinner, and airport transfer all look set." Treat the thread as the single referent for purposes of the uniqueness rule (one mention, one sentence, one closer).
 - CRITICAL — NO INVENTED DATE RANGES OR WINDOWS: When a signal has no specific ETA, do NOT fabricate a date range or vague window in place of the missing date. Specifically banned: "sometime between {X} and {Y}", "expected sometime in {month/season}", "by the end of {the year/month/quarter}", "around the {end/middle/start} of {month/year}", "in the next {month/quarter/season} or so", "anywhere from {X} to {Y}", "{date} through {date}" when neither bound came from the authoritative ETA. A signal with no ETA stays dateless — acceptable phrasings: "no confirmed date yet", "still in motion", "details still coming through", "Conductor is watching for it". Fabricated windows are NEVER acceptable, even when they feel like a reasonable guess (e.g. a "Chime Card on its way" signal does NOT get "expected sometime between mid-December and the end of the year" — it stays dateless).
 - CRITICAL RULE — INTER-SIGNAL GAP PHRASES: When two future-dated items appear in the same brief, do NOT characterize the gap between them with a relative-duration phrase. ANY number — digit ("11", "5", "8") OR spelled out ("eleven", "five", "eight", "twelve", "fifteen", "twenty", "thirty", any English number word) OR quantifier ("a", "a few", "several", "a couple of", "about two", "roughly three") — combined with ANY time unit ("day", "days", "week", "weeks", "month", "months", "year", "years") and ANY linking preposition or adverb ("later", "after", "before", "ahead", "out", "away", "from now", "earlier", "down the line", "down the road", "afterward", "subsequently", "thereafter") forms a FORBIDDEN gap phrase. Concrete forbidden examples (all banned): "eleven days later", "11 days later", "five days after", "5 days after", "a week later", "two weeks later", "twelve days afterward", "eight days out", "three weeks ahead", "a couple of days after". The dates themselves convey the timing — May 20 and May 28 already tell the reader the gap. Permitted sequential framings: "the following Thursday", "and another", "then", "on the {weekday}, {date}", or just two complete sentences with both dates. If you wrote a sentence containing any "<number-or-quantifier> <time-unit> <linking-word>" pattern referring to the spacing between two signals, DELETE that phrase and let the dates stand alone.
