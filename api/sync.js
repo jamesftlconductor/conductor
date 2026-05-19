@@ -4,6 +4,7 @@ import { runImport } from "./import.js";
 import { runCalendarSync } from "./calendar.js";
 import { runOuraSync } from "./oura-sync.js";
 import { refreshLocalEventsCache } from "./events.js";
+import { runOutlookImport } from "./outlook-import.js";
 
 const qstash = process.env.QSTASH_TOKEN
   ? new Client({
@@ -234,6 +235,22 @@ export default async function handler(req, res) {
           }
         } catch (err) {
           errors.push({ stage: "import", householdId, userId, message: err.message });
+        }
+      }
+      // Outlook import per member who has tokens. Gmail failure
+      // doesn't block this — they're independent driver paths.
+      // Tokens-absent is a silent skip (this is the common case until
+      // the user connects their Microsoft account).
+      for (const userId of members) {
+        try {
+          const hasTokens = await redis.exists(`user:${userId}:outlookTokens`);
+          if (!hasTokens) continue;
+          const result = await runOutlookImport(userId);
+          if (typeof result?.imported === "number") {
+            signalsImported += result.imported;
+          }
+        } catch (err) {
+          errors.push({ stage: "outlook", householdId, userId, message: err.message });
         }
       }
       for (const userId of members) {
