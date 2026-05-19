@@ -1608,6 +1608,60 @@ async function handleImapStatus(req, res) {
   });
 }
 
+// Urgent-count probe for the Minimap badge. Returns the count of
+// active signals that warrant attention right now — anything with
+// an ETA within tomorrow OR explicit high urgency OR a deadline
+// within 48h OR a briefCount >= 3 (carried forward). 5-minute cache
+// keyed by user+date so the mobile poll (every 5min) doesn't pound
+// the brief-compute path.
+async function handleUrgentCount(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for urgentCount" });
+  }
+  const userId = req.query?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+
+  // Cache key uses the YYYY-MM-DD date so a 5-min entry at 11:58pm
+  // doesn't poison the next morning's badge. Per-user (not per-
+  // household) so cross-member views stay separate.
+  const dateKey = new Date().toISOString().slice(0, 10);
+  const cacheKey = `user:${userId}:urgentCount:${dateKey}`;
+  const cached = await redis.get(cacheKey).catch(() => null);
+  if (cached != null) {
+    const n = typeof cached === "number" ? cached : parseInt(String(cached), 10);
+    if (!isNaN(n)) {
+      return res.status(200).json({ count: n, cached: true });
+    }
+  }
+
+  const rawSignals = await redis.lrange(`household:${householdId}:signals`, 0, -1);
+  const now = Date.now();
+  const tomorrowMs = now + 48 * 60 * 60 * 1000; // generous "tomorrow" window
+  const deadline48h = now + 48 * 60 * 60 * 1000;
+  let count = 0;
+  for (const r of rawSignals || []) {
+    let s;
+    try { s = typeof r === "string" ? JSON.parse(r) : r; } catch { continue; }
+    if (!s) continue;
+    if (s.state && s.state !== "incoming" && s.state !== "active") continue;
+    let urgent = false;
+    const etaMs = s.eta ? Date.parse(s.eta) : NaN;
+    if (!isNaN(etaMs) && etaMs <= tomorrowMs) urgent = true;
+    if (s.urgency === "high") urgent = true;
+    if (s.type === "deadline" && !isNaN(etaMs) && etaMs <= deadline48h) urgent = true;
+    if (typeof s.briefCount === "number" && s.briefCount >= 3) urgent = true;
+    if (urgent) count++;
+  }
+  // 5-minute TTL — the badge polls every 5min on mobile, so this is
+  // the right cadence. Set with EX so even a same-key SET refreshes
+  // the window.
+  await redis.set(cacheKey, count, { ex: 300 }).catch(() => null);
+  return res.status(200).json({ count, cached: false });
+}
+
 async function handleSpend(req, res) {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
@@ -3930,6 +3984,10 @@ export default async function handler(req, res) {
 
     if (queryType === "spend") {
       return handleSpend(req, res);
+    }
+
+    if (queryType === "urgentCount") {
+      return handleUrgentCount(req, res);
     }
 
     // IMAP universal connector — POST to validate credentials, store
