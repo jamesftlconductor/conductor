@@ -5,6 +5,7 @@ import { runCalendarSync } from "./calendar.js";
 import { runOuraSync } from "./oura-sync.js";
 import { refreshLocalEventsCache } from "./events.js";
 import { runOutlookImport } from "./outlook-import.js";
+import { runImapImport } from "./imap-import.js";
 
 const qstash = process.env.QSTASH_TOKEN
   ? new Client({
@@ -251,6 +252,22 @@ export default async function handler(req, res) {
           }
         } catch (err) {
           errors.push({ stage: "outlook", householdId, userId, message: err.message });
+        }
+      }
+      // IMAP import per member who has an imapConfig. Catches iCloud,
+      // Yahoo, and any user-configured custom IMAP host. Failure
+      // scoped — bad IMAP creds shouldn't break Gmail/Outlook for
+      // the same user.
+      for (const userId of members) {
+        try {
+          const hasImap = await redis.exists(`user:${userId}:imapConfig`);
+          if (!hasImap) continue;
+          const result = await runImapImport(userId);
+          if (typeof result?.imported === "number") {
+            signalsImported += result.imported;
+          }
+        } catch (err) {
+          errors.push({ stage: "imap", householdId, userId, message: err.message });
         }
       }
       for (const userId of members) {

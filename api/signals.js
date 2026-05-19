@@ -3,6 +3,7 @@ import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
 import { detectOrLoadLocation, saveHouseholdLocation, loadHouseholdLocation } from "./location.js";
 import { writeCommonsRecord } from "./commons.js";
+import { IMAP_PRESETS, encrypt, validateImapConnection } from "./imap-import.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -1509,6 +1510,103 @@ function normalizeProvider(name) {
 // the import/tracking auto-resolve paths can call the same write
 // without a circular import. writeCommonsRecord is referenced in the
 // PATCH resolve flow below.
+
+// IMAP connection handlers — see api/imap-import.js for the import
+// pipeline + AES helpers. These handlers cover the "Settings →
+// Connect iCloud / Yahoo / Other" mobile flow. Validation runs a
+// live IMAP connect BEFORE persisting; a wrong password never
+// lands in Redis.
+async function handleImapConnect(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "Method not allowed for imap-connect" });
+  }
+  const { userId, provider, email, password, host: customHost, port: customPort } = req.body || {};
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  if (!email || !password) {
+    return res.status(400).json({ error: "email and password required" });
+  }
+  // Resolve host/port from preset, or accept custom values for
+  // 'custom' provider. Provider value is also stored so we can
+  // reconstruct the friendly label later.
+  let host;
+  let port;
+  if (provider && provider !== "custom" && IMAP_PRESETS[provider]) {
+    host = IMAP_PRESETS[provider].host;
+    port = IMAP_PRESETS[provider].port;
+  } else if (provider === "custom") {
+    if (!customHost) return res.status(400).json({ error: "host required for custom provider" });
+    host = customHost;
+    port = customPort || 993;
+  } else {
+    return res.status(400).json({ error: `unknown provider: ${provider}` });
+  }
+
+  // Validate by attempting a live connect. validateImapConnection
+  // returns { ok, error? } — surface the underlying error to the
+  // mobile form so the user can tell "wrong password" from "host
+  // unreachable".
+  const validation = await validateImapConnection({ host, port, user: email, password });
+  if (!validation.ok) {
+    return res.status(400).json({ connected: false, error: validation.error || "connection failed" });
+  }
+
+  // Encrypt password and persist. If encryption fails (missing
+  // ENCRYPTION_KEY) we surface a 500 — the user shouldn't see a
+  // misleading "connected" state when the password couldn't be
+  // safely stored.
+  let encryptedPassword;
+  try {
+    encryptedPassword = encrypt(password);
+  } catch (err) {
+    return res.status(500).json({
+      connected: false,
+      error: `encryption unavailable: ${err.message}`,
+    });
+  }
+  const config = {
+    provider: provider || "custom",
+    email,
+    host,
+    port,
+    tls: true,
+    encryptedPassword,
+    connectedAt: Date.now(),
+  };
+  await redis.set(`user:${userId}:imapConfig`, JSON.stringify(config));
+  return res.status(200).json({ connected: true, provider: config.provider, email });
+}
+
+async function handleImapDisconnect(req, res) {
+  if (req.method !== "POST" && req.method !== "DELETE") {
+    res.setHeader("Allow", "POST, DELETE");
+    return res.status(405).json({ error: "Method not allowed for imap-disconnect" });
+  }
+  const userId = req.body?.userId || req.query?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  await redis.del(`user:${userId}:imapConfig`);
+  await redis.del(`user:${userId}:imapLastSync`);
+  return res.status(200).json({ ok: true });
+}
+
+async function handleImapStatus(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed for imap-status" });
+  }
+  const { userId } = req.query;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const raw = await redis.get(`user:${userId}:imapConfig`);
+  if (!raw) return res.status(200).json({ connected: false });
+  const c = typeof raw === "string" ? JSON.parse(raw) : raw;
+  return res.status(200).json({
+    connected: true,
+    provider: c.provider || null,
+    email: c.email || null,
+    host: c.host || null,
+    connectedAt: c.connectedAt || null,
+  });
+}
 
 async function handleSpend(req, res) {
   if (req.method !== "GET") {
@@ -3832,6 +3930,22 @@ export default async function handler(req, res) {
 
     if (queryType === "spend") {
       return handleSpend(req, res);
+    }
+
+    // IMAP universal connector — POST to validate credentials, store
+    // encrypted password + config at user:{userId}:imapConfig. Used
+    // by the mobile iCloud/Yahoo/Other connection form. Validation
+    // attempts a live connect; the encrypted password is only
+    // persisted after the connect succeeds, so a bad password never
+    // lands in Redis.
+    if (queryType === "imap-connect" || bodyType === "imap-connect") {
+      return handleImapConnect(req, res);
+    }
+    if (queryType === "imap-disconnect" || bodyType === "imap-disconnect") {
+      return handleImapDisconnect(req, res);
+    }
+    if (queryType === "imap-status") {
+      return handleImapStatus(req, res);
     }
 
     if (req.method === "GET") {
