@@ -3937,6 +3937,7 @@ export default async function handler(req, res) {
       if (index !== -1) {
         // Primary path — id is in :signals.
         const previousLastUpdate = signals[index].lastUpdate;
+        const previousState = signals[index].state || null;
         applyEditFields(signals[index]);
         if (stateProvided) {
           signals[index].state = state;
@@ -3959,12 +3960,15 @@ export default async function handler(req, res) {
         }
         await redis.lset(key, index, JSON.stringify(signals[index]));
 
-        // Brief cache invalidation — when a signal's
-        // description / eta / status changes, the previously
-        // cached morning/midday/evening prose is now stale and
-        // could misquote the edited field. Clear the cache for
-        // every household member so the next brief regenerates.
-        if (hasDescription || hasEta || hasStatus) {
+        // Brief cache invalidation — when ANY field that affects
+        // brief prose changes, drop the cached morning/midday/evening
+        // for every household member. Without this a Rest tap (state
+        // transition) left the cached brief still narrating the
+        // resolved signal until its TTL expired, and a co-parent on a
+        // different device kept seeing the pre-edit text.
+        const stateChanged =
+          stateProvided && state !== previousState;
+        if (hasDescription || hasEta || hasStatus || stateChanged) {
           try {
             await invalidateBriefCache(householdId);
           } catch (err) {
@@ -4007,6 +4011,7 @@ export default async function handler(req, res) {
       }
 
       const previousLastUpdate = deadlines[index].lastUpdate;
+      const previousDeadlineState = deadlines[index].state || null;
       applyEditFields(deadlines[index]);
       if (stateProvided) {
         deadlines[index].state = state;
@@ -4017,8 +4022,11 @@ export default async function handler(req, res) {
       }
       await redis.lset(deadlinesKey, index, JSON.stringify(deadlines[index]));
 
-      // Same brief-cache invalidation as the :signals path.
-      if (hasDescription || hasEta || hasStatus) {
+      // Same brief-cache invalidation as the :signals path — state
+      // transitions count too, otherwise resolving a vault deadline
+      // leaves the cached brief still narrating it.
+      const deadlineStateChanged = stateProvided && state !== previousDeadlineState;
+      if (hasDescription || hasEta || hasStatus || deadlineStateChanged) {
         try { await invalidateBriefCache(householdId); }
         catch (err) { console.warn("[cache] deadlines brief invalidation failed:", err?.message); }
       }
