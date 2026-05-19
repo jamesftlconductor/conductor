@@ -3361,7 +3361,14 @@ export default async function handler(req, res) {
       if (s._isDeadline) {
         return `- ${owner} ${tenant}[DEADLINE] ${s.description || "Unknown"} | Due: ${etaWithFriendly(s.eta)} | Category: ${s.category || "uncategorized"}`;
       }
-      return `- ${owner} ${tenant}${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}${freshnessTag(s)}`;
+      // briefCount >= 3 tag surfaces only when the signal has crossed
+      // the escalation threshold — the prompt rule "CARRY-FORWARD
+      // ESCALATION" looks for this and reframes accordingly.
+      const carryTag =
+        typeof s.briefCount === "number" && s.briefCount >= 3
+          ? ` | briefCount: ${s.briefCount}`
+          : "";
+      return `- ${owner} ${tenant}${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}${freshnessTag(s)}${carryTag}`;
     };
     const formatEvent = (e) => {
       const owner = `[${ownershipTag(e, userId, householdNameMap, isSingleMember)}]`;
@@ -3786,6 +3793,7 @@ ${isSingleMember
 - Crew birthdays/anniversaries: any entry in the CREW BIRTHDAYS/ANNIVERSARIES layer within 14 days ALWAYS appears in the brief. On the day itself (0 days), lead with it unless a high-severity conflict outranks it; 3 days out or less, mention with gentle urgency; further out, a single quiet acknowledgment is enough. Lift the parenthesized phrase verbatim ("today", "tomorrow", "in N days") — never compute your own count. Frame anniversaries as a household milestone, not a directive.
 - Home requirements: flag naturally if service window conflicts with likely schedule
 - Carried forward: if CARRIED FORWARD FROM YESTERDAY is populated, weave in one understated sentence near the end (before the horizon line) — e.g. "Carrying forward from yesterday: the HVAC appointment is still unconfirmed." Never alarming, never repetitive of the main brief narrative. If multiple carry-forwards exist, name at most one or two; the rest are implied.
+- CARRY-FORWARD ESCALATION: Any signal whose record carries briefCount >= 3 has been in this household's brief for at least three mornings without resolving. Acknowledge it differently — not as ambient context but as a decision point: "The [description] has been carrying forward for [briefCount] days — worth a quick decision: pursue it or remove it from the radar?" Never just repeat the same framing for a signal that's been in every brief for 3+ days. Pick at most one of these per brief; the rest stay implied. Use the parenthesized briefCount value verbatim — do not compute a different number.
 - Still in motion: if STILL IN MOTION has an item, you MAY include one quiet "still moving" mention (e.g. "the renewal is still in motion, due Thursday"). Do NOT include if the same signal was already covered in URGENT or NEAR WINDOW prose this brief, and skip it entirely if doing so would push the brief past 5 sentences. A clean omission is fine — this layer is optional.
 - Horizon signal: one sentence at the end, tonal shift to future-aware, specific and surprising
 - Horizon awareness: if HORIZON AWARENESS is populated, surface it as one quiet sentence near the end (a "by the way..." not a lead). If both HORIZON SIGNAL and HORIZON AWARENESS are populated, prefer HORIZON AWARENESS — at most one horizon-style sentence per brief total.
@@ -4221,6 +4229,7 @@ Never manufacture urgency. Never apologize for having nothing to say. The quiet 
 
     const briefedTodayKey = `household:${householdId}:briefedToday`;
     const briefedTodayFields = {};
+    const briefedSignalIds = new Set();
     for (const seg of segments || []) {
       if (!seg || seg.type !== "signal" || seg.signalId == null) continue;
       const id = String(seg.signalId);
@@ -4231,6 +4240,38 @@ Never manufacture urgency. Never apologize for having nothing to say. The quiet 
         state: sig.state || "",
         ring: computeRing(sig),
       });
+      briefedSignalIds.add(id);
+    }
+
+    // briefCount — increment for each signal that was actually narrated
+    // in this brief AND is still unresolved. Becomes the substrate for
+    // the carry-forward escalation prompt rule (briefCount >= 3 gets
+    // softer "make a decision" framing) and the mobile Finale amber
+    // "Carried forward N days" badge. Read-modify-write per signal so
+    // a fresh fetch of :signals reflects the bump immediately.
+    if (briefedSignalIds.size > 0) {
+      const signalsListKey = `household:${householdId}:signals`;
+      try {
+        const rawList = await redis.lrange(signalsListKey, 0, -1);
+        for (let i = 0; i < rawList.length; i++) {
+          let parsed;
+          try { parsed = typeof rawList[i] === "string" ? JSON.parse(rawList[i]) : rawList[i]; }
+          catch { continue; }
+          if (!parsed || !parsed.id) continue;
+          if (!briefedSignalIds.has(String(parsed.id))) continue;
+          // Skip resolved/expired — incrementing a resolved signal's
+          // count would mislead the FinaleSheet badge after a Rest tap.
+          if (parsed.state === "resolved" || parsed.state === "expired") continue;
+          const next = {
+            ...parsed,
+            briefCount: (typeof parsed.briefCount === "number" ? parsed.briefCount : 0) + 1,
+            lastBriefedAt: new Date().toISOString(),
+          };
+          await redis.lset(signalsListKey, i, JSON.stringify(next));
+        }
+      } catch (err) {
+        console.warn("[brief] briefCount bump failed:", err?.message || err);
+      }
     }
     if (Object.keys(briefedTodayFields).length > 0) {
       await redis.hset(briefedTodayKey, briefedTodayFields);
