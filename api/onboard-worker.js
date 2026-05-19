@@ -3,6 +3,7 @@ import { Client, Receiver } from "@upstash/qstash";
 import { getValidToken } from "./refresh.js";
 import { runOutlookContactsImport } from "./outlook-contacts.js";
 import { runDriveDocumentScan } from "./drive.js";
+import { runContactsDeepScan } from "./contacts.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -42,9 +43,11 @@ const ALL_JOBS = [
   "crew",
   "horizon",
   "inventory",
-  // Supplementary intelligence jobs. Both are credential / scope
+  // Supplementary intelligence jobs. All three are credential / scope
   // gated — they silently skip when tokens or scopes are absent, so
-  // adding them to ALL_JOBS doesn't break Gmail-only households.
+  // adding them to ALL_JOBS doesn't break a household that only has
+  // a subset of the providers connected.
+  "contactsDeep",
   "outlookContacts",
   "driveDocs",
 ];
@@ -143,6 +146,15 @@ async function maybeFinalize(householdId) {
       // Supplementary intelligence summaries — surface 0 when the
       // job was skipped so the reveal can show a neutral line
       // ("No Outlook connected yet") instead of a missing field.
+      googleContactsScanned: jobs.contactsDeep?.contactsScanned || 0,
+      googleCrewMembersFound: jobs.contactsDeep?.crewMembersFound || 0,
+      googleProvidersFound: jobs.contactsDeep?.providersFound || 0,
+      googleBirthdaysFound: jobs.contactsDeep?.birthdaysFound || 0,
+      googleActivitiesFound: jobs.contactsDeep?.activitiesFound || 0,
+      googleNetworkCandidates: jobs.contactsDeep?.networkCandidates || 0,
+      googleCalendarEventsScanned: jobs.contactsDeep?.calendarEventsScanned || 0,
+      googleSignalsFromCalendar: jobs.contactsDeep?.signalsFromCalendar || 0,
+      googleContactsSkipReason: jobs.contactsDeep?.reason || null,
       outlookContactsScanned: jobs.outlookContacts?.contactsScanned || 0,
       outlookCrewFound: jobs.outlookContacts?.crewFound || 0,
       outlookProvidersFound: jobs.outlookContacts?.providersFound || 0,
@@ -2047,6 +2059,49 @@ ${emailsList}`;
   console.log(`[inventory] scanned=${scanned} extracted=${extracted}`);
 }
 
+// Supplementary intelligence job — Google contacts + calendar deep-
+// scan via People API + primary calendar ±90d window. Pre-requires
+// a Google OAuth token (every signed-in household has this). Returns
+// crew/provider/birthday/activity findings and stamps the count on
+// the job record for reveal consumption.
+async function runContactsDeepJob(userId, householdId) {
+  await patchJob(householdId, "contactsDeep", {
+    state: "running",
+    startedAt: Date.now(),
+  });
+  let result;
+  try {
+    result = await runContactsDeepScan(userId);
+  } catch (err) {
+    await patchJob(householdId, "contactsDeep", {
+      state: "failed",
+      error: err.message,
+      finishedAt: Date.now(),
+    });
+    return;
+  }
+  if (result.skipped) {
+    await patchJob(householdId, "contactsDeep", {
+      state: "skipped",
+      reason: result.skipped,
+      finishedAt: Date.now(),
+    });
+    return;
+  }
+  await patchJob(householdId, "contactsDeep", {
+    state: "complete",
+    finishedAt: Date.now(),
+    contactsScanned: result.contactsScanned,
+    crewMembersFound: result.crewMembersFound,
+    providersFound: result.providersFound,
+    birthdaysFound: result.birthdaysFound,
+    activitiesFound: result.activitiesFound,
+    networkCandidates: result.networkCandidates,
+    calendarEventsScanned: result.calendarEventsScanned,
+    signalsFromCalendar: result.signalsFromCalendar,
+  });
+}
+
 // Supplementary intelligence job — Microsoft Graph contacts + extended
 // calendar deep-scan. No-ops silently when the user hasn't connected
 // Outlook (no tokens at user:{id}:outlookTokens). Marks 'skipped' so
@@ -2221,6 +2276,7 @@ export default async function handler(req, res) {
     else if (job === "crew") await runCrewJob(userId, householdId);
     else if (job === "horizon") await runHorizonJob(householdId);
     else if (job === "inventory") await runInventoryJob(userId, householdId);
+    else if (job === "contactsDeep") await runContactsDeepJob(userId, householdId);
     else if (job === "outlookContacts") await runOutlookContactsJob(userId, householdId);
     else if (job === "driveDocs") await runDriveDocsJob(userId, householdId);
   } catch (err) {
