@@ -861,9 +861,23 @@ Mobile: `app.json` carries `expo.extra.eas.projectId` and the OTA
 | Tail recent logs | `vercel logs --since 1h --no-follow --no-branch` |
 | Filter logs by request | `vercel logs --query "POST /api/signals" --no-follow --no-branch` |
 
-> **Verify deploys** before trusting behavioral tests: `vercel ls --prod`
-> should show a fresh deploy. Git pushes have been unreliable triggers;
-> use `vercel --prod --yes` if a push doesn't deploy.
+> **Vercel auto-deploy is broken since 2026-05-14.** Git pushes no
+> longer trigger production deploys. After every backend commit, run:
+>
+> ```
+> vercel --prod --yes
+> ```
+>
+> Then confirm with `vercel ls --prod` — the top row's "Age" should be
+> seconds/minutes, not hours, and the Username should be your Vercel
+> user (not `vercel[bot]`). Behavioral tests against the production URL
+> must wait for a fresh deploy or they'll hit the old build.
+>
+> Root cause is the Vercel ↔ GitHub App integration on this project —
+> not a code-level fix. To repair: open the project at
+> `vercel.com/jamestotalhome-5918s-projects/conductor`, Settings → Git
+> → disconnect, then reconnect to `JamesFTL/conductor` and re-grant
+> repo access in the GitHub Apps page.
 
 ### Mobile (from `C:\Users\james\conductor-mobile`)
 
