@@ -17,6 +17,82 @@ const HOUR_MS = 60 * 60 * 1000;
 // per-household coords come from household:{id}:location now.
 const WEATHER_TIMEOUT_MS = 3000;
 
+// ---------- Annual / seasonal local-event calendar ----------
+//
+// Hardcoded, region-keyed list of recurring annual events with traffic
+// or safety impact. Surfaces alongside the live Eventbrite feed (when
+// that lands) via getAnnualEvents below. Each event carries:
+//   - tier:                 1 = safety, 2 = major (mention on quiet
+//                           days or signal conflicts), 3 = awareness
+//                           (mention only on quiet days)
+//   - surfaceWeeksBefore:   how far ahead to start mentioning (default 1)
+//   - durationDays:         how many days the event spans (default 1)
+//
+// Region keys correspond to household:{id}:location.marketRegion values
+// set by location.js. Households outside these markets fall back to
+// the empty list (no annual events surfaced) — a 'generic' bucket is
+// not maintained because nothing here is universally relevant.
+const ANNUAL_EVENTS = {
+  south_florida: [
+    { name: "Hurricane Season Opens", month: 6, day: 1, tier: 1, surfaceWeeksBefore: 2, note: "Check supplies and emergency kit" },
+    { name: "Tortuga Music Festival", month: 5, day: 15, tier: 2, durationDays: 3, note: "Beach corridor packed, A1A gridlock" },
+    { name: "Fort Lauderdale Boat Show", month: 10, day: 25, tier: 2, durationDays: 5, note: "Downtown gridlock, plan around it" },
+    { name: "Air and Sea Show", month: 5, day: 4, tier: 2, durationDays: 2, note: "Beach closed, A1A shut down" },
+    { name: "Spring Break Peak", month: 3, day: 10, tier: 3, durationDays: 14, note: "Beach traffic heavy" },
+    { name: "Snowbird Season", month: 11, day: 1, tier: 3, durationDays: 150, note: "Traffic 40% heavier through April" },
+    { name: "Hurricane Season Ends", month: 11, day: 30, tier: 3, surfaceWeeksBefore: 0, note: "Six months clear" },
+  ],
+  nyc: [
+    { name: "NYC Marathon", month: 11, day: 3, tier: 2, note: "Major street closures across boroughs" },
+    { name: "Thanksgiving Parade", month: 11, day: 27, tier: 2, note: "Upper West Side closed" },
+    { name: "July 4 Fireworks", month: 7, day: 4, tier: 2, note: "East River closures, FDR shut" },
+    { name: "US Open Tennis", month: 8, day: 25, tier: 3, durationDays: 14, note: "Flushing Meadows traffic" },
+    { name: "Pride Weekend", month: 6, day: 28, tier: 3, durationDays: 2, note: "Midtown closures" },
+  ],
+  chicago: [
+    { name: "Chicago Marathon", month: 10, day: 13, tier: 2, note: "Major street closures" },
+    { name: "Lollapalooza", month: 8, day: 1, tier: 2, durationDays: 4, note: "Grant Park, downtown packed" },
+    { name: "Air and Water Show", month: 8, day: 16, tier: 2, durationDays: 2, note: "Lakefront crowds" },
+    { name: "St. Patrick's Day", month: 3, day: 17, tier: 3, note: "River dyed green, downtown busy" },
+  ],
+  los_angeles: [
+    { name: "LA Marathon", month: 3, day: 16, tier: 2, note: "Major street closures across city" },
+    { name: "Coachella", month: 4, day: 11, tier: 3, durationDays: 14, note: "I-10 East heavy both weekends" },
+    { name: "Thanksgiving", month: 11, day: 27, tier: 3, note: "LAX and freeways brutal" },
+    { name: "Wildfire Season", month: 9, day: 1, tier: 1, durationDays: 90, note: "Watch air quality and evacuation notices" },
+  ],
+  seattle: [
+    { name: "Seafair", month: 8, day: 1, tier: 2, durationDays: 30, note: "Blue Angels weekend, Lake Washington packed" },
+    { name: "Bumbershoot", month: 9, day: 1, tier: 3, durationDays: 3, note: "Seattle Center area busy" },
+  ],
+  boston: [
+    { name: "Boston Marathon", month: 4, day: 21, tier: 2, note: "Major street closures across city" },
+    { name: "Fourth of July", month: 7, day: 4, tier: 2, note: "Esplanade, closures across Back Bay" },
+    { name: "Head of the Charles", month: 10, day: 18, tier: 3, durationDays: 2, note: "Cambridge River traffic" },
+  ],
+};
+
+// Returns the annual events that are either upcoming (within their
+// surfaceWeeksBefore window) or actively underway. daysUntil is
+// negative for events that started in the past but haven't ended yet
+// (e.g. Snowbird Season starting Nov 1, accessed in February).
+function getAnnualEvents(marketRegion, today) {
+  const events = ANNUAL_EVENTS[marketRegion] || [];
+  const todayDate = new Date(today);
+  return events
+    .map((event) => {
+      const eventDate = new Date(todayDate.getFullYear(), event.month - 1, event.day);
+      const daysUntil = Math.floor((eventDate - todayDate) / 86400000);
+      const surfaceDays = (event.surfaceWeeksBefore !== undefined ? event.surfaceWeeksBefore : 1) * 7;
+      const duration = event.durationDays || 1;
+      return { event, daysUntil, surfaceDays, duration };
+    })
+    .filter(({ daysUntil, surfaceDays, duration }) =>
+      daysUntil >= -duration && daysUntil <= surfaceDays
+    )
+    .map(({ event, daysUntil }) => ({ ...event, daysUntil }));
+}
+
 // ---------- helpers ----------
 
 // Open-Meteo's WMO weather codes mapped to the small vocabulary that
@@ -3714,6 +3790,30 @@ ${isSingleMember
       `WEATHER TODAY (silent unless it changes what someone should do about a signal):`,
       weather ? weather.summary : "Unknown",
       ``,
+      // Annual + (eventually) Eventbrite local events. Tier 1 (safety)
+      // always lands; tier 2 (major) only on quiet days or when it
+      // directly intersects a signal; tier 3 (awareness) is mute
+      // unless the brief otherwise has nothing.
+      `LOCAL AND SEASONAL AWARENESS:`,
+      (() => {
+        const annual = getAnnualEvents(
+          householdLocation?.marketRegion || "south_florida",
+          new Date().toISOString()
+        );
+        if (annual.length === 0) return "No major local events this week.";
+        return annual
+          .map((e) => {
+            const whenLabel =
+              e.daysUntil === 0
+                ? "today"
+                : e.daysUntil < 0
+                  ? "happening now"
+                  : `in ${e.daysUntil} days`;
+            return `- [tier ${e.tier}] ${e.name} — ${whenLabel}: ${e.note}`;
+          })
+          .join("\n");
+      })(),
+      ``,
       `CHILDCARE (mention if affects today or tomorrow):`,
       childcareEvents.length > 0 ? childcareEvents.map(formatEvent).join("\n") : "None",
       ``,
@@ -3793,6 +3893,11 @@ ${isSingleMember
 - Crew birthdays/anniversaries: any entry in the CREW BIRTHDAYS/ANNIVERSARIES layer within 14 days ALWAYS appears in the brief. On the day itself (0 days), lead with it unless a high-severity conflict outranks it; 3 days out or less, mention with gentle urgency; further out, a single quiet acknowledgment is enough. Lift the parenthesized phrase verbatim ("today", "tomorrow", "in N days") — never compute your own count. Frame anniversaries as a household milestone, not a directive.
 - Home requirements: flag naturally if service window conflicts with likely schedule
 - Carried forward: if CARRIED FORWARD FROM YESTERDAY is populated, weave in one understated sentence near the end (before the horizon line) — e.g. "Carrying forward from yesterday: the HVAC appointment is still unconfirmed." Never alarming, never repetitive of the main brief narrative. If multiple carry-forwards exist, name at most one or two; the rest are implied.
+- LOCAL/SEASONAL EVENTS (use LOCAL AND SEASONAL AWARENESS list): pick at most one event to mention.
+  - tier 1 (safety, e.g. Hurricane Season Opens, Wildfire Season): ALWAYS mention regardless of signal load — one practical sentence ("Hurricane season opens June 1 — worth refreshing supplies this weekend").
+  - tier 2 (major traffic / closures, e.g. Tortuga, marathons): mention only when the brief is otherwise quiet OR the event directly conflicts with a signal's location/timing.
+  - tier 3 (awareness, e.g. Snowbird Season, Spring Break Peak): mention ONLY on a fully quiet day with no other signals to surface.
+  - Frame as practical observation, not news ("Tortuga is this weekend — beach traffic will be heavy by Friday"). Never headline-voice. Never list multiple events. Speak like someone who lives in this market.
 - CARRY-FORWARD ESCALATION: Any signal whose record carries briefCount >= 3 has been in this household's brief for at least three mornings without resolving. Acknowledge it differently — not as ambient context but as a decision point: "The [description] has been carrying forward for [briefCount] days — worth a quick decision: pursue it or remove it from the radar?" Never just repeat the same framing for a signal that's been in every brief for 3+ days. Pick at most one of these per brief; the rest stay implied. Use the parenthesized briefCount value verbatim — do not compute a different number.
 - Still in motion: if STILL IN MOTION has an item, you MAY include one quiet "still moving" mention (e.g. "the renewal is still in motion, due Thursday"). Do NOT include if the same signal was already covered in URGENT or NEAR WINDOW prose this brief, and skip it entirely if doing so would push the brief past 5 sentences. A clean omission is fine — this layer is optional.
 - Horizon signal: one sentence at the end, tonal shift to future-aware, specific and surprising
