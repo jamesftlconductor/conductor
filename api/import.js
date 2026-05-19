@@ -5,6 +5,7 @@ import {
   parseAmazonDeliveryEmail,
   trackPackage,
 } from "./carrier.js";
+import { writeCommonsRecord, logAutoResolvedMemory } from "./commons.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -271,37 +272,11 @@ export async function applyTrackingUpdate(householdId, signal) {
     }
     await redis.lset(key, i, JSON.stringify(parsed));
     if (becameResolved) {
-      // Memory-log the auto-resolution so handleAutoResolutions can
-      // surface it. Stamps source:'tracking' on the entry (separate
-      // from the signal's original source) so the wasAutomatic
-      // filter classifies it correctly without us mutating the
-      // signal record's source field.
-      try {
-        const daysInSystem = (() => {
-          if (!parsed.lastUpdate) return null;
-          const ms = Date.parse(parsed.lastUpdate);
-          if (isNaN(ms)) return null;
-          return Math.max(0, Math.round((Date.now() - ms) / (24 * 60 * 60 * 1000)));
-        })();
-        const entry = {
-          signalId: parsed.id ?? null,
-          description: parsed.description ?? null,
-          type: parsed.type ?? null,
-          sender: parsed.sender ?? null,
-          eta: parsed.eta ?? null,
-          action: "resolved",
-          actionAt: parsed.resolvedAt,
-          userId: parsed.userId ?? null,
-          source: "tracking",
-          resolvedBy: "tracking",
-          daysInSystem,
-        };
-        const memKey = `household:${householdId}:memory`;
-        await redis.lpush(memKey, JSON.stringify(entry));
-        await redis.ltrim(memKey, 0, 999);
-      } catch (err) {
-        console.warn("[tracking] memory log write failed:", err?.message || err);
-      }
+      // Auto-resolve: log memory entry + Commons aggregation. Memory
+      // surfaces the resolution in Took Care Of; Commons records the
+      // anonymous resolution-time-by-provider stat.
+      await logAutoResolvedMemory(householdId, parsed, "tracking");
+      await writeCommonsRecord(householdId, parsed);
     }
     console.log(
       `[tracking] ${signal.trackingNumber} (${tracking.carrier}): ${previousStatus || "?"} → ${tracking.status}`
@@ -1534,9 +1509,17 @@ ${emailText.substring(0, 1000)}`,
           if (trigger.resolve) {
             patched.state = "resolved";
             patched.resolvedAt = new Date().toISOString();
+            patched.resolvedBy = "status-update";
           }
           await redis.lset(signalsKey, updateIndex, JSON.stringify(patched));
           await redis.sadd(fingerprintSetKey, fp);
+          if (trigger.resolve) {
+            // Same memory + Commons rails as the tracking auto-resolve.
+            // Without these the Took Care Of band and Commons stats both
+            // stay empty for the Delivered/Cancelled status-update path.
+            await logAutoResolvedMemory(householdId, patched, "status-update");
+            await writeCommonsRecord(householdId, patched);
+          }
           console.log(
             `Updated signal ${updateExisting.id} status to ${signal.status} from confirmation email`
           );
@@ -1709,6 +1692,20 @@ ${emailText.substring(0, 1000)}`,
                 if (amzl.status === "Delivered") {
                   signal.state = "resolved";
                   signal.resolvedAt = new Date().toISOString();
+                  signal.resolvedBy = "amzl-parse";
+                  // Stamp createdAt so the same-cycle resolve still
+                  // contributes to Commons. Without it writeCommons
+                  // bails (NaN createdAt → 0-day resolution undefined).
+                  signal.createdAt = Date.now();
+                  // Auto-resolves outside the PATCH path need memory +
+                  // Commons writes here so Took Care Of and Commons
+                  // stats both reflect them.
+                  try {
+                    await logAutoResolvedMemory(householdId, signal, "amzl-parse");
+                    await writeCommonsRecord(householdId, signal);
+                  } catch (err) {
+                    console.warn("[amzl] post-resolve write failed:", err?.message || err);
+                  }
                 }
               }
             }

@@ -15,6 +15,7 @@
 import { Redis } from "@upstash/redis";
 import { applyTrackingUpdate } from "./import.js";
 import { trackFlight, extractFlightNumbers } from "./carrier.js";
+import { writeCommonsRecord, logAutoResolvedMemory } from "./commons.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -167,11 +168,18 @@ async function applyFlightUpdate(householdId, signal, flightNumber) {
     parsed.flightDepartureGate = result.departureGate;
     parsed.flightArrivalGate = result.arrivalGate;
     parsed.flightUpdatedAt = new Date().toISOString();
-    if (result.status === "Landed" && parsed.state !== "resolved") {
+    const becameResolved = result.status === "Landed" && parsed.state !== "resolved";
+    if (becameResolved) {
       parsed.state = "resolved";
       parsed.resolvedAt = new Date().toISOString();
+      parsed.resolvedBy = "flight-landed";
     }
     await redis.lset(key, i, JSON.stringify(parsed));
+    if (becameResolved) {
+      // Memory + Commons rails for the flight-landed auto-resolve.
+      await logAutoResolvedMemory(householdId, parsed, "flight-landed");
+      await writeCommonsRecord(householdId, parsed);
+    }
     return { signal: parsed, prevStatus, prevDelay, result };
   }
   return null;

@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
 import { detectOrLoadLocation, saveHouseholdLocation, loadHouseholdLocation } from "./location.js";
+import { writeCommonsRecord } from "./commons.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -1504,45 +1505,10 @@ function normalizeProvider(name) {
   return s.length > 1 && s.length < 80 ? s : null;
 }
 
-// Write an anonymous resolution record to the commons aggregation.
-// No householdId. No userId. resolutionDays + signalType + timestamp
-// only. Capped at 100 entries per provider+region slot.
-async function writeCommonsRecord(householdId, signal) {
-  try {
-    if (!signal || !signal.sender) return;
-    const provider = normalizeProvider(signal.sender);
-    if (!provider) return;
-    const created =
-      typeof signal.createdAt === "number"
-        ? signal.createdAt
-        : Date.parse(signal.createdAt || "");
-    const resolved =
-      typeof signal.id === "number" && signal.id > 1e12 ? signal.id : Date.now();
-    if (isNaN(created) || created < 0) return;
-    const resolutionDays = Math.max(
-      0,
-      Math.floor((Date.now() - created) / (24 * 60 * 60 * 1000))
-    );
-    // Resolve region from household location — best-effort; default
-    // 'generic' bucket when missing.
-    let region = "generic";
-    try {
-      const raw = await redis.get(`household:${householdId}:location`);
-      const loc = safeJson(raw);
-      if (loc?.marketRegion) region = loc.marketRegion;
-    } catch { /* skip */ }
-    const key = `commons:providers:${provider}:${region}`;
-    const record = {
-      resolutionDays,
-      signalType: signal.type || "unknown",
-      resolvedAt: new Date(resolved).toISOString(),
-    };
-    await redis.lpush(key, JSON.stringify(record));
-    await redis.ltrim(key, 0, 99);
-  } catch (err) {
-    console.warn("[commons] write failed:", err?.message);
-  }
-}
+// Commons aggregation lives in commons.js (imported at file top) so
+// the import/tracking auto-resolve paths can call the same write
+// without a circular import. writeCommonsRecord is referenced in the
+// PATCH resolve flow below.
 
 async function handleSpend(req, res) {
   if (req.method !== "GET") {
