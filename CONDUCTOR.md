@@ -845,6 +845,13 @@ Per signal tap: 0 calls on cache hit, 1 Haiku call on miss (12h TTL).
 | `GOOGLE_PLACES_KEY` | `places.js` — extractSignalLocation (Places Text Search) |
 | `GOOGLE_MAPS_KEY` | `places.js` — getTravelTime (Distance Matrix). Falls back to `GOOGLE_PLACES_KEY` if the Maps API is enabled on the same key |
 | `EVENTBRITE_API_KEY` | `events.js` — fetchLocalEvents (private OAuth token from eventbrite.com/account/api-keys) |
+| `MICROSOFT_CLIENT_ID` | `outlook/*` + `outlook-import.js` + `outlook-token.js` — Microsoft Entra app client id |
+| `MICROSOFT_CLIENT_SECRET` | Microsoft Entra app secret. Auth flow returns 500 with a clear error when either of these is unset |
+| `OUTLOOK_REDIRECT_URI` | Optional override. Defaults to `https://conductor-ivory.vercel.app/api/outlook/callback` |
+| `ENCRYPTION_KEY` | `imap-import.js` — 64-char hex (or 32 raw bytes). Generate with `openssl rand -hex 32`. The IMAP connect endpoint refuses to persist credentials when this is missing |
+| `RING_CLIENT_ID` | `ring/*` + `ring-token.js` — Ring developer client id |
+| `RING_CLIENT_SECRET` | Ring developer client secret |
+| `RING_REDIRECT_URI` | Optional override. Defaults to `https://conductor-ivory.vercel.app/api/ring/callback` |
 
 Each integration is credential-gated and degrades silently to a no-op
 when the relevant key isn't set. Add a key + redeploy → the feature
