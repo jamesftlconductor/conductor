@@ -224,6 +224,23 @@ export default async function handler(req, res) {
     }
   }
 
+  if (action === "deepScan") {
+    // Manual trigger for the heavyweight deep-scan path. Surfaces the
+    // raw stats object — the worker normally invokes this via
+    // runContactsDeepJob during onboard fan-out. Calling it directly
+    // is fine: writes are idempotent (existing crew unchanged,
+    // candidates overwrite same key, network candidates SADD'd).
+    try {
+      const stats = await runContactsDeepScan(userId);
+      return res.status(200).json({ ok: true, ...stats });
+    } catch (err) {
+      return res.status(502).json({
+        ok: false,
+        error: err?.message || "contacts deep scan failed",
+      });
+    }
+  }
+
   if (action === "match") {
     const { query } = req.body || {};
     if (!query || !String(query).trim()) {
