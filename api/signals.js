@@ -2783,6 +2783,51 @@ async function handlePriorities(req, res) {
   return res.status(405).json({ error: "Method not allowed" });
 }
 
+// Hobbies / joie-de-vivre layer. Stored at household:{id}:hobbies as
+// { values: [...], setAt }. Allowed values are gated by HOBBY_KEYS so a
+// rogue client can't pollute the prompt with arbitrary strings. On
+// save, we bust the saver's currentTakeoff cache so the next brief
+// regenerates with the new hobby context — household members on cached
+// briefs will refresh naturally as their 6h TTLs expire.
+const HOBBY_KEYS = new Set([
+  "water", "music", "food", "golf", "fitness",
+  "art", "travel", "sports", "outdoors", "film",
+  "wine", "cycling", "books", "gaming", "wellness",
+]);
+
+async function handleHobbies(req, res) {
+  const userId = req.method === "GET" ? req.query?.userId : req.body?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+  const key = `household:${householdId}:hobbies`;
+  if (req.method === "GET") {
+    const raw = await redis.get(key);
+    const parsed = safeJson(raw);
+    const values = Array.isArray(parsed?.values) ? parsed.values : [];
+    return res.status(200).json({ ok: true, hobbies: values });
+  }
+  if (req.method === "POST") {
+    const { hobbies } = req.body || {};
+    if (!Array.isArray(hobbies)) {
+      return res.status(400).json({ error: "hobbies (array) required" });
+    }
+    const sanitized = hobbies
+      .map((h) => (typeof h === "string" ? h.trim().toLowerCase() : null))
+      .filter((h) => h && HOBBY_KEYS.has(h));
+    await redis.set(key, JSON.stringify({
+      values: sanitized,
+      setAt: new Date().toISOString(),
+    }));
+    // Bust this user's cached brief so the next /api/brief call sees
+    // the updated hobbies. Other household members refresh on TTL.
+    await redis.del(`user:${userId}:currentTakeoff`).catch(() => {});
+    return res.status(200).json({ ok: true, household: householdId, hobbies: sanitized });
+  }
+  res.setHeader("Allow", "GET, POST");
+  return res.status(405).json({ error: "Method not allowed" });
+}
+
 async function handleExport(req, res) {
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
@@ -3972,6 +4017,10 @@ export default async function handler(req, res) {
 
     if (queryType === "priorities" || bodyType === "priorities") {
       return handlePriorities(req, res);
+    }
+
+    if (queryType === "hobbies" || bodyType === "hobbies") {
+      return handleHobbies(req, res);
     }
 
     if (queryType === "recurringEvents" || bodyType === "recurringEvents") {

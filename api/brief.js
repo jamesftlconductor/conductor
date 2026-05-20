@@ -4139,6 +4139,65 @@ ${isSingleMember
       console.warn("[brief] priorities rule failed:", err?.message);
     }
 
+    // Household hobbies — joie-de-vivre layer. Stored at
+    // household:{id}:hobbies (POST /api/signals?type=hobbies). On quiet
+    // days we want the brief to surface invitations, not obligations,
+    // and the prompt addendum below tells Claude how to frame them.
+    // We also opportunistically enrich with surf conditions when 'water'
+    // is selected and the household has coords — Claude can choose to
+    // lift the conditions as an invitation when load is light/clear.
+    try {
+      const rawHobbies = await redis.get(`household:${householdId}:hobbies`);
+      const hobbiesParsed = rawHobbies
+        ? (typeof rawHobbies === "string" ? JSON.parse(rawHobbies) : rawHobbies)
+        : null;
+      const hobbies = Array.isArray(hobbiesParsed?.values) ? hobbiesParsed.values : [];
+      if (hobbies.length > 0) {
+        const HOBBY_LABELS = {
+          water: "water", music: "music", food: "food & dining", golf: "golf",
+          fitness: "fitness", art: "art", travel: "travel", sports: "sports",
+          outdoors: "outdoors", film: "film", wine: "wine & spirits",
+          cycling: "cycling", books: "books", gaming: "gaming", wellness: "wellness",
+        };
+        const labelled = hobbies.map((h) => HOBBY_LABELS[h] || h);
+
+        // Best-effort surf conditions when 'water' is chosen and we have
+        // coords. Wrapped tightly so a NOAA hiccup never blocks the brief.
+        let surfNote = "";
+        try {
+          if (hobbies.includes("water") && householdLocation?.lat && householdLocation?.lon) {
+            const { getSurfConditions } = await import("./hobbies.js");
+            const surf = await getSurfConditions(
+              householdLocation.lat,
+              householdLocation.lon,
+              hobbies
+            );
+            if (surf && surf.conditions) {
+              const whTxt = typeof surf.waveHeight === "number"
+                ? `${surf.waveHeight.toFixed(1)}ft seas`
+                : "";
+              const windTxt = surf.windDirection && surf.windSpeed
+                ? `, wind ${surf.windDirection} ${Math.round(surf.windSpeed)}mph`
+                : "";
+              surfNote = `\nCURRENT MARINE: ${surf.conditions.toUpperCase()} (${whTxt}${windTxt}). Lift this only as an invitation on light/clear days.`;
+            }
+          }
+        } catch (err) {
+          console.warn("[brief] surf enrichment failed:", err?.message);
+        }
+
+        const hobbyRule = [
+          `- HOUSEHOLD HOBBIES AND INTERESTS: ${labelled.join(", ")}.`,
+          `  On quiet days (signalLoad is 'light' or 'clear'): surface one relevant opportunity from local events or conditions. Frame as an invitation, not an obligation. "The surf is up at Sebastian Inlet this weekend." not "You should go surfing." "Khruangbin tickets go on sale Friday." not "Buy tickets."`,
+          `  On normal days: hobby signals may appear below brief obligations if space allows. Never let hobby signals crowd out urgent household signals.`,
+          `  Hobby signals get a different visual treatment — not a chip, a quiet observation. The brief closes with the opportunity rather than opening with it.${surfNote}`,
+        ].join("\n");
+        composedRules = `${composedRules}\n${hobbyRule}`;
+      }
+    } catch (err) {
+      console.warn("[brief] hobbies rule failed:", err?.message);
+    }
+
     // Quiet day detection — when there's genuinely nothing in motion,
     // we deserve a different brief shape rather than fabricating prose
     // around emptiness. Conditions:
