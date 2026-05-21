@@ -574,6 +574,200 @@ Rules: warm but not effusive. Honest. Maximum 4 sentences. Never clinical. This 
 // Same Haiku pattern as Week in Review but spans the whole month
 // (from day 1 in ET). Returns null on any non-last-day or on empty
 // memory months so the mobile renderer can hide the section.
+// Evening cards — appear at the bottom of Clearance only. Each card is
+// best-effort: a single card failure returns null and the others ship.
+// The mobile renderer filters nulls so the visible stack is exactly
+// what we have to say tonight, no skeleton rows.
+//
+// Cards:
+//   1. quick_actions  — sub-2-minute resolvable signals
+//   2. opportunity    — hobby-tied invitation (skip when no hobbies set)
+//   3. suppressed     — items held back from brief (over-suppressed or overdue)
+//   4. observation    — one warm sentence about the household, Haiku-generated
+async function generateEveningCards(householdId, context) {
+  const { signals, allDeadlines } = context;
+  const cards = [];
+
+  // Card 1: quick_actions — signals the user could clear in under 2 minutes.
+  // Heuristic: any signal with a URL/confirmationNumber, or any signal not
+  // marked recurring (those can be snoozed without consequence). Top 3.
+  try {
+    const candidates = (signals || [])
+      .filter((s) => !s.state || s.state === "incoming" || s.state === "active")
+      .filter((s) => s.confirmationNumber || s.url || s.recurring === false || !s.recurring)
+      .slice(0, 3);
+    if (candidates.length > 0) {
+      cards.push({
+        type: "quick_actions",
+        items: candidates.map((s) => ({
+          signalId: s.id,
+          description: s.description || "Unknown signal",
+          action: s.confirmationNumber ? "Confirm" : s.url ? "Open" : "Snooze",
+        })),
+      });
+    }
+  } catch (err) {
+    console.warn("[eveningCards] quick_actions failed:", err?.message || err);
+  }
+
+  // Card 2: opportunity — gated on hobbies. Falls through to surf/marine
+  // when 'water' is selected + coords are available; otherwise picks a
+  // hobby keyword and surfaces a generic invitation phrasing. Skip
+  // entirely when no hobbies are set.
+  try {
+    const rawHobbies = await redis.get(`household:${householdId}:hobbies`);
+    const parsed = rawHobbies
+      ? (typeof rawHobbies === "string" ? JSON.parse(rawHobbies) : rawHobbies)
+      : null;
+    const hobbies = Array.isArray(parsed?.values) ? parsed.values : [];
+    if (hobbies.length > 0) {
+      let opportunity = null;
+      if (hobbies.includes("water") && context.location?.lat && context.location?.lon) {
+        try {
+          const { getSurfConditions } = await import("./hobbies.js");
+          const surf = await getSurfConditions(
+            context.location.lat,
+            context.location.lon,
+            hobbies
+          );
+          if (surf && (surf.conditions === "excellent" || surf.conditions === "good")) {
+            const wh = typeof surf.waveHeight === "number"
+              ? `${surf.waveHeight.toFixed(1)}ft seas`
+              : "decent surf";
+            const wind = surf.windDirection && surf.windSpeed
+              ? `, ${surf.windDirection} ${Math.round(surf.windSpeed)}mph wind`
+              : "";
+            opportunity = {
+              type: "opportunity",
+              title: "TONIGHT / THIS WEEKEND",
+              description: `${surf.conditions === "excellent" ? "Looks excellent for the water" : "Conditions are good for the water"} — ${wh}${wind}. Worth keeping open.`,
+              ctaText: "Got it",
+              ctaAction: "ack",
+            };
+          }
+        } catch { /* fall through */ }
+      }
+      // Generic hobby fallback when surf-specific didn't trigger. Picks
+      // the first hobby as an anchor for a soft invitation; the brief's
+      // synthesis already handles the more-tailored "what does the week
+      // offer" framing.
+      if (!opportunity) {
+        const lead = hobbies[0];
+        const phrases = {
+          music: "Worth scanning the city calendar this weekend — something usually surfaces.",
+          food: "Resy and Tock are quiet right now — a good week to lock in a Saturday spot.",
+          golf: "Tee times for the weekend are still open at most courses around the area.",
+          fitness: "A studio class block this week could be worth booking ahead.",
+          art: "Worth checking what's hanging at the local galleries this weekend.",
+          travel: "Flight prices for the next month-out window tend to drop midweek.",
+          sports: "Take a look at this weekend's local games — tickets ease up after Friday.",
+          outdoors: "Trails should be in good shape this weekend — worth keeping a window open.",
+          film: "A few new releases land this weekend — a Friday night could pay for itself.",
+          wine: "Tasting events around town pick up on weekends — easy to slot one in.",
+          cycling: "Routes look clear for a Saturday ride if the weather holds.",
+          books: "A quiet hour with the book that's been waiting on the shelf isn't a bad use of tonight.",
+          gaming: "An evening on the couch with whatever's in the queue counts as a real choice.",
+          wellness: "An early bedtime or a long walk after dinner — both count.",
+        };
+        const text = phrases[lead] || "There's room in the week to make time for what you actually enjoy.";
+        opportunity = {
+          type: "opportunity",
+          title: "TONIGHT / THIS WEEKEND",
+          description: text,
+          ctaText: "Got it",
+          ctaAction: "ack",
+        };
+      }
+      if (opportunity) cards.push(opportunity);
+    }
+  } catch (err) {
+    console.warn("[eveningCards] opportunity failed:", err?.message || err);
+  }
+
+  // Card 3: suppressed — signals briefCount >= 5 (Conductor surfaced
+  // it five mornings and the user hasn't acted, so by definition it
+  // got de-prioritized in subsequent briefs) + vault items 60+ days
+  // past renewal. Top 3.
+  try {
+    const items = [];
+    for (const s of (signals || [])) {
+      if (typeof s.briefCount === "number" && s.briefCount >= 5) {
+        items.push({
+          description: s.description || "Unknown signal",
+          daysSuppressed: s.briefCount,
+          action: "ack",
+        });
+      }
+      if (items.length >= 3) break;
+    }
+    if (items.length < 3) {
+      const now = Date.now();
+      for (const d of (allDeadlines || [])) {
+        const renew = d.renewalDate ? Date.parse(d.renewalDate) : NaN;
+        if (!isNaN(renew) && now - renew > 60 * 24 * 60 * 60 * 1000) {
+          items.push({
+            description: d.description || "Overdue deadline",
+            daysSuppressed: Math.floor((now - renew) / (24 * 60 * 60 * 1000)),
+            action: "ack",
+          });
+          if (items.length >= 3) break;
+        }
+      }
+    }
+    if (items.length > 0) {
+      cards.push({ type: "suppressed", items });
+    }
+  } catch (err) {
+    console.warn("[eveningCards] suppressed failed:", err?.message || err);
+  }
+
+  // Card 4: observation — one honest line about the household.
+  // Generated via Claude Haiku. The prompt is intentionally short so
+  // a 200-token reply is the upper bound.
+  try {
+    const streakRaw = await redis.get(`household:${householdId}:streakData`);
+    const streak = streakRaw
+      ? (typeof streakRaw === "string" ? JSON.parse(streakRaw) : streakRaw)
+      : null;
+    const observationPrompt = `Write ONE warm, honest observation about a household based on these stats. Plain text, one sentence, no preamble, no markdown, never effusive. If nothing stands out, observe something quiet about the day.
+
+Current streak: ${streak?.currentStreak ?? 0} days
+Peak streak: ${streak?.peakStreak ?? 0} days
+Active signals: ${(signals || []).length}
+Open deadlines: ${(allDeadlines || []).length}`;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (apiKey) {
+      const resp = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 120,
+          messages: [{ role: "user", content: observationPrompt }],
+        }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        const text = data?.content?.[0]?.text?.trim() || "";
+        if (text) {
+          cards.push({
+            type: "observation",
+            text: text.replace(/^["'“”]+|["'“”]+$/g, "").trim(),
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[eveningCards] observation failed:", err?.message || err);
+  }
+
+  return cards;
+}
+
 async function generateMonthInReview(householdId) {
   try {
     // Last-day detection in America/New_York: a day is the last of
@@ -1279,7 +1473,16 @@ ${isSingleMember
     // for a warm one-paragraph reflection. Returns null on non-Sunday or
     // any failure — the field is always present in the response so the
     // mobile renderer can decide whether to show the section.
-    const [segments, transparency, weekInReview, monthInReview, yearInReview] = await Promise.all([
+    // Best-effort household location for evening-cards opportunity gating.
+    // The surf-conditions branch needs lat/lon; everything else short-
+    // circuits gracefully when location lookup fails.
+    let eveningLocation = null;
+    try {
+      const { loadHouseholdLocation } = await import("./location.js");
+      eveningLocation = await loadHouseholdLocation(householdId);
+    } catch { /* fall through — non-water cards still ship */ }
+
+    const [segments, transparency, weekInReview, monthInReview, yearInReview, eveningCards] = await Promise.all([
       tagBriefSegments(brief, tagSet),
       generateTransparency(brief, {
         resolvedToday,
@@ -1295,6 +1498,14 @@ ${isSingleMember
       generateWeekInReview(householdId, await loadHouseholdName(householdId)),
       generateMonthInReview(householdId),
       generateYearInReview(householdId),
+      generateEveningCards(householdId, {
+        signals,
+        allDeadlines,
+        location: eveningLocation,
+      }).catch((err) => {
+        console.warn("[clearance] eveningCards top-level failed:", err?.message || err);
+        return [];
+      }),
     ]);
 
     // Write narrated signal snapshots into the shared briefedToday hash so the
@@ -1338,7 +1549,21 @@ ${isSingleMember
       await redis.expire(clearanceBriefedKey, 14 * 60 * 60);
     }
 
-    const clearanceResponse = { brief, segments, transparency, weekInReview, monthInReview, yearInReview, household: householdId, user: userName, isSingleMember };
+    const clearanceResponse = {
+      brief,
+      segments,
+      transparency,
+      weekInReview,
+      monthInReview,
+      yearInReview,
+      // Evening cards appear at the bottom of Clearance in the mobile
+      // app. The renderer filters out any nulls/empties, so we ship
+      // whatever generateEveningCards produced — even if that's [].
+      eveningCards: Array.isArray(eveningCards) ? eveningCards.filter(Boolean) : [],
+      household: householdId,
+      user: userName,
+      isSingleMember,
+    };
 
     if (userId) {
       await redis.set(

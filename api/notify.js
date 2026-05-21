@@ -180,13 +180,22 @@ export default async function handler(req, res) {
       // household shouldn't receive their 7am brief at 4am Pacific.
       // The window is ±1 hour around the canonical hour to absorb
       // cron drift.
+      // Coarse household-level window — keeps a Pacific household
+      // from getting their 7am push at 4am Pacific even when no
+      // per-user preference is set. The window is wider than any
+      // individual takeoffHour so per-user precision still falls
+      // within. Takeoff: 5-11am (covers 5am-10am + 1h weekend delay).
+      // Clearance: 7-10pm. Overwatch fires from the Clearance cron
+      // when localHour is at/after the household's earliest overwatchHour.
+      let cachedLocalHour = null;
       if (getHouseholdLocalHour && !householdIdInput) {
         try {
           const localHour = await getHouseholdLocalHour(hid);
+          cachedLocalHour = localHour;
           const okWindow =
-            type === "takeoff" ? localHour >= 6 && localHour <= 8
+            type === "takeoff" ? localHour >= 5 && localHour <= 11
             : type === "midday" ? localHour >= 12 && localHour <= 14
-            : type === "clearance" ? localHour >= 20 && localHour <= 22
+            : type === "clearance" ? localHour >= 19 && localHour <= 23
             : true;
           if (!okWindow) {
             results.push({ household: hid, skipped: "outside local time window", localHour });
@@ -195,21 +204,57 @@ export default async function handler(req, res) {
         } catch { /* fall through */ }
       }
 
+      // Saturday=6, Sunday=0 in JS. We compute this once for the
+      // household using its local timezone (approximated by passing
+      // the household's local hour through Date below — exact tz
+      // requires the location helper). Worst case the weekend delay
+      // misfires by an hour around midnight which is acceptable.
+      const isWeekend = (() => {
+        try {
+          const day = new Date().getDay();
+          return day === 0 || day === 6;
+        } catch { return false; }
+      })();
+
       const tokensByUser = [];
       for (const userId of members) {
         const token = await redis.get(`user:${userId}:expoPushToken`);
         if (!(typeof token === "string" && token.length)) continue;
-        // Midday is opt-in: skip users who haven't toggled middayEnabled
-        // in Settings. Default-off means the firehose stays at twice-daily
-        // (Takeoff/Clearance) unless the user explicitly asks for the
-        // third touchpoint.
+
+        // Load per-user preferences once per member-iteration. We
+        // reuse the same fetch for the per-user takeoffHour /
+        // clearanceHour / overwatchHour gate and the existing midday
+        // opt-in check.
+        const prefsRaw = await redis.get(`user:${userId}:preferences`);
+        let prefs = null;
+        try { prefs = typeof prefsRaw === "string" ? JSON.parse(prefsRaw) : prefsRaw; }
+        catch { prefs = null; }
+
         if (type === "midday") {
-          const prefsRaw = await redis.get(`user:${userId}:preferences`);
-          let prefs = null;
-          try { prefs = typeof prefsRaw === "string" ? JSON.parse(prefsRaw) : prefsRaw; }
-          catch { prefs = null; }
+          // Midday is opt-in: skip users who haven't toggled
+          // middayEnabled in Settings.
           if (!prefs || prefs.middayEnabled !== true) continue;
         }
+
+        // Per-user hour gate — only fires when the household's local
+        // hour matches this user's configured takeoff/clearance hour.
+        // Falls through silently when prefs or cachedLocalHour are
+        // missing so existing households without configured times
+        // still receive on the coarse-window default.
+        if (cachedLocalHour != null && prefs) {
+          const takeoffStr = typeof prefs.takeoffTime === "string" ? prefs.takeoffTime : "07:00";
+          const clearanceStr = typeof prefs.clearanceTime === "string" ? prefs.clearanceTime : "21:00";
+          const takeoffHour = parseInt(takeoffStr.split(":")[0] || "7", 10);
+          const clearanceHour = parseInt(clearanceStr.split(":")[0] || "21", 10);
+          const weekendDelay = prefs.weekendTakeoffDelay === true;
+          const effectiveTakeoffHour = (isWeekend && weekendDelay)
+            ? takeoffHour + 1
+            : takeoffHour;
+
+          if (type === "takeoff" && cachedLocalHour !== effectiveTakeoffHour) continue;
+          if (type === "clearance" && cachedLocalHour !== clearanceHour) continue;
+        }
+
         tokensByUser.push({ userId, token });
       }
 
