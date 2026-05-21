@@ -4359,6 +4359,38 @@ ${isSingleMember
       console.warn("[brief] hobbies rule failed:", err?.message);
     }
 
+    // Seasonal personality — one-line context appended to the
+    // prompt rules. Falls through silently for markets we don't
+    // have a map for; other regions can be added without touching
+    // the brief assembly logic. The rule tells the model to lift
+    // this naturally only when it actually shapes a signal.
+    try {
+      const SEASONAL_CONTEXT = {
+        south_florida: {
+          1:  "January in Fort Lauderdale. Snowbird season peak. Traffic is 40% heavier.",
+          2:  "February. Still peak season. The weather is perfect and everyone knows it.",
+          3:  "March. Spring break approaches. Beach traffic building.",
+          4:  "April. Last of the good weather before summer arrives.",
+          5:  "May. Summer is coming. The humidity is beginning to have opinions.",
+          6:  "June 1st is hurricane season. The Conductor is paying attention to the Atlantic.",
+          7:  "July. Full South Florida summer. The humidity is not subtle.",
+          8:  "August. Storm season peak. The Conductor is watching the tropics.",
+          9:  "September. Still hurricane season. Still watching.",
+          10: "October. Boat Show month. Downtown Fort Lauderdale becomes complicated.",
+          11: "November. Season begins. The snowbirds return. Traffic resumes.",
+          12: "December. Holiday season. The Conductor notes the calendar is full.",
+        },
+      };
+      const region = householdLocation?.marketRegion || "south_florida";
+      const month = new Date().getMonth() + 1;
+      const seasonal = SEASONAL_CONTEXT[region]?.[month];
+      if (seasonal) {
+        composedRules = `${composedRules}\n- SEASONAL AWARENESS: ${seasonal} Reference this naturally only when the season genuinely affects something in the brief. Never force it.`;
+      }
+    } catch (err) {
+      console.warn("[brief] seasonal rule failed:", err?.message || err);
+    }
+
     // Quiet day detection — when there's genuinely nothing in motion,
     // we deserve a different brief shape rather than fabricating prose
     // around emptiness. Conditions:
@@ -4785,6 +4817,90 @@ Never manufacture urgency. Never apologize for having nothing to say. The quiet 
       }
     }
 
+    // ── Personality layer additions ──
+
+    // Streak milestone observation — surfaced when the household
+    // hits one of the named thresholds. Stored as a separate
+    // streakObservation field so the mobile renderer can give it
+    // distinct treatment (brass color, slight size bump per spec).
+    let streakObservation = null;
+    try {
+      const streakRaw = await redis.get(`household:${householdId}:streakData`);
+      const data = streakRaw
+        ? (typeof streakRaw === "string" ? JSON.parse(streakRaw) : streakRaw)
+        : null;
+      const cur = Number(data?.currentStreak) || 0;
+      const milestones = {
+        7:   "Seven days. The Conductor notes the streak is real.",
+        14:  "Two weeks. The household has found its rhythm.",
+        21:  "21 days. Most habits form in less time than this.",
+        30:  "30 days. The Conductor doesn't often say this: well done.",
+        60:  "Two months. The Conductor has been watching for 60 days. It approves of what it sees.",
+        90:  "90 days. The Conductor knows this household now.",
+        100: "100 days. The Conductor marks this quietly.",
+        365: "One year. The Conductor has been watching your household for 365 days. It has been, by most measures, worth watching.",
+      };
+      if (milestones[cur]) {
+        // Acknowledged-once latch — same household won't see the
+        // milestone twice if their streak hovers at the threshold
+        // (resolve a signal at 30 days, signal expires, resolve
+        // another, streak ticks back to 30). Keyed by milestone
+        // value so future thresholds don't suppress.
+        const ackKey = `household:${householdId}:streakAck:${cur}`;
+        const already = await redis.get(ackKey).catch(() => null);
+        if (!already) {
+          streakObservation = milestones[cur];
+          await redis.set(ackKey, "1", { ex: 90 * 24 * 60 * 60 }).catch(() => null);
+        }
+      }
+    } catch (err) {
+      console.warn("[brief] streak milestone failed:", err?.message || err);
+    }
+
+    // Radar-clear sign-off — when there are genuinely zero active
+    // signals, append the special quiet-day closing. Skipped if
+    // isFirstRun (the firstRun noSignals copy is already custom).
+    if (!isFirstRun && synthesisState.signalLoad === "clear") {
+      const radarClearSignOff =
+        "The Conductor has nothing to report. The radar is clear. This is genuinely rare. The Conductor recommends being outside more than you currently are.";
+      finalBrief = `${finalBrief.trim()}\n\n${radarClearSignOff}`;
+    }
+
+    // Brief sign-off — ~40% chance of appending a one-liner, never
+    // the same as yesterday's. Suppressed when isFirstRun /
+    // isFirstBrief / red-alert / radar-clear so the line lands at
+    // the right moment, not on top of another sign-off. Persisted
+    // at household:{id}:lastSignOff (no TTL — we want the
+    // anti-repeat to last across many days).
+    try {
+      const suppressSignOff =
+        isFirstRun
+        || isFirstBrief
+        || synthesisState.signalLoad === "clear"
+        || synthesisState.synthesisFlags?.includes?.("red_alert");
+      if (!suppressSignOff && Math.random() < 0.4) {
+        const SIGN_OFFS = [
+          "The Conductor has the rest.",
+          "It's safe to look away.",
+          "The radar is yours.",
+          "The Conductor is watching.",
+          "Nothing else from The Conductor today.",
+          "That's what matters. The rest can wait.",
+          "The Conductor has everything else.",
+          "Go. The Conductor is here.",
+        ];
+        const lastSignOff = await redis.get(`household:${householdId}:lastSignOff`).catch(() => null);
+        const pool = SIGN_OFFS.filter((s) => s !== lastSignOff);
+        const pick = pool[Math.floor(Math.random() * pool.length)];
+        if (pick) {
+          finalBrief = `${finalBrief.trim()}\n\n${pick}`;
+          await redis.set(`household:${householdId}:lastSignOff`, pick).catch(() => null);
+        }
+      }
+    } catch (err) {
+      console.warn("[brief] sign-off failed:", err?.message || err);
+    }
+
     // Spoken summary — 2-sentence speech-friendly condensation of
     // the brief for the morning Takeoff voice playback. Best-effort;
     // null when the Haiku call fails (mobile falls back to silent).
@@ -4875,6 +4991,9 @@ Return only the spoken text.`,
         && !highGrief
         && !highStress
         && !hasActiveAlert
+        // Never offer a joke on the household's first brief — that
+        // moment belongs to the onboarding morning question.
+        && !isFirstBrief
         && (loadHeavyish || healthDragging);
 
       if (eligible) {
@@ -4971,6 +5090,7 @@ Return only the offer line.`;
       morningQuestion,
       jokeOffer,
       jokeOffered,
+      streakObservation,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for
