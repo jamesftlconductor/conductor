@@ -1627,13 +1627,28 @@ async function handleUrgentCount(req, res) {
   // Cache key uses the YYYY-MM-DD date so a 5-min entry at 11:58pm
   // doesn't poison the next morning's badge. Per-user (not per-
   // household) so cross-member views stay separate.
+  //
+  // The shape changed in the weather-vane build to also carry the
+  // dominant emotionalState/Intensity so the minimap border color +
+  // pulse speed can flip without a second roundtrip. Old cache entries
+  // (pure numbers) are still accepted on read for graceful migration —
+  // the missing fields fall through to neutral/low and the minimap
+  // reads as the 'busy' or 'clear' state.
   const dateKey = new Date().toISOString().slice(0, 10);
   const cacheKey = `user:${userId}:urgentCount:${dateKey}`;
   const cached = await redis.get(cacheKey).catch(() => null);
   if (cached != null) {
+    if (typeof cached === "object" && cached !== null && typeof cached.count === "number") {
+      return res.status(200).json({ ...cached, cached: true });
+    }
     const n = typeof cached === "number" ? cached : parseInt(String(cached), 10);
     if (!isNaN(n)) {
-      return res.status(200).json({ count: n, cached: true });
+      return res.status(200).json({
+        count: n,
+        emotionalState: "neutral",
+        emotionalIntensity: "low",
+        cached: true,
+      });
     }
   }
 
@@ -1642,11 +1657,13 @@ async function handleUrgentCount(req, res) {
   const tomorrowMs = now + 48 * 60 * 60 * 1000; // generous "tomorrow" window
   const deadline48h = now + 48 * 60 * 60 * 1000;
   let count = 0;
+  const activeSignals = [];
   for (const r of rawSignals || []) {
     let s;
     try { s = typeof r === "string" ? JSON.parse(r) : r; } catch { continue; }
     if (!s) continue;
     if (s.state && s.state !== "incoming" && s.state !== "active") continue;
+    activeSignals.push(s);
     let urgent = false;
     const etaMs = s.eta ? Date.parse(s.eta) : NaN;
     if (!isNaN(etaMs) && etaMs <= tomorrowMs) urgent = true;
@@ -1655,11 +1672,29 @@ async function handleUrgentCount(req, res) {
     if (typeof s.briefCount === "number" && s.briefCount >= 3) urgent = true;
     if (urgent) count++;
   }
+
+  // Derive the dominant emotional state from active high-intensity
+  // signals — same logic as brief.js's synthesizeHouseholdState
+  // but inlined here so the badge endpoint stays a single read.
+  const highIntensity = activeSignals.filter((s) => s?.emotionalIntensity === "high");
+  // Grief always wins, then stress, then milestone joy — matches the
+  // brief.js calibration order. Falls through to 'neutral' / 'low'
+  // when nothing high-intensity is in motion.
+  const grief = highIntensity.find((s) => s?.emotionalValence === "grief");
+  const stress = highIntensity.find((s) => s?.emotionalValence === "stressful");
+  const joy = highIntensity.find((s) => s?.emotionalValence === "joyful");
+  const dominant = grief || stress || joy || null;
+  const payload = {
+    count,
+    emotionalState: dominant ? (dominant.emotionalValence || "neutral") : "neutral",
+    emotionalIntensity: dominant ? (dominant.emotionalIntensity || "low") : "low",
+  };
+
   // 5-minute TTL — the badge polls every 5min on mobile, so this is
   // the right cadence. Set with EX so even a same-key SET refreshes
   // the window.
-  await redis.set(cacheKey, count, { ex: 300 }).catch(() => null);
-  return res.status(200).json({ count, cached: false });
+  await redis.set(cacheKey, JSON.stringify(payload), { ex: 300 }).catch(() => null);
+  return res.status(200).json({ ...payload, cached: false });
 }
 
 async function handleSpend(req, res) {

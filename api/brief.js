@@ -2699,6 +2699,40 @@ export default async function handler(req, res) {
       }
     }
 
+    // Red Alert override — when an active alert is in motion, the
+    // brief is replaced with a single-line directive and nothing
+    // else. No Pulse, no Read, no segments, no extras. Mobile root
+    // layout shows the full fullscreen overlay; this short circuit
+    // exists so the in-app brief surface doesn't compete with it.
+    try {
+      const rawAlert = await redis.get(`household:${householdId}:activeAlert`);
+      const activeAlert = rawAlert
+        ? (typeof rawAlert === "string" ? JSON.parse(rawAlert) : rawAlert)
+        : null;
+      if (activeAlert && activeAlert.description) {
+        const briefText = `🔴 RED ALERT — ${activeAlert.description}.`;
+        const response = {
+          brief: briefText,
+          pulse: `Conductor Red Alert is active. ${activeAlert.description}.`,
+          pulseFlags: ["red_alert"],
+          segments: [{ type: "text", content: briefText }],
+          transparency: null,
+          theRead: null,
+          handoff: null,
+          alert: activeAlert,
+          household: { id: householdId },
+        };
+        if (userId) {
+          // Don't cache the override — the alert can be dismissed at
+          // any moment and the steady-state brief should reappear on
+          // the next call without waiting for the 6h TTL.
+        }
+        return res.status(200).json(response);
+      }
+    } catch (err) {
+      console.warn("[brief] red alert check failed:", err?.message || err);
+    }
+
     // Load location FIRST so weather fetch uses the household's actual
     // coords. Falls through to LOCATION_FALLBACK inside fetchWeather
     // when no location is stored — keeps unconfigured households on the
