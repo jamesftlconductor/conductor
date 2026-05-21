@@ -765,6 +765,90 @@ Open deadlines: ${(allDeadlines || []).length}`;
     console.warn("[eveningCards] observation failed:", err?.message || err);
   }
 
+  // Card 5: joke_offer — the in-between zone where the evening has
+  // been hard but not catastrophic. Same eligibility rules as
+  // brief.js (medium-intensity stress, no high-intensity stress or
+  // grief, no active alert) and the same once-per-day daily key so
+  // the user isn't offered both a morning brief joke and an evening
+  // card joke on the same day.
+  try {
+    const signals = context.signals || [];
+    const mediumStress = signals.find(
+      (s) => s?.emotionalIntensity === "medium" && s?.emotionalValence === "stressful"
+    );
+    const highGrief = signals.some(
+      (s) => s?.emotionalIntensity === "high" && s?.emotionalValence === "grief"
+    );
+    const highStress = signals.some(
+      (s) => s?.emotionalIntensity === "high" && s?.emotionalValence === "stressful"
+    );
+    const hasActiveAlert = !!(await redis.get(`household:${householdId}:activeAlert`).catch(() => null));
+    // Clearance fires in the evening — we don't have synthesisState
+    // here, so the heuristic is signal count instead of signalLoad
+    // bucket. Anything north of 4 active signals at end-of-day is
+    // "the load is dragging" in this surface.
+    const loadHeavyish = signals.length >= 4;
+
+    const eligible = !!mediumStress && !highGrief && !highStress && !hasActiveAlert && loadHeavyish;
+
+    if (eligible) {
+      const dailyKey = `household:${householdId}:jokeOfferedToday`;
+      const alreadyOffered = await redis.get(dailyKey).catch(() => null);
+      if (!alreadyOffered) {
+        const offerPrompt = `The household is having a stressful but not catastrophic evening.
+Active signals: ${signals.length}
+The day is closing down.
+
+Write one understated offer line that gently offers a laugh.
+Don't say 'cheer up' or anything patronizing.
+The tone is: a trusted friend who noticed you're tired and has something that might help.
+Maximum 12 words. End with an em dash — The Conductor will show the joke on tap.
+
+Examples of the right tone:
+'Heavy day. The Conductor has one more thing if you need it —'
+'A lot in motion. Something lighter, if you want it —'
+
+Return only the offer line.`;
+        try {
+          const apiKey = process.env.ANTHROPIC_API_KEY;
+          if (apiKey) {
+            const resp = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-api-key": apiKey,
+                "anthropic-version": "2023-06-01",
+              },
+              body: JSON.stringify({
+                model: "claude-haiku-4-5-20251001",
+                max_tokens: 100,
+                messages: [{ role: "user", content: offerPrompt }],
+              }),
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              const text = (data?.content?.[0]?.text || "").trim().replace(/^["'“”]+|["'“”]+$/g, "");
+              if (text && text.length <= 120) {
+                cards.push({ type: "joke_offer", offer: text });
+                // Set midnight TTL daily key so a later/repeat call
+                // doesn't double up.
+                const now = new Date();
+                const nextMidnight = new Date(now);
+                nextMidnight.setUTCHours(24, 0, 0, 0);
+                const ttlSec = Math.max(60, Math.floor((nextMidnight.getTime() - now.getTime()) / 1000));
+                await redis.set(dailyKey, "1", { ex: ttlSec }).catch(() => null);
+              }
+            }
+          }
+        } catch (err) {
+          console.warn("[eveningCards] joke_offer haiku failed:", err?.message || err);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[eveningCards] joke_offer eligibility failed:", err?.message || err);
+  }
+
   return cards;
 }
 

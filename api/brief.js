@@ -4842,6 +4842,107 @@ Return only the spoken text.`,
       ? "What would make this week feel successful for your household?"
       : null;
 
+    // Emotional joke offer — the in-between zone where the household
+    // is having a hard but not catastrophic time. Surfaced rare
+    // enough to feel meaningful: medium-intensity stress dominant,
+    // no high-intensity stress/grief, no active red alert, and the
+    // load or health is dragging. Once-per-day cap via
+    // household:{id}:jokeOfferedToday with midnight TTL so the same
+    // household isn't offered twice on a single tough day.
+    let jokeOffer = null;
+    let jokeOffered = false;
+    try {
+      // Detect medium-intensity dominant stress directly from
+      // activeSignals rather than synthesisState (which currently
+      // only tracks high-intensity). High-intensity grief/stress
+      // anywhere in the active pool disqualifies — those days get
+      // the calibration block, not a joke.
+      const mediumStress = (activeSignals || []).find(
+        (s) => s?.emotionalIntensity === "medium" && s?.emotionalValence === "stressful"
+      );
+      const highGrief = (activeSignals || []).some(
+        (s) => s?.emotionalIntensity === "high" && s?.emotionalValence === "grief"
+      );
+      const highStress = (activeSignals || []).some(
+        (s) => s?.emotionalIntensity === "high" && s?.emotionalValence === "stressful"
+      );
+      const hasActiveAlert = !!(await redis.get(`household:${householdId}:activeAlert`).catch(() => null));
+      const loadHeavyish = synthesisState.signalLoad === "heavy" || synthesisState.signalLoad === "moderate";
+      const healthDragging = synthesisState.healthState === "low" || synthesisState.healthState === "poor";
+
+      const eligible =
+        !!mediumStress
+        && !highGrief
+        && !highStress
+        && !hasActiveAlert
+        && (loadHeavyish || healthDragging);
+
+      if (eligible) {
+        const dailyKey = `household:${householdId}:jokeOfferedToday`;
+        const alreadyOffered = await redis.get(dailyKey).catch(() => null);
+        if (!alreadyOffered) {
+          // Carried-forward count for the prompt — falls through to
+          // 0 when the array isn't populated yet on this path.
+          const cfCount = Array.isArray(carriedForwardSignals)
+            ? carriedForwardSignals.length
+            : 0;
+          const offerPrompt = `The household is having a stressful but not catastrophic time.
+Signals: ${synthesisState.signalLoad}
+Health: ${synthesisState.healthState || "not connected"}
+Carried forward signals: ${cfCount}
+
+Write one understated offer line that gently offers a laugh.
+Don't say 'cheer up' or anything patronizing.
+The tone is: a trusted friend who noticed you're tired and has something that might help.
+Maximum 12 words. End with an em dash — The Conductor will show the joke on tap.
+
+Examples of the right tone:
+'Heavy week. The Conductor has one more thing if you need it —'
+'A lot in motion. Something lighter, if you want it —'
+'Rough combination today. The Conductor noticed. Also —'
+'These signals have been waiting a while. So has this —'
+
+Return only the offer line.`;
+          try {
+            const haikuRes = await fetch("https://api.anthropic.com/v1/messages", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-api-key": process.env.ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+              },
+              body: JSON.stringify({
+                model: "claude-haiku-4-5-20251001",
+                max_tokens: 100,
+                messages: [{ role: "user", content: offerPrompt }],
+              }),
+            });
+            if (haikuRes.ok) {
+              const data = await haikuRes.json();
+              const text = (data?.content?.[0]?.text || "").trim();
+              if (text && text.length <= 120) {
+                jokeOffer = text.replace(/^["'“”]+|["'“”]+$/g, "").trim();
+                jokeOffered = true;
+                // Midnight TTL — compute seconds until next local
+                // midnight UTC-side. Slightly imprecise on DST days
+                // but close enough; the key isn't load-bearing past
+                // the daily window.
+                const now = new Date();
+                const nextMidnight = new Date(now);
+                nextMidnight.setUTCHours(24, 0, 0, 0);
+                const ttlSec = Math.max(60, Math.floor((nextMidnight.getTime() - now.getTime()) / 1000));
+                await redis.set(dailyKey, "1", { ex: ttlSec }).catch(() => null);
+              }
+            }
+          } catch (err) {
+            console.warn("[brief] joke offer Haiku failed:", err?.message || err);
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[brief] joke offer eligibility failed:", err?.message || err);
+    }
+
     const briefResponse = {
       brief: finalBrief,
       spokenSummary,
@@ -4868,6 +4969,8 @@ Return only the spoken text.`,
       maintenancePlanOffer: maintenancePlanOffer,
       isFirstBrief,
       morningQuestion,
+      jokeOffer,
+      jokeOffered,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for
