@@ -277,6 +277,37 @@ export default async function handler(req, res) {
         }
       }
 
+      // Sunday Clearance — symphony preview body. Replaces the
+      // first-sentence-of-brief approach with a count of instruments
+      // earned this week, because the symphony is the moment of
+      // Sunday and people open the app to hear it.
+      if (type === "clearance") {
+        try {
+          const weekday = new Date().toLocaleDateString("en-US", {
+            timeZone: "America/New_York",
+            weekday: "short",
+          });
+          if (weekday === "Sun") {
+            const { mondayAnchorISO, loadWeeklyAchievements } = await import("./signals.js");
+            const weekStart = mondayAnchorISO();
+            const record = await loadWeeklyAchievements(hid, weekStart);
+            const n = record.instrumentsEarned || 0;
+            if (n >= 7) {
+              sharedBody = "A full symphony this week. The Conductor is ready for Sunday.";
+            } else if (n >= 5) {
+              sharedBody = `${n} of 7 instruments earned this week. Your symphony plays tonight.`;
+            } else if (n >= 3) {
+              sharedBody = `${n} instruments this week. A measured composition.`;
+            } else if (n >= 1) {
+              sharedBody = `${n} instrument${n === 1 ? "" : "s"} earned. A quieter week — the music reflects it.`;
+            }
+            // n === 0 falls through to the per-user brief fetch.
+          }
+        } catch (err) {
+          console.warn("[notify] symphony preview failed:", err?.message || err);
+        }
+      }
+
       // Carry-forward suffix on Takeoff only — if anything was flagged in
       // last night's LAST CHANCE pool and is still active this morning
       // (the morning brief stamps it on the carriedForward set), nudge

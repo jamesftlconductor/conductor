@@ -4884,7 +4884,50 @@ Never manufacture urgency. Never apologize for having nothing to say. The quiet 
         const dayLine = daysSince
           ? `The Conductor has been watching your household for ${daysSince} days.`
           : `The Conductor has been watching your household this year.`;
-        finalBrief = `The last brief of the year. ${dayLine}\n\n${finalBrief.trim()}\n\nIt's been, by most measures, worth watching.`;
+
+        // Symphony highlight — walk the last ~52 weeks of weekly
+        // achievement records and surface the household's best.
+        // Best-effort; any failure leaves the close at the standard
+        // copy. Each lookup is a single redis GET so the worst-case
+        // cost is 52 reads which is still under a second.
+        let symphonyLine = "";
+        try {
+          let bestCount = -1;
+          let bestWeek = null;
+          let totalInstruments = 0;
+          const today = new Date();
+          for (let i = 0; i < 52; i++) {
+            const d = new Date(today);
+            d.setUTCDate(d.getUTCDate() - i * 7);
+            const wkStart = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - ((d.getUTCDay() + 6) % 7))).toISOString().slice(0, 10);
+            const raw = await redis.get(`household:${householdId}:weeklyAchievements:${wkStart}`).catch(() => null);
+            if (!raw) continue;
+            let record;
+            try { record = typeof raw === "string" ? JSON.parse(raw) : raw; }
+            catch { continue; }
+            const n = Number(record?.instrumentsEarned) || 0;
+            totalInstruments += n;
+            if (n > bestCount) { bestCount = n; bestWeek = wkStart; }
+          }
+          if (bestCount >= 5 && bestWeek) {
+            const friendly = (() => {
+              try {
+                return new Date(`${bestWeek}T12:00:00Z`).toLocaleDateString("en-US", {
+                  month: "long", day: "numeric",
+                });
+              } catch { return bestWeek; }
+            })();
+            symphonyLine = bestCount >= 7
+              ? `\n\nYour best week musically: ${friendly}. All seven instruments. The full symphony.`
+              : `\n\nYour best week musically: ${friendly}. ${bestCount} of 7 instruments earned.`;
+          } else if (totalInstruments > 0) {
+            symphonyLine = `\n\nYour household earned ${totalInstruments} instruments this year across the weeks.`;
+          }
+        } catch (err) {
+          console.warn("[brief] year symphony highlight failed:", err?.message || err);
+        }
+
+        finalBrief = `The last brief of the year. ${dayLine}\n\n${finalBrief.trim()}${symphonyLine}\n\nIt's been, by most measures, worth watching.`;
       }
     } catch (err) {
       console.warn("[brief] dec25/31 override failed:", err?.message || err);

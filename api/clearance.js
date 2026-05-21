@@ -1633,6 +1633,56 @@ ${isSingleMember
       await redis.expire(clearanceBriefedKey, 14 * 60 * 60);
     }
 
+    // Weekly Symphony — Sunday-only field. Pulls the household's
+    // current week of achievements + grief-week emotional state to
+    // pick major/minor key. Soundtrack assets are placeholders for
+    // now; mobile renders the instrument visualization regardless.
+    let weeklyAchievements = null;
+    try {
+      const weekday = new Date().toLocaleDateString("en-US", {
+        timeZone: "America/New_York",
+        weekday: "short",
+      });
+      if (weekday === "Sun") {
+        const {
+          mondayAnchorISO,
+          loadWeeklyAchievements,
+          symphonyVariationFor,
+          symphonySoundSequence,
+        } = await import("./signals.js");
+        const weekStart = mondayAnchorISO();
+        const record = await loadWeeklyAchievements(householdId, weekStart);
+        const variation = symphonyVariationFor(record.instrumentsEarned);
+        // Minor key when this week saw active grief in any signal.
+        let key = "major";
+        try {
+          const raw = await redis.lrange(`household:${householdId}:signals`, 0, 99);
+          const list = (raw || [])
+            .map((v) => { try { return typeof v === "string" ? JSON.parse(v) : v; } catch { return null; } })
+            .filter(Boolean);
+          if (list.some((s) => s?.emotionalValence === "grief")) key = "minor";
+        } catch { /* ignore */ }
+        weeklyAchievements = {
+          instruments: {
+            monday:    record.monday,
+            tuesday:   record.tuesday,
+            wednesday: record.wednesday,
+            thursday:  record.thursday,
+            friday:    record.friday,
+            saturday:  record.saturday,
+            sunday:    record.sunday,
+          },
+          instrumentsEarned: record.instrumentsEarned,
+          symphonyVariation: variation,
+          symphonyKey: key,
+          soundSequence: symphonySoundSequence(record),
+          weekStart: record.weekStart,
+        };
+      }
+    } catch (err) {
+      console.warn("[clearance] weeklyAchievements failed:", err?.message || err);
+    }
+
     const clearanceResponse = {
       brief,
       segments,
@@ -1644,6 +1694,7 @@ ${isSingleMember
       // app. The renderer filters out any nulls/empties, so we ship
       // whatever generateEveningCards produced — even if that's [].
       eveningCards: Array.isArray(eveningCards) ? eveningCards.filter(Boolean) : [],
+      weeklyAchievements,
       household: householdId,
       user: userName,
       isSingleMember,

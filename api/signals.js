@@ -2790,6 +2790,220 @@ async function handleRecurringEvents(req, res) {
   return res.status(405).json({ error: "Method not allowed" });
 }
 
+// ── Weekly Symphony — achievement tracking ──
+//
+// Each household's week (Monday-anchored) maintains a 7-bit
+// achievement bitmap. Each instrument represents the day's specific
+// achievement criterion; the Sunday Clearance reads the resulting
+// state and surfaces it as a single composition. Storage key:
+//   household:{id}:weeklyAchievements:{weekStart}
+// where weekStart is the ISO date (YYYY-MM-DD) of the most recent
+// Monday in UTC (close enough for daily-bucket aggregation across
+// US timezones — symphony unlocks on Sunday regardless of locale).
+//
+// Achievement criteria per day:
+//   Monday    drums    — >=2 resolutions today AND streak maintained
+//   Tuesday   bass     — vault item resolved OR crew-attributed signal resolved
+//   Wednesday piano    — high-urgency/intensity signal resolved
+//   Thursday  guitar   — signal resolved before entering inner ring
+//   Friday    strings  — net signal load improved vs Monday's count
+//   Saturday  brass    — any rest action
+//   Sunday    voice    — any activity this week (always lights up if anything earned)
+const DAY_KEYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"];
+
+function mondayAnchorISO(d = new Date()) {
+  // 0 = Sunday, 1 = Monday, ..., 6 = Saturday. Shift so Monday=0.
+  const day = (d.getUTCDay() + 6) % 7;
+  const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - day));
+  return monday.toISOString().slice(0, 10);
+}
+
+function dayKeyForToday(d = new Date()) {
+  return DAY_KEYS[(d.getUTCDay() + 6) % 7];
+}
+
+async function loadWeeklyAchievements(householdId, weekStart) {
+  const raw = await redis.get(`household:${householdId}:weeklyAchievements:${weekStart}`);
+  const parsed = safeJson(raw);
+  if (parsed && typeof parsed === "object") return parsed;
+  return {
+    weekStart,
+    monday: false, tuesday: false, wednesday: false, thursday: false,
+    friday: false, saturday: false, sunday: false,
+    instrumentsEarned: 0,
+    mondaySignalCount: null,
+    weekResolutions: 0,
+    milestonesThisWeek: [],
+  };
+}
+
+async function persistWeeklyAchievements(householdId, weekStart, record) {
+  // Recompute instrumentsEarned from the bitmap so it stays
+  // authoritative even if a caller mutates a day flag.
+  record.instrumentsEarned = DAY_KEYS.reduce(
+    (n, k) => n + (record[k] ? 1 : 0),
+    0
+  );
+  await redis.set(
+    `household:${householdId}:weeklyAchievements:${weekStart}`,
+    JSON.stringify(record),
+    { ex: 90 * 24 * 60 * 60 }
+  );
+}
+
+async function updateWeeklyAchievement(householdId, signal, kind) {
+  if (!householdId) return;
+  const now = new Date();
+  const weekStart = mondayAnchorISO(now);
+  const today = dayKeyForToday(now);
+  const record = await loadWeeklyAchievements(householdId, weekStart);
+
+  // Track weekly resolution count + capture Monday's active signal
+  // count for Friday's net-improvement check.
+  record.weekResolutions = (record.weekResolutions || 0) + 1;
+  if (today === "monday" && record.mondaySignalCount == null) {
+    try {
+      const raw = await redis.lrange(`household:${householdId}:signals`, 0, -1);
+      const active = (raw || [])
+        .map((v) => safeJson(v))
+        .filter((s) => s && (!s.state || s.state === "incoming" || s.state === "active"));
+      record.mondaySignalCount = active.length;
+    } catch { /* ignore */ }
+  }
+
+  // Per-day criteria evaluation. Each block guards against double-
+  // crediting an already-earned day so once an instrument lights up
+  // it stays lit for the week.
+  try {
+    if (today === "monday" && !record.monday) {
+      // ≥2 resolutions today + streak maintained.
+      const streakRaw = await redis.get(`household:${householdId}:streakData`);
+      const streak = streakRaw
+        ? (typeof streakRaw === "string" ? JSON.parse(streakRaw) : streakRaw)
+        : null;
+      const todaysCount = await countResolvedToday(householdId);
+      const streakAlive = (streak?.currentStreak || 0) > 0;
+      if (todaysCount >= 2 && streakAlive) record.monday = true;
+    } else if (today === "tuesday" && !record.tuesday) {
+      // Vault item OR crew-attributed signal.
+      const isVault = kind === "deadline" || signal?.type === "deadline";
+      const isCrew = !!signal?.crewMemberId;
+      if (isVault || isCrew) record.tuesday = true;
+    } else if (today === "wednesday" && !record.wednesday) {
+      if (
+        signal?.urgency === "high"
+        || signal?.emotionalIntensity === "high"
+      ) record.wednesday = true;
+    } else if (today === "thursday" && !record.thursday) {
+      // Resolved before entering the inner ring: ETA more than 24h
+      // away at the moment of resolution.
+      const etaMs = signal?.eta ? Date.parse(signal.eta) : NaN;
+      if (!isNaN(etaMs) && etaMs - Date.now() > 24 * 60 * 60 * 1000) {
+        record.thursday = true;
+      }
+    } else if (today === "friday" && !record.friday) {
+      // Net improvement vs Monday's snapshot.
+      if (typeof record.mondaySignalCount === "number") {
+        const raw = await redis.lrange(`household:${householdId}:signals`, 0, -1);
+        const active = (raw || [])
+          .map((v) => safeJson(v))
+          .filter((s) => s && (!s.state || s.state === "incoming" || s.state === "active"));
+        if (active.length < record.mondaySignalCount) record.friday = true;
+      }
+    } else if (today === "saturday" && !record.saturday) {
+      // Any rest action on Saturday lights brass.
+      record.saturday = true;
+    }
+  } catch (err) {
+    console.warn("[symphony] criteria eval failed:", err?.message || err);
+  }
+
+  // Sunday auto-lights if any prior day earned, OR if there was any
+  // activity today. We light it on this update because we're inside
+  // a resolve transition — counts as activity.
+  const anyPrior = DAY_KEYS.slice(0, 6).some((k) => record[k]);
+  if (anyPrior || today === "sunday") record.sunday = true;
+
+  await persistWeeklyAchievements(householdId, weekStart, record);
+}
+
+async function countResolvedToday(householdId) {
+  try {
+    const raw = await redis.lrange(`household:${householdId}:memory`, 0, 199);
+    const today = new Date().toISOString().slice(0, 10);
+    let count = 0;
+    for (const v of raw || []) {
+      let e;
+      try { e = typeof v === "string" ? JSON.parse(v) : v; } catch { continue; }
+      if (!e || e.action !== "resolved") continue;
+      const at = (e.actionAt || "").slice(0, 10);
+      if (at === today) count++;
+    }
+    return count;
+  } catch { return 0; }
+}
+
+function symphonyVariationFor(instrumentsEarned) {
+  if (instrumentsEarned >= 7) return "full";
+  if (instrumentsEarned >= 5) return "major";
+  if (instrumentsEarned >= 3) return "moderate";
+  if (instrumentsEarned >= 2) return "sparse";
+  return "minimal";
+}
+
+function symphonySoundSequence(record) {
+  return DAY_KEYS
+    .filter((k) => record[k])
+    .map((k) => `${k}-${{
+      monday: "drums",
+      tuesday: "bass",
+      wednesday: "piano",
+      thursday: "guitar",
+      friday: "strings",
+      saturday: "brass",
+      sunday: "voice",
+    }[k]}`);
+}
+
+async function handleWeeklyAchievements(req, res) {
+  if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+  const userId = req.query?.userId;
+  if (!userId) return res.status(400).json({ error: "userId required" });
+  const householdId = await resolveHouseholdId(userId);
+  if (!householdId) return res.status(400).json({ error: "no household" });
+
+  const now = new Date();
+  const weeks = [];
+  for (let i = 0; i < 5; i++) {
+    const d = new Date(now);
+    d.setUTCDate(d.getUTCDate() - i * 7);
+    const wkStart = mondayAnchorISO(d);
+    weeks.push(wkStart);
+  }
+  const records = await Promise.all(weeks.map((w) => loadWeeklyAchievements(householdId, w)));
+
+  const current = records[0];
+  return res.status(200).json({
+    ok: true,
+    current,
+    history: records,
+    symphonyVariation: symphonyVariationFor(current.instrumentsEarned),
+    soundSequence: symphonySoundSequence(current),
+  });
+}
+
+// Exposed so api/clearance.js can compose the Sunday symphony
+// without duplicating the variation/sequence logic.
+export {
+  mondayAnchorISO,
+  loadWeeklyAchievements,
+  symphonyVariationFor,
+  symphonySoundSequence,
+};
+
 async function handlePriorities(req, res) {
   const userId = req.method === "GET" ? req.query?.userId : req.body?.userId;
   if (!userId) return res.status(400).json({ error: "userId required" });
@@ -4054,6 +4268,10 @@ export default async function handler(req, res) {
       return handlePriorities(req, res);
     }
 
+    if (queryType === "weeklyAchievements" || bodyType === "weeklyAchievements") {
+      return handleWeeklyAchievements(req, res);
+    }
+
     if (queryType === "hobbies" || bodyType === "hobbies") {
       return handleHobbies(req, res);
     }
@@ -4262,6 +4480,11 @@ export default async function handler(req, res) {
             // Commons — anonymous provider aggregation. No identifiers
             // ever written; only resolution days + type + timestamp.
             await writeCommonsRecord(householdId, signals[index]);
+            // Weekly Symphony — update the current week's achievement
+            // bitmap. Best-effort; failure never blocks the resolve.
+            try { await updateWeeklyAchievement(householdId, signals[index], "signal"); } catch (err) {
+              console.warn("[symphony] update failed:", err?.message || err);
+            }
           }
         }
         return res.status(200).json({ household: householdId, signal: signals[index] });
@@ -4316,6 +4539,11 @@ export default async function handler(req, res) {
           if (criterion) await recordCaughtMoment(householdId, item, criterion, userId);
           try { await updateStreak(householdId); } catch (err) {
             console.warn("[streak] update failed:", err?.message || err);
+          }
+          try {
+            await updateWeeklyAchievement(householdId, deadlines[index], "deadline");
+          } catch (err) {
+            console.warn("[symphony] deadline update failed:", err?.message || err);
           }
         }
       }
