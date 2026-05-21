@@ -514,6 +514,262 @@ function routeForTopic(topic) {
   return "/directory";
 }
 
+// ============================================================
+// Easter eggs — The Conductor's hidden voice layer. Detector
+// runs BEFORE rate limiting + intent classification so casual
+// conversational hits ("tell me a joke", "good morning") don't
+// burn through the daily ask cap and don't go to Sonnet.
+// ============================================================
+
+const EASTER_EGG_PATTERNS = [
+  { patterns: ['tell me a joke', 'make me laugh', 'i need a laugh', 'say something funny', 'joke'], type: 'JOKE' },
+  { patterns: ['how are you', 'how are you doing', "how's it going"], type: 'HOW_ARE_YOU' },
+  { patterns: ['what do you think of me', 'what do you think about me', 'thoughts on me'], type: 'THINK_OF_ME' },
+  { patterns: ['meaning of life', 'what is the meaning'], type: 'MEANING_OF_LIFE' },
+  { patterns: ['are you human', 'are you real', 'are you ai', 'are you a robot'], type: 'ARE_YOU_HUMAN' },
+  { patterns: ['i love you', 'love you conductor', 'love you'], type: 'LOVE' },
+  { patterns: ["you're amazing", 'you are amazing', 'youre amazing', 'great job', 'well done'], type: 'COMPLIMENT' },
+  { patterns: ['what time is it', 'what time'], type: 'TIME' },
+  { patterns: ['surprise me', 'surprise', 'tell me something', 'tell me something interesting'], type: 'SURPRISE' },
+  { patterns: ['goodnight', 'good night', 'going to sleep', 'heading to bed'], type: 'GOODNIGHT' },
+  { patterns: ['good morning', 'morning conductor'], type: 'GOOD_MORNING' },
+  { patterns: ['who are you', 'what are you'], type: 'WHO_ARE_YOU' },
+  { patterns: ['thank you', 'thanks', 'thank you conductor'], type: 'THANKS' },
+];
+
+function detectEasterEgg(question) {
+  const lower = String(question || '').toLowerCase().trim();
+  for (const egg of EASTER_EGG_PATTERNS) {
+    if (egg.patterns.some((p) => lower.includes(p))) return egg.type;
+  }
+  return null;
+}
+
+const CONDUCTOR_JOKES = [
+  { id: 'j1',  setup: "Why did the HVAC technician never call back?",                       punchline: "He was too busy ghosting every household in Fort Lauderdale." },
+  { id: 'j2',  setup: "How many subscription services does it take to change a lightbulb?", punchline: "Four. One to change it, three you forgot you were paying for." },
+  { id: 'j3',  setup: "What did the package tracker say to the homeowner?",                 punchline: "'Out for delivery' for the third consecutive Tuesday." },
+  { id: 'j4',  setup: "Why don't contractors call when they say they will?",                punchline: "The Conductor is still investigating." },
+  { id: 'j5',  setup: "What's the difference between a warranty and a prayer?",             punchline: "The warranty expires." },
+  { id: 'j6',  setup: "Why did the household skip the gym?",                                punchline: "The signal load was a full workout already." },
+  { id: 'j7',  setup: "How does The Conductor stay calm?",                                  punchline: "It never sleeps. There's no time to panic." },
+  { id: 'j8',  setup: "What did one subscription say to the other?",                        punchline: "'We should auto-renew sometime.'" },
+  { id: 'j9',  setup: "Why is the insurance renewal always a surprise?",                    punchline: "It wasn't. The Conductor told you in March." },
+  { id: 'j10', setup: "A contractor, a delivery driver, and an HVAC technician walk into a bar.", punchline: "None of them showed up in the window." },
+  { id: 'j11', setup: "What do you call a signal that's been on the radar for three weeks?", punchline: "A personality." },
+  { id: 'j12', setup: "Why did the household's streak break?",                              punchline: "One signal. Always one signal." },
+  { id: 'j13', setup: "How many reminders does it take before something gets done?",        punchline: "The Conductor is on reminder four. Let me know how this one goes." },
+  { id: 'j14', setup: "What's the scariest thing in a household?",                          punchline: "An email from the HOA with 'urgent' in the subject line." },
+  { id: 'j15', setup: "Why did the homeowner buy a smart thermostat?",                      punchline: "So they'd have something else to troubleshoot at 11pm." },
+];
+
+// Small Haiku wrapper used by HOW_ARE_YOU and THINK_OF_ME — keeps
+// the easter-egg path independent of the heavyweight Sonnet call.
+async function haikuOneLiner(prompt) {
+  try {
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 200,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return (data?.content?.[0]?.text || "").trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function loadEasterEggContext(userId) {
+  const householdId = await resolveHouseholdId(userId);
+  const ctx = {
+    householdId,
+    signalCount: 0,
+    urgentCount: 0,
+    streak: 0,
+    activeSignals: [],
+  };
+  if (!householdId) return ctx;
+  try {
+    const raw = await redis.lrange(`household:${householdId}:signals`, 0, 49);
+    const signals = (raw || [])
+      .map((v) => { try { return typeof v === "string" ? JSON.parse(v) : v; } catch { return null; } })
+      .filter(Boolean);
+    const active = signals.filter((s) => !s.state || s.state === "incoming" || s.state === "active");
+    ctx.activeSignals = active;
+    ctx.signalCount = active.length;
+    const now = Date.now();
+    ctx.urgentCount = active.filter((s) => {
+      const ms = s.eta ? Date.parse(s.eta) : NaN;
+      return (!isNaN(ms) && ms - now < 48 * 60 * 60 * 1000) || s.urgency === "high";
+    }).length;
+  } catch { /* ignore */ }
+  try {
+    const streakRaw = await redis.get(`household:${householdId}:streakData`);
+    const data = streakRaw ? (typeof streakRaw === "string" ? JSON.parse(streakRaw) : streakRaw) : null;
+    ctx.streak = (data && Number(data.currentStreak)) || 0;
+  } catch { /* ignore */ }
+  return ctx;
+}
+
+async function handleEasterEgg(type, userId) {
+  const ctx = await loadEasterEggContext(userId);
+  const householdId = ctx.householdId;
+
+  switch (type) {
+    case "JOKE": {
+      if (!householdId) {
+        const pick = CONDUCTOR_JOKES[Math.floor(Math.random() * CONDUCTOR_JOKES.length)];
+        return {
+          answer: `${pick.setup}\n\n${pick.punchline}`,
+          spokenAnswer: `${pick.setup} ${pick.punchline}`,
+          confidence: "high",
+          isEasterEgg: true,
+        };
+      }
+      const toldKey = `household:${householdId}:toldJokes`;
+      let told = [];
+      try { told = (await redis.smembers(toldKey)) || []; } catch { told = []; }
+      let untold = CONDUCTOR_JOKES.filter((j) => !told.includes(j.id));
+      if (untold.length === 0) {
+        try { await redis.del(toldKey); } catch { /* ignore */ }
+        untold = CONDUCTOR_JOKES;
+      }
+      const pick = untold[Math.floor(Math.random() * untold.length)];
+      try { await redis.sadd(toldKey, pick.id); } catch { /* ignore */ }
+      return {
+        answer: `${pick.setup}\n\n${pick.punchline}`,
+        spokenAnswer: `${pick.setup} ${pick.punchline}`,
+        confidence: "high",
+        isEasterEgg: true,
+      };
+    }
+
+    case "HOW_ARE_YOU": {
+      const prompt = `The Conductor is asked how it's doing. Respond in character — calm, aware, slightly wry. Reference actual household data: ${ctx.signalCount} active signals, streak at ${ctx.streak} days. One to two sentences. Dry and genuine. No emoji. Plain text.`;
+      const ai = await haikuOneLiner(prompt);
+      const fallback = `Watching ${ctx.signalCount} active signals. Streak's at ${ctx.streak}. Steady.`;
+      const ans = ai || fallback;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "THINK_OF_ME": {
+      const sigSummary = (ctx.activeSignals || [])
+        .slice(0, 3)
+        .map((s) => s.type || "signal")
+        .join(", ") || "no active signals";
+      const prompt = `The Conductor is asked what it thinks of this user. Respond based on their actual patterns. Be honest, specific, and warm without being sycophantic. Two sentences maximum. Reference real data: signal types in motion (${sigSummary}), streak ${ctx.streak} days, total active ${ctx.signalCount}. No emoji. Plain text.`;
+      const ai = await haikuOneLiner(prompt);
+      const fallback = `Consistent with the radar, light on noise. ${ctx.streak} days of showing up — that tells me most of what I need to know.`;
+      const ans = ai || fallback;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "MEANING_OF_LIFE": {
+      const sig = (ctx.activeSignals || [])[0];
+      const ans = sig?.description
+        ? `Forty-two. Also: ${sig.description}. Both answers have merit.`
+        : `Forty-two. The Conductor has been considering this between syncs.`;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "ARE_YOU_HUMAN": {
+      const fact = (ctx.activeSignals || [])[0]?.description
+        ? `Right now I know that ${(ctx.activeSignals[0].description || "").toLowerCase()} is on your radar.`
+        : `Right now I know your household is quiet — and what that usually means.`;
+      const ans = `No. But I know your household better than most humans do. ${fact} Does that count for something?`;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "LOVE": {
+      const ans = `The Conductor notes that. Your streak is at ${ctx.streak} day${ctx.streak === 1 ? "" : "s"} — showing up every day is its own kind of love.`;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "COMPLIMENT": {
+      let ans = `The brief generates itself. You handle the signals. We're a good team.`;
+      if (ctx.streak > 14) {
+        ans = `The brief generates itself. You handle the signals. And ${ctx.streak} days strong — The Conductor appreciates the collaboration.`;
+      }
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "TIME": {
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+      const hour = now.getHours();
+      let nextBand;
+      if (hour < 7) nextBand = `Takeoff is in ${7 - hour} hour${7 - hour === 1 ? "" : "s"}`;
+      else if (hour < 21) nextBand = `Clearance is in ${21 - hour} hour${21 - hour === 1 ? "" : "s"}`;
+      else if (hour < 23) nextBand = `Overwatch is in ${23 - hour} hour${23 - hour === 1 ? "" : "s"}`;
+      else nextBand = `Takeoff is in ${24 - hour + 7} hours`;
+      const ans = `It's ${timeStr}. The radar has ${ctx.urgentCount} signal${ctx.urgentCount === 1 ? "" : "s"} that could use attention. ${nextBand}.`;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "SURPRISE": {
+      let totalResolved = 0;
+      try {
+        const memRaw = await redis.lrange(`household:${householdId}:memory`, 0, -1);
+        totalResolved = (memRaw || []).filter((v) => {
+          try {
+            const e = typeof v === "string" ? JSON.parse(v) : v;
+            return e && e.action === "resolved";
+          } catch { return false; }
+        }).length;
+      } catch { /* skip */ }
+      const ans = totalResolved > 0
+        ? `Your household has resolved ${totalResolved} signal${totalResolved === 1 ? "" : "s"} since connecting The Conductor. That's the quiet kind of progress.`
+        : `Your household is just getting started. The Conductor has been reading and assembling the picture.`;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "GOODNIGHT": {
+      const ans = ctx.urgentCount > 0
+        ? `Goodnight. ${ctx.urgentCount} thing${ctx.urgentCount === 1 ? "" : "s"} on the radar — The Conductor has ${ctx.urgentCount === 1 ? "it" : "them"}. Sleep well.`
+        : `Goodnight. The Conductor is watching. Sleep well — the radar will be here in the morning.`;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "GOOD_MORNING": {
+      let firstSentence = "";
+      try {
+        const cached = await redis.get(`user:${userId}:currentTakeoff`);
+        const parsed = cached ? (typeof cached === "string" ? JSON.parse(cached) : cached) : null;
+        const brief = typeof parsed?.brief === "string" ? parsed.brief : "";
+        firstSentence = (brief.split(/(?<=[.!?])\s+/)[0] || "").trim();
+      } catch { /* skip */ }
+      const ans = firstSentence
+        ? `Good morning. Your Takeoff is ready — ${firstSentence}`
+        : `Good morning. The Conductor is preparing your Takeoff.`;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "WHO_ARE_YOU": {
+      const ans = `The Conductor. I watch your household so you don't have to. Everything in motion — signals, deadlines, crew, patterns — held and synthesized into what actually matters. It's safe to look away.`;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    case "THANKS": {
+      const ans = ctx.streak > 0
+        ? `The Conductor is doing exactly what it's built to do. The streak is at ${ctx.streak} day${ctx.streak === 1 ? "" : "s"}. That's both of us.`
+        : `The Conductor is doing exactly what it's built to do. ${ctx.signalCount} signal${ctx.signalCount === 1 ? "" : "s"} on the radar today.`;
+      return { answer: ans, spokenAnswer: ans, confidence: "high", isEasterEgg: true };
+    }
+
+    default:
+      return null;
+  }
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
@@ -528,6 +784,23 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Missing or invalid question" });
   }
   const trimmedQuestion = question.trim();
+
+  // Easter eggs — run BEFORE rate limiting + intent classifier so
+  // conversational hits ("tell me a joke") don't burn through the
+  // daily cap and don't go to Sonnet. Each handler is self-contained
+  // and silent-falls-through on any internal failure.
+  try {
+    const eggType = detectEasterEgg(trimmedQuestion);
+    if (eggType) {
+      const eggResponse = await handleEasterEgg(eggType, userId);
+      if (eggResponse) {
+        return res.status(200).json({ ...eggResponse, cached: false });
+      }
+    }
+  } catch (err) {
+    console.warn("[ask] easter egg handler failed:", err?.message || err);
+    // Fall through to the normal path.
+  }
 
   // Rate limiting — per-user daily count. Default cap 50; founding
   // households 200. Resets at UTC midnight via 24h TTL. Counted
