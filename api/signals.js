@@ -229,6 +229,37 @@ export async function updateStreak(householdId) {
     data.longestStreak = data.currentStreak;
   }
   await redis.set(key, JSON.stringify(data));
+
+  // Conductor auto-post on streak milestones — fires exactly once per
+  // threshold per household via the streakAck:{N} latch from
+  // api/brief.js's streak-observation path. The post mirrors the
+  // brief's milestone copy so the channel and the brief stay in sync.
+  try {
+    const cur = data.currentStreak;
+    const MILESTONES = {
+      7:   "🔥 Seven days. The Conductor notes the streak is real.",
+      14:  "🔥 Two weeks. The household has found its rhythm.",
+      21:  "🔥 21 days. Most habits form in less time than this.",
+      30:  "🔥 30 days. The Conductor doesn't often say this: well done.",
+      60:  "🔥 Two months. The Conductor approves of what it sees.",
+      90:  "🔥 90 days. The Conductor knows this household now.",
+      100: "🔥 100 days. The Conductor marks this quietly.",
+      365: "🔥 One year. By most measures, worth watching.",
+    };
+    const line = MILESTONES[cur];
+    if (line) {
+      const channelKey = `household:${householdId}:streakChannelAck:${cur}`;
+      const already = await redis.get(channelKey).catch(() => null);
+      if (!already) {
+        const { postConductorMessage } = await import("./channel.js");
+        await postConductorMessage(householdId, line);
+        await redis.set(channelKey, "1", { ex: 365 * 24 * 60 * 60 }).catch(() => null);
+      }
+    }
+  } catch (err) {
+    console.warn("[channel] streak milestone post failed:", err?.message || err);
+  }
+
   return data;
 }
 
@@ -4484,6 +4515,25 @@ export default async function handler(req, res) {
             // bitmap. Best-effort; failure never blocks the resolve.
             try { await updateWeeklyAchievement(householdId, signals[index], "signal"); } catch (err) {
               console.warn("[symphony] update failed:", err?.message || err);
+            }
+            // Conductor auto-post to Crew Channel — only for genuinely
+            // notable signals so the channel doesn't fill with noise.
+            // Threshold: high-urgency, high-intensity, or carried
+            // forward 3+ mornings.
+            try {
+              const notable =
+                signals[index]?.urgency === "high"
+                || signals[index]?.emotionalIntensity === "high"
+                || (Number(signals[index]?.briefCount) || 0) >= 3;
+              if (notable) {
+                const { postConductorMessage } = await import("./channel.js");
+                const desc = (signals[index]?.description || "A signal").slice(0, 120);
+                await postConductorMessage(householdId, `✓ ${desc} — handled.`, {
+                  attachedSignalId: signals[index].id,
+                });
+              }
+            } catch (err) {
+              console.warn("[channel] auto-post failed:", err?.message || err);
             }
           }
         }

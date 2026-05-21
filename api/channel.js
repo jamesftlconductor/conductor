@@ -140,6 +140,41 @@ async function handleMarkRead(req, res, householdId, userId) {
   return res.status(200).json({ success: true });
 }
 
+// In-process helper for backend handlers that need to drop a
+// Conductor system message into the channel without a roundtrip
+// through the HTTP handler. Same persistence + unread-bump logic
+// as the POST endpoint, but skips the sender == userId check since
+// the system always posts as 'conductor'.
+export async function postConductorMessage(householdId, text, { attachedSignalId } = {}) {
+  if (!householdId || !text || typeof text !== "string") return null;
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const message = {
+    id,
+    householdId,
+    senderId: "conductor",
+    senderName: "Conductor",
+    text: text.slice(0, 400),
+    attachedSignalId: attachedSignalId || null,
+    mediaUrl: null,
+    mediaType: null,
+    createdAt: new Date().toISOString(),
+    readBy: ["conductor"],
+  };
+  try {
+    const key = `household:${householdId}:channel`;
+    await redis.lpush(key, JSON.stringify(message));
+    await redis.ltrim(key, 0, CHANNEL_CAP);
+    const members = await householdMembers(householdId);
+    for (const m of members) {
+      await redis.incr(`household:${householdId}:channel:unread:${m}`);
+    }
+  } catch (err) {
+    console.warn("[channel] postConductorMessage failed:", err?.message || err);
+    return null;
+  }
+  return message;
+}
+
 export default async function handler(req, res) {
   try {
     // Path discrimination — the file maps to /api/channel and also

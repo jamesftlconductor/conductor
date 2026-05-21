@@ -563,6 +563,26 @@ Rules: warm but not effusive. Honest. Maximum 4 sentences. Never clinical. This 
     const data = await response.json();
     const text = data?.content?.[0]?.text?.trim();
     if (!text) return null;
+
+    // Conductor auto-post — drop the Week in Review's first sentence
+    // into the Crew Channel exactly once per week. weeklyReviewAck
+    // key keyed by the Monday-anchor ISO so a re-run on the same
+    // Sunday doesn't duplicate.
+    try {
+      const ackKey = `household:${householdId}:weeklyReviewChannelAck:${cutoff}`;
+      const already = await redis.get(ackKey).catch(() => null);
+      if (!already) {
+        const firstSentence = (text.split(/(?<=[.!?])\s+/)[0] || "").trim();
+        if (firstSentence) {
+          const { postConductorMessage } = await import("./channel.js");
+          await postConductorMessage(householdId, `📊 Week in Review: ${firstSentence}`);
+          await redis.set(ackKey, "1", { ex: 7 * 24 * 60 * 60 }).catch(() => null);
+        }
+      }
+    } catch (err) {
+      console.warn("[channel] week-in-review post failed:", err?.message || err);
+    }
+
     return text;
   } catch (err) {
     console.error("Week in Review failed:", err?.message || err);
