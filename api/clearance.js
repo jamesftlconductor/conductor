@@ -490,6 +490,45 @@ async function generateWeekInReview(householdId, householdName) {
         .sort((a, b) => (a.daysBeforeExpiry ?? 99) - (b.daysBeforeExpiry ?? 99))[0];
     }
 
+    // Week's emotional context — load any high-intensity signals that
+    // were active in the past week. The signals list carries the
+    // emotionalValence/emotionalIntensity fields that the brief layer
+    // uses; we read them here so the review's tone matches what the
+    // household actually went through. Best-effort: a redis hiccup
+    // leaves the review with no emotional calibration, which is the
+    // pre-existing baseline.
+    let emotionalContextBlock = "";
+    try {
+      const rawSignals = await redis.lrange(`household:${householdId}:signals`, 0, 199);
+      const recentSignals = (rawSignals || [])
+        .map((v) => { try { return JSON.parse(v); } catch { return null; } })
+        .filter(Boolean);
+      const weekHigh = recentSignals.filter((s) => {
+        if (s?.emotionalIntensity !== "high") return false;
+        const ts = Date.parse(s?.createdAt || s?.lastUpdate || "");
+        return !isNaN(ts) && ts >= cutoff;
+      });
+      if (weekHigh.length > 0) {
+        const lines = weekHigh.slice(0, 6).map((s) => {
+          const v = s.emotionalValence || "neutral";
+          const d = (s.description || "(unspecified)").slice(0, 140);
+          return `${v}: ${d}`;
+        });
+        const griefThisWeek = weekHigh.some((s) => s.emotionalValence === "grief");
+        const milestoneThisWeek = weekHigh.some((s) => s.emotionalValence === "joyful");
+
+        const calibration = griefThisWeek
+          ? `If grief signals were active this week: acknowledge the weight first. Keep the review brief. "Hard week." is a complete and valid opening sentence.`
+          : milestoneThisWeek
+          ? `If milestone signals were active: lead with the milestone. Everything else is secondary. The household kept running while something important happened.`
+          : `Steady, honest, specific. This is what good looks like.`;
+
+        emotionalContextBlock = `\nWEEK'S EMOTIONAL CONTEXT:\n${lines.join("\n")}\n\n${calibration}\n`;
+      }
+    } catch (err) {
+      console.warn("[weekInReview] emotional context load failed:", err?.message || err);
+    }
+
     const householdRef = householdName ? `${householdName}` : "this household";
     const prompt = `Write a warm, honest one-paragraph Week in Review for ${householdRef}. Cover:
 - How many signals were handled this week (${rested} rested, ${carriedForward} carried forward, ${lapsed} lapsed)
@@ -501,7 +540,7 @@ async function generateWeekInReview(householdId, householdName) {
 - If there's something funny or ironic about the week: let it land with a light touch
 ${topCaught ? `- Most significant caught moment this week: "${topCaught.description}"${topCaught.sender ? ` from ${topCaught.sender}` : ""} — handled with ${topCaught.daysBeforeExpiry} day(s) to spare. Include this as one warm sentence in the review.` : ""}
 
-Rules: warm but not effusive. Honest. Maximum 4 sentences. Never clinical. This should feel like something worth reading. Plain text, no markdown. Never quote the raw numbers as bare digits in a clinical way ("${rested} signals rested this week" is fine; "${rested}/${rested + carriedForward + lapsed} resolution rate" is not). Refer to the household in second person — "you" / "your".`;
+Rules: warm but not effusive. Honest. Maximum 4 sentences. Never clinical. This should feel like something worth reading. Plain text, no markdown. Never quote the raw numbers as bare digits in a clinical way ("${rested} signals rested this week" is fine; "${rested}/${rested + carriedForward + lapsed} resolution rate" is not). Refer to the household in second person — "you" / "your".${emotionalContextBlock}`;
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",

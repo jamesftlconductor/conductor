@@ -4098,6 +4098,11 @@ export default async function handler(req, res) {
         state: "incoming",
         source: typeof source === "string" && source.length > 0 ? source : "manual",
         userId,
+        // Manual signals get neutral/low defaults — user can override
+        // via FinaleSheet's "How does this feel?" selector. The brief
+        // synthesis layer reads these to calibrate tone.
+        emotionalValence: "neutral",
+        emotionalIntensity: "low",
         lastUpdate: new Date().toLocaleString(),
         createdAt: Date.now(),
       };
@@ -4109,7 +4114,7 @@ export default async function handler(req, res) {
 
     if (req.method === "PATCH") {
       const body = req.body || {};
-      const { id, state, userId, notedAt, description, eta, status, notes, confirmationNumber } = body;
+      const { id, state, userId, notedAt, description, eta, status, notes, confirmationNumber, emotionalValence, emotionalIntensity } = body;
 
       if (id === undefined || id === null) {
         return res.status(400).json({ error: "id is required" });
@@ -4117,20 +4122,25 @@ export default async function handler(req, res) {
 
       // PATCH accepts EITHER a state transition (existing lifecycle
       // semantics) OR a field edit (description / eta / status / notes /
-      // confirmationNumber), or both in one call. FinaleSheet edit mode
-      // sends just the edit fields; resolve/hold flows send just state.
-      // Horizon's inline-edit affordances send notes/confirmationNumber.
+      // confirmationNumber / emotional override), or both in one call.
+      // FinaleSheet edit mode sends just the edit fields; resolve/hold
+      // flows send just state. The emotional override comes from the
+      // FinaleSheet "How does this feel?" pills.
+      const VALID_VALENCE = new Set(["joyful", "neutral", "stressful", "grief"]);
+      const VALID_INTENSITY = new Set(["high", "medium", "low"]);
       const stateProvided = state !== undefined;
       const hasDescription = typeof description === "string";
       const hasEta = "eta" in body; // allow null to clear
       const hasStatus = typeof status === "string";
       const hasNotes = "notes" in body; // allow null/empty to clear
       const hasConfirmation = "confirmationNumber" in body;
-      const isEdit = hasDescription || hasEta || hasStatus || hasNotes || hasConfirmation;
+      const hasValence = typeof emotionalValence === "string" && VALID_VALENCE.has(emotionalValence);
+      const hasIntensity = typeof emotionalIntensity === "string" && VALID_INTENSITY.has(emotionalIntensity);
+      const isEdit = hasDescription || hasEta || hasStatus || hasNotes || hasConfirmation || hasValence || hasIntensity;
 
       if (!stateProvided && !isEdit) {
         return res.status(400).json({
-          error: "at least one of state, description, eta, status, notes, or confirmationNumber is required",
+          error: "at least one of state, description, eta, status, notes, confirmationNumber, emotionalValence, or emotionalIntensity is required",
         });
       }
       if (stateProvided && !VALID_STATES.includes(state)) {
@@ -4148,6 +4158,8 @@ export default async function handler(req, res) {
         if (hasStatus) record.status = status;
         if (hasNotes) record.notes = notes === "" ? null : notes;
         if (hasConfirmation) record.confirmationNumber = confirmationNumber === "" ? null : confirmationNumber;
+        if (hasValence) record.emotionalValence = emotionalValence;
+        if (hasIntensity) record.emotionalIntensity = emotionalIntensity;
       }
 
       const householdId = await resolveHouseholdId(userId);

@@ -1407,8 +1407,25 @@ export async function runImport(userId, customQuery = null) {
   "sender": "who sent it",
   "type": "package, food, grocery, service, reservation, travel, or unknown",
   "notes": "any additional context about timing, location, or special instructions (or null)",
-  "confidence": "high, medium, or low — how confident you are in the extracted data"
+  "confidence": "high, medium, or low — how confident you are in the extracted data",
+  "emotionalValence": "joyful, neutral, stressful, or grief",
+  "emotionalIntensity": "high, medium, or low"
 }
+
+Also classify the emotional valence of this signal:
+- joyful: celebrations, milestones, achievements, anticipated pleasures
+- stressful: breakdowns, medical issues, financial problems, conflicts
+- grief: deaths, serious illness, divorce, loss
+- neutral: routine household management
+
+And intensity:
+- high: life-changing or significantly disruptive
+- medium: meaningful but manageable
+- low: routine
+
+When in doubt, default to neutral/low — most package deliveries and routine
+service reminders are neutral/low. Only mark high-intensity when the signal
+genuinely changes the shape of the day.
 
 Subject: ${subject}
 From: ${from}
@@ -1430,6 +1447,20 @@ ${emailText.substring(0, 1000)}`,
       // before the gate runs so the same field can drive both filtering
       // and dedup tie-breaking.
       signal.confidence = signalConfidenceScore(signal);
+
+      // Emotional classification — coerce to the allowed enum and
+      // default to neutral/low when Claude omits or returns something
+      // off-list. This guarantees every signal has the two fields
+      // downstream consumers expect, without forcing every prompt
+      // path to validate.
+      const VALID_VALENCE = new Set(["joyful", "neutral", "stressful", "grief"]);
+      const VALID_INTENSITY = new Set(["high", "medium", "low"]);
+      signal.emotionalValence = VALID_VALENCE.has(signal.emotionalValence)
+        ? signal.emotionalValence
+        : "neutral";
+      signal.emotionalIntensity = VALID_INTENSITY.has(signal.emotionalIntensity)
+        ? signal.emotionalIntensity
+        : "low";
 
       // Mark as imported once parsing succeeds — covers both the lpush path
       // below and the stale-eta skip, so neither gets re-processed.

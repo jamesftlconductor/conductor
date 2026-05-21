@@ -1761,6 +1761,28 @@ function synthesizeHouseholdState({
     pulseWord = "steady";
   }
 
+  // Emotional state — drives prompt calibration so the brief / Pulse
+  // / Week-in-Review can match the register of what the household is
+  // experiencing. We surface the first high-intensity signal per
+  // valence rather than enumerate; the brief prompt's "GRIEF SIGNAL
+  // ACTIVE" / "HIGH STRESS" / "MILESTONE" blocks only need one
+  // anchoring signal each to calibrate tone.
+  const highIntensitySignals = (activeSignals || []).filter(
+    (s) => s?.emotionalIntensity === "high" && (!s.state || s.state === "incoming" || s.state === "active")
+  );
+  const dominantValence = highIntensitySignals.length > 0
+    ? highIntensitySignals[0].emotionalValence || "neutral"
+    : "neutral";
+  const activeGrief = highIntensitySignals.find((s) => s?.emotionalValence === "grief") || null;
+  const activeStress = highIntensitySignals.find((s) => s?.emotionalValence === "stressful") || null;
+  const activeMilestone = highIntensitySignals.find((s) => s?.emotionalValence === "joyful") || null;
+  const emotionalState = {
+    dominantValence,
+    activeGrief,
+    activeStress,
+    activeMilestone,
+  };
+
   return {
     signalLoad,
     urgentCount,
@@ -1784,6 +1806,7 @@ function synthesizeHouseholdState({
     synthesisFlags: flags,
     synthesisNote: null,           // populated by generatePulseNote after this returns
     pulseWord,
+    emotionalState,
     // Carry the household's marketRegion through to the Pulse prompt
     // so the per-market vocabulary set fires correctly. Falls through
     // to "south_florida" for backwards compatibility (test household).
@@ -2242,7 +2265,16 @@ async function generatePulseNote(state) {
     ? `ANNIVERSARY: Today marks exactly one year since this household connected to Conductor. Stats for the year: ${state.anniversaryYearStats.totalRested} signals handled, ${state.anniversaryYearStats.deadlinesCaught} deadlines caught before they slipped. Weave a quiet, warm acknowledgment into the Pulse — never "happy anniversary", just an honest recognition that they've been at this for a year. Earned, not effusive.`
     : null;
 
+  // Emotional context for the Pulse — when a high-intensity signal is
+  // active, the prompt gets a tightly-worded calibration block. On
+  // ordinary days the block is empty and the existing rules apply.
+  const emo = state.emotionalState || {};
+  const emoSignal = emo.activeGrief || emo.activeStress || emo.activeMilestone || null;
+  const emoLine = `EMOTIONAL STATE: ${emo.dominantValence || "neutral"}\nActive high-intensity signal: ${emoSignal ? (emoSignal.description || "(unspecified)") : "none"}\n\nEmotional calibration for The Pulse:\n- Grief: quiet, present, minimal. Don't comment on productivity.\n- High stress: practical and grounding. Acknowledge the weight without adding to it.\n- Milestone joy: warm and permission-giving. Today deserves presence.\n- Neutral: normal synthesis rules apply.`;
+
   const prompt = `Given this household state, write one sentence that synthesizes what it means for today. Be specific, warm, and honest. Use the approved list of location-aware weather observations for ${locationLabel}. If a synthesis flag is active, lead with its implication — not the data behind it.
+
+${emoLine}
 
 ${anniversaryLine ? anniversaryLine + "\n\n" : ""}Flags active: ${flagsLine}
 Health: ${healthLine}
@@ -3764,6 +3796,49 @@ ${isSingleMember
     if (anniversary) synthesisState.anniversaryYearStats = anniversary.yearStats;
     synthesisState.synthesisNote = await generatePulseNote(synthesisState);
 
+    // Emotional calibration block — only emitted when there's an
+    // active high-intensity signal worth shaping the brief around.
+    // For ordinary days the emotionalState is { dominantValence:
+    // 'neutral', ... nulls } and the block stays empty.
+    const emo = synthesisState.emotionalState || {};
+    const emotionalCalibrationLines = [];
+    emotionalCalibrationLines.push(`EMOTIONAL STATE: ${emo.dominantValence || "neutral"}`);
+    if (emo.activeGrief) {
+      emotionalCalibrationLines.push(
+        `GRIEF SIGNAL ACTIVE: ${emo.activeGrief.description || "(unspecified)"}`,
+        `RULES: Brief maximum 2 sentences. Only surface genuinely urgent signals.`,
+        `No humor. No upbeat framing. No hobby signals. No local events.`,
+        `Tone: present, warm, unhurried. Hold space.`
+      );
+    }
+    if (emo.activeStress && emo.activeStress.emotionalIntensity === "high") {
+      emotionalCalibrationLines.push(
+        `HIGH STRESS SIGNAL ACTIVE: ${emo.activeStress.description || "(unspecified)"}`,
+        `RULES: Lead with the stressful signal. Give actionable next steps.`,
+        `De-prioritize other signals unless urgent. No pleasantries.`,
+        `Tone: trusted advisor who knows things are hard.`
+      );
+    }
+    if (emo.activeMilestone && emo.activeMilestone.emotionalIntensity === "high") {
+      emotionalCalibrationLines.push(
+        `MILESTONE SIGNAL ACTIVE: ${emo.activeMilestone.description || "(unspecified)"}`,
+        `RULES: Acknowledge the milestone first, warmly and genuinely.`,
+        `Practical signals come second. Conductor gives permission to be present.`,
+        `Tone: celebratory but not performative. One true sentence about what today is.`
+      );
+    }
+    if (emo.activeGrief || emo.activeStress || emo.activeMilestone) {
+      emotionalCalibrationLines.push(
+        ``,
+        `GENERAL EMOTIONAL RULES:`,
+        `- Match the register of what the household is experiencing`,
+        `- Never be relentlessly practical in the middle of something significant`,
+        `- Never manufacture urgency when the household is celebrating`,
+        `- Never add levity when the household is grieving`,
+        `- The brief should feel like it was written by someone who knows what's happening`
+      );
+    }
+
     const householdStateBlock = [
       `HOUSEHOLD STATE TODAY:`,
       `Signal load: ${synthesisState.signalLoad}`,
@@ -3777,6 +3852,8 @@ ${isSingleMember
           : "none"
       }`,
       `The Pulse: ${synthesisState.synthesisNote || "(unavailable)"}`,
+      ``,
+      emotionalCalibrationLines.join("\n"),
       ``,
       `Use this household state to inform the editorial judgment of the brief. A high_stress_load day calls for a calmer, more focused brief. A green_light day allows a slightly warmer opening. A dehydration_risk day warrants a mention of the weather in context. Let the synthesis flags guide the tone and emphasis — but never mention the flags explicitly. The structured fields above (signal load, health, weather state, flags, pulse word) are EDITORIAL CUES, not content. Never quote, paraphrase, or describe these values in the brief — phrases like "your body feels strong", "your body is strong right now", "energy is good", "you're in a strong window", "the day is moderate", "load is light", "it's humid" (when humidity isn't load-bearing for a signal) are all forbidden. The reader should feel the tone shift, not read the diagnostic.`,
     ].join("\n");
