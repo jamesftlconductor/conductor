@@ -4833,6 +4833,15 @@ Return only the spoken text.`,
       if (profile?.householdName) householdName = profile.householdName;
     } catch { /* skip */ }
 
+    // First-brief morning question — onboarding moment that
+    // introduces The Conductor at exactly the right time. The mobile
+    // Ground screen reads isFirstBrief + morningQuestion together
+    // and renders the question with a real "Tell The Conductor →"
+    // button rather than the muted weekly variant.
+    const morningQuestion = isFirstBrief
+      ? "What would make this week feel successful for your household?"
+      : null;
+
     const briefResponse = {
       brief: finalBrief,
       spokenSummary,
@@ -4858,6 +4867,7 @@ Return only the spoken text.`,
       // this flag to show the "Build plan →" card.
       maintenancePlanOffer: maintenancePlanOffer,
       isFirstBrief,
+      morningQuestion,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for

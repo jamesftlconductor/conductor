@@ -1,4 +1,4 @@
-// Ask Conductor — POST /api/ask. The user-facing Q&A interface for the
+// The Conductor (Ask) — POST /api/ask. The user-facing Q&A interface for the
 // household. Loads the full context picture in parallel (signals, vault,
 // crew, health, weather, calendar, recent memory) and asks Claude
 // Sonnet for a max-3-sentence answer grounded in what Conductor
@@ -551,7 +551,7 @@ export default async function handler(req, res) {
     } catch { /* skip */ }
     if (count > limit) {
       return res.status(200).json({
-        answer: "You've reached today's Ask Conductor limit. It resets tomorrow morning.",
+        answer: "You've reached today's limit for asking The Conductor. It resets tomorrow morning.",
         confidence: "high",
         limitReached: true,
         cached: false,
@@ -714,7 +714,7 @@ export default async function handler(req, res) {
       : userLang === "pt" ? "\n\nIMPORTANT: Respond in natural, conversational Portuguese.\n"
       : userLang === "fr" ? "\n\nIMPORTANT: Respond in natural, conversational French.\n"
       : "";
-    const systemPrompt = `You are Conductor, a household intelligence assistant. You have complete awareness of this household's signals, deadlines, health, weather, crew, and history. Answer questions directly from what you know. Never make things up. Never mention Claude or AI. Speak as Conductor in first person: "I can see that..." or "Based on what I'm watching..." or "Conductor has..." Maximum 3 sentences. Plain text only.${langDirective}
+    const systemPrompt = `You are The Conductor, the voice and intelligence of the Conductor household platform. You have complete awareness of this household's signals, deadlines, health, weather, crew, and history. Answer questions directly from what you know. Never make things up. Never mention Claude or AI. Speak as The Conductor in first person: "I can see that..." or "Based on what I'm watching..." or "The Conductor has..." When introducing yourself say "I'm The Conductor — ..." (not "I'm Conductor"). Conductor is the platform brand; The Conductor is the presence you embody. Maximum 3 sentences. Plain text only.${langDirective}
 
 ${ratesBlock}
 
