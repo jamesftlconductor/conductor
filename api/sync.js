@@ -320,6 +320,51 @@ export default async function handler(req, res) {
       } catch (err) {
         errors.push({ stage: "eventbrite", householdId, message: err.message });
       }
+      // NWS severe-weather alerts — auto-trigger Red Alert when the
+      // active feed for this household's coords includes Severe or
+      // Extreme certainty:Warning/Watch events and no Red Alert is
+      // already active. Free, no API key required. Best-effort: any
+      // hiccup falls through silently.
+      try {
+        const rawLoc = await redis.get(`household:${householdId}:location`);
+        const loc = (() => {
+          if (!rawLoc) return null;
+          try { return typeof rawLoc === "string" ? JSON.parse(rawLoc) : rawLoc; } catch { return null; }
+        })();
+        if (loc && typeof loc.lat === "number" && typeof loc.lon === "number") {
+          const existing = await redis.get(`household:${householdId}:activeAlert`).catch(() => null);
+          if (!existing) {
+            const resp = await fetch(
+              `https://api.weather.gov/alerts/active?point=${loc.lat},${loc.lon}`,
+              { headers: { "User-Agent": "Conductor (conductor-ivory.vercel.app)", Accept: "application/geo+json" } }
+            );
+            if (resp.ok) {
+              const data = await resp.json();
+              const severe = (data?.features || []).filter((f) => {
+                const sev = f?.properties?.severity;
+                const cert = f?.properties?.certainty;
+                return ["Severe", "Extreme"].includes(sev) && ["Warning", "Watch"].includes(cert);
+              });
+              if (severe.length > 0) {
+                const top = severe[0]?.properties;
+                const headline = (top?.headline || top?.event || "Severe weather alert").slice(0, 400);
+                const { postAlert } = await import("./alert.js");
+                await postAlert({
+                  householdId,
+                  alertType: "WEATHER_EMERGENCY",
+                  description: headline,
+                  severity: "red",
+                  source: "nws",
+                });
+                console.log(`[nws] red alert raised for ${householdId}: ${headline}`);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        errors.push({ stage: "nws", householdId, message: err.message });
+      }
+
       try {
         await selfHealHousehold(redis, householdId, members);
       } catch (err) {
