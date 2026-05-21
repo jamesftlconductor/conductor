@@ -4378,7 +4378,7 @@ ${isSingleMember
           9:  "September. Still hurricane season. Still watching.",
           10: "October. Boat Show month. Downtown Fort Lauderdale becomes complicated.",
           11: "November. Season begins. The snowbirds return. Traffic resumes.",
-          12: "December. Holiday season. The Conductor notes the calendar is full.",
+          12: "December in Fort Lauderdale. The year is ending. Christmas approaching. The Conductor notes the warmth of the season — in temperature and spirit. Brief tone: warm, slightly reflective, celebratory when earned. The household has made it through another year. That matters.",
         },
       };
       const region = householdLocation?.marketRegion || "south_florida";
@@ -4819,6 +4819,77 @@ Never manufacture urgency. Never apologize for having nothing to say. The quiet 
 
     // ── Personality layer additions ──
 
+    // Icon note — surfaced on the 1st of each month when the user
+    // has auto-icon-update enabled (default true). Single line that
+    // lives just below The Pulse on mobile. Off-day briefs leave the
+    // field null. The 1st-of-month gate matches the launch-time
+    // suggestion sheet so the brief copy and the icon offer align.
+    let iconNote = null;
+    try {
+      const now = new Date();
+      const dayOfMonth = now.getDate();
+      if (dayOfMonth === 1) {
+        const MONTH_NAMES = [
+          "January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December",
+        ];
+        const monthName = MONTH_NAMES[now.getMonth()];
+        // Region-specific flavor where it earns its line; falls
+        // through to a neutral copy for everywhere else.
+        const flavorByMonth = {
+          January:   "The Conductor has put on a new year look.",
+          February:  "The Conductor is feeling the peak season.",
+          March:     "The Conductor has dressed for the change in air.",
+          April:     "The Conductor has put on something green.",
+          May:       "The Conductor is feeling the South Florida energy.",
+          June:      "The Conductor has its eye on the Atlantic.",
+          July:      "The Conductor is dressed for the heat.",
+          August:    "The Conductor is at attention.",
+          September: "The Conductor has put on autumn.",
+          October:   "The Conductor is dressed for Boat Show month.",
+          November:  "The Conductor is dressed for gratitude.",
+          December:  "The Conductor has put on its Christmas look.",
+        };
+        const flavor = flavorByMonth[monthName] || `The Conductor has put on a new look.`;
+        iconNote = `${monthName} has arrived. ${flavor}`;
+      }
+    } catch (err) {
+      console.warn("[brief] icon note failed:", err?.message || err);
+    }
+
+    // December 25 / December 31 — overrides land BEFORE the regular
+    // sign-off + radar-clear additions so the Christmas / NYE copy
+    // gets the final word. Both override the brief's lead, but only
+    // when the brief isn't a firstRun or red-alert (those have their
+    // own opinionated copy).
+    try {
+      const now = new Date();
+      const month = now.getMonth(); // 11 = December
+      const day = now.getDate();
+      if (month === 11 && day === 25 && !isFirstRun) {
+        finalBrief = `Merry Christmas. The Conductor has the rest. Enjoy the day.\n\n${finalBrief.trim()}`;
+      } else if (month === 11 && day === 31 && !isFirstRun) {
+        // Days-since-onboarding count for the NYE close. Falls
+        // through to a neutral copy when we can't compute it.
+        let daysSince = null;
+        try {
+          const rawCreated = await redis.get(`household:${householdId}:createdAt`);
+          const created = rawCreated
+            ? (typeof rawCreated === "string" ? Date.parse(rawCreated) : Number(rawCreated))
+            : null;
+          if (created && !isNaN(created)) {
+            daysSince = Math.max(1, Math.floor((Date.now() - created) / (24 * 60 * 60 * 1000)));
+          }
+        } catch { /* ignore */ }
+        const dayLine = daysSince
+          ? `The Conductor has been watching your household for ${daysSince} days.`
+          : `The Conductor has been watching your household this year.`;
+        finalBrief = `The last brief of the year. ${dayLine}\n\n${finalBrief.trim()}\n\nIt's been, by most measures, worth watching.`;
+      }
+    } catch (err) {
+      console.warn("[brief] dec25/31 override failed:", err?.message || err);
+    }
+
     // Streak milestone observation — surfaced when the household
     // hits one of the named thresholds. Stored as a separate
     // streakObservation field so the mobile renderer can give it
@@ -5091,6 +5162,7 @@ Return only the offer line.`;
       jokeOffer,
       jokeOffered,
       streakObservation,
+      iconNote,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for
