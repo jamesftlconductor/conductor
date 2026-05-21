@@ -2881,9 +2881,59 @@ export default async function handler(req, res) {
       }
     }
 
-    const activeSignals = allSignals.filter(
+    let activeSignals = allSignals.filter(
       (s) => !s.state || s.state === "incoming" || s.state === "active"
     );
+
+    // Financial awareness filter — suppresses routine finance noise
+    // from the brief unless the user has explicitly opted into a
+    // higher-engagement tier. Default 'silent' keeps things quiet:
+    // only genuine anomalies (fraud-pattern, price-increase, charges
+    // from previously cancelled services) make it through. The
+    // financialAwareness pref is set via Settings.
+    try {
+      const prefsForFinancial = safeJson(rawPreferences) || {};
+      const awareness = typeof prefsForFinancial.financialAwareness === "string"
+        ? prefsForFinancial.financialAwareness
+        : "silent";
+      function isFinancialSignal(s) {
+        const t = (s.type || "").toLowerCase();
+        if (t === "financial" || t === "financial_anomaly") return true;
+        const d = (s.description || "").toLowerCase();
+        return /\bsubscription\b|\brenewal\b|\bcharge\b|\bpayment\b|\$\d/.test(d);
+      }
+      function isFinancialAnomaly(s) {
+        if ((s.type || "").toLowerCase() === "financial_anomaly") return true;
+        if (s.priceIncrease === true) return true;
+        if (s.fromCancelledService === true) return true;
+        return false;
+      }
+      function isWithinDays(eta, days) {
+        if (!eta) return false;
+        const ms = Date.parse(eta);
+        if (isNaN(ms)) return false;
+        const diff = (ms - Date.now()) / (24 * 60 * 60 * 1000);
+        return diff >= 0 && diff <= days;
+      }
+      if (awareness === "silent") {
+        activeSignals = activeSignals.filter((s) => !isFinancialSignal(s) || isFinancialAnomaly(s));
+      } else if (awareness === "awareness") {
+        activeSignals = activeSignals.filter((s) => {
+          if (!isFinancialSignal(s)) return true;
+          if (isFinancialAnomaly(s)) return true;
+          return isWithinDays(s.eta, 7);
+        });
+      } else if (awareness === "tracking") {
+        activeSignals = activeSignals.filter((s) => {
+          if (!isFinancialSignal(s)) return true;
+          if (isFinancialAnomaly(s)) return true;
+          return isWithinDays(s.eta, 14);
+        });
+      }
+      // 'planning' tier: no filter — full pool retained.
+    } catch (err) {
+      console.warn("[brief] financial filter failed:", err?.message || err);
+    }
 
     const calendarEvents = safeJson(rawCalendar) || [];
     const healthContext = safeJson(rawHealth);

@@ -56,7 +56,7 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: "Invalid API key" });
   }
 
-  const { type, description, sender, eta, status, metadata } = req.body || {};
+  const { type, description, sender, eta, status, metadata, shortcutId, source: sourceField } = req.body || {};
 
   // Validate the type enum strictly so the radar / brief / signal
   // segmenter never get an unknown enum value. If callers pass
@@ -76,6 +76,20 @@ export default async function handler(req, res) {
   // externally-vouched-for (vs. LLM-parsed signals which carry lower
   // confidence) — surfaces in the brief prompt as a credibility cue
   // when relevant.
+  // Distinct source tags let downstream consumers (brief prompt,
+  // attribution UI, dedup) differentiate raw webhook / API ingests
+  // from iOS Shortcuts / IFTTT / Zapier flows. We accept the caller's
+  // `source` field when it matches the allowed enum; otherwise fall
+  // through to "api". Same applies for the shortcutId tag.
+  const ALLOWED_SOURCES = new Set(["api", "ios_shortcut", "ifttt", "zapier", "webhook"]);
+  const sourceTag = typeof sourceField === "string" && ALLOWED_SOURCES.has(sourceField)
+    ? sourceField
+    : "api";
+  // Shortcut sources carry slightly lower confidence than direct API
+  // hits — a webhook from a known integration is stronger than a
+  // user-built Shortcut whose mapping we don't control.
+  const sourceConfidence = sourceTag === "api" ? 10 : 7;
+
   const now = Date.now();
   const signal = {
     id: now,
@@ -84,8 +98,9 @@ export default async function handler(req, res) {
     eta: typeof eta === "string" && eta.length > 0 ? eta : null,
     status: typeof status === "string" && status.length > 0 ? status : null,
     type: safeType,
-    source: "api",
-    confidence: 10,
+    source: sourceTag,
+    shortcutId: typeof shortcutId === "string" ? shortcutId : null,
+    confidence: sourceConfidence,
     state: "incoming",
     lastUpdate: new Date(now).toLocaleString(),
     metadata: metadata && typeof metadata === "object" ? metadata : null,
