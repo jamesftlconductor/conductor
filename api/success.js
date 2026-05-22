@@ -16,7 +16,7 @@ function escapeHtml(value) {
 }
 
 export default async function handler(req, res) {
-  const { email, householdId, mode } = req.query;
+  const { email, householdId, mode, userId } = req.query;
 
   // Prefer the human-readable household name when one was set during
   // creation; fall back to the household id (for legacy households that
@@ -30,6 +30,21 @@ export default async function handler(req, res) {
   }
 
   const safeName = escapeHtml(householdName);
+
+  // Deep link back into the mobile app. After OAuth, the app needs the
+  // resolved userId to write to AsyncStorage so every screen can stop
+  // hardcoding James's id. Without this round-trip Sarah's app would
+  // call /api/brief?userId=james_... and see James's brief.
+  const safeUserId = typeof userId === "string" && userId.length > 0
+    ? encodeURIComponent(userId)
+    : "";
+  const safeHouseholdId = typeof householdId === "string" && householdId.length > 0
+    ? encodeURIComponent(householdId)
+    : "";
+  const deepLink = safeUserId
+    ? `conductormobile://onboard-success?userId=${safeUserId}${safeHouseholdId ? `&householdId=${safeHouseholdId}` : ""}`
+    : null;
+
   let heading;
   let body;
   let status;
@@ -89,8 +104,35 @@ export default async function handler(req, res) {
           padding: 12px 24px;
           border-radius: 8px;
           font-size: 14px;
+          margin-bottom: 32px;
+        }
+        .returnBtn {
+          display: inline-block;
+          background: #b8960c;
+          color: #0f0f0f;
+          padding: 14px 28px;
+          border-radius: 12px;
+          font-size: 15px;
+          font-weight: 600;
+          text-decoration: none;
+          margin-top: 8px;
+        }
+        .returnHint {
+          color: #5a5855;
+          font-size: 12px;
+          margin-top: 16px;
         }
       </style>
+      ${deepLink ? `<script>
+        // Auto-bounce to the app after a short pause so the OAuth
+        // completion is acknowledged visually before the deep link
+        // fires. iOS Safari needs a user-initiated nav for some
+        // schemes so the visible button below is the reliable
+        // fallback when the auto-redirect is blocked.
+        setTimeout(function() {
+          window.location.href = ${JSON.stringify(deepLink)};
+        }, 1500);
+      </script>` : ""}
     </head>
     <body>
       <div class="logo">C</div>
@@ -98,6 +140,10 @@ export default async function handler(req, res) {
       <p>${body}</p>
       <div class="email">${escapeHtml(email || "")}</div>
       <div class="status">${status}</div>
+      ${deepLink ? `
+        <a href="${deepLink}" class="returnBtn">Return to Conductor →</a>
+        <div class="returnHint">If the app doesn't open automatically, tap the button above.</div>
+      ` : ""}
     </body>
     </html>
   `);
