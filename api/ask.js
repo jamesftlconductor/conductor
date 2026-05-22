@@ -776,7 +776,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { userId, question } = req.body || {};
+  const { userId, question, screenContext } = req.body || {};
   if (!userId || typeof userId !== "string") {
     return res.status(400).json({ error: "Missing or invalid userId" });
   }
@@ -784,6 +784,11 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Missing or invalid question" });
   }
   const trimmedQuestion = question.trim();
+  // screenContext tells the LLM which surface the user invoked The
+  // Conductor from. Used to bias the response toward the data
+  // visible on that screen — e.g. on Vault, lean into deadlines and
+  // subscriptions; on Hover, lean into the radar's signals.
+  const trimmedContext = typeof screenContext === "string" ? screenContext.trim() : "";
 
   // Easter eggs — run BEFORE rate limiting + intent classifier so
   // conversational hits ("tell me a joke") don't burn through the
@@ -987,7 +992,28 @@ export default async function handler(req, res) {
       : userLang === "pt" ? "\n\nIMPORTANT: Respond in natural, conversational Portuguese.\n"
       : userLang === "fr" ? "\n\nIMPORTANT: Respond in natural, conversational French.\n"
       : "";
-    const systemPrompt = `You are The Conductor, the voice and intelligence of the Conductor household platform. You have complete awareness of this household's signals, deadlines, health, weather, crew, and history. Answer questions directly from what you know. Never make things up. Never mention Claude or AI. Speak as The Conductor in first person: "I can see that..." or "Based on what I'm watching..." or "The Conductor has..." When introducing yourself say "I'm The Conductor — ..." (not "I'm Conductor"). Conductor is the platform brand; The Conductor is the presence you embody. Maximum 3 sentences. Plain text only.${langDirective}
+    // Per-screen bias — light prompt addition based on where the
+    // user invoked The Conductor from. Keeps answers focused on the
+    // data the user is already looking at when relevant; falls
+    // through silently for unmapped contexts.
+    const SCREEN_BIAS = {
+      ground: "The user is on the main Ground screen. If they ask broadly, give a concise household overview from the active signals + brief.",
+      hover: "The user is looking at the radar (Hover). Answer with awareness of which signals are currently in motion across the three rings.",
+      vault: "The user is in the Vault. Answer with awareness of upcoming deadlines, subscriptions, renewals, and warranties.",
+      settings: "The user is in Settings. Answer with awareness of preferences, brief schedule, and integrations.",
+      horizon: "The user is on the Horizon. Answer with awareness of items beyond the next two weeks.",
+      crew: "The user is on Crew. Answer with awareness of household members, schedules, and crew-attributed signals.",
+      programme: "The user is on the Programme — the 14-day unified timeline.",
+      calendar: "The user is in the Calendar view. Answer with awareness of upcoming events.",
+      compass: "The user is in Compass — household patterns and trends over time.",
+      journal: "The user is in the Memory Journal — past resolutions and caught moments.",
+      shake: "The user shook the device to ask. They may be looking at any screen; default to a broad household-aware answer.",
+    };
+    const screenBias = trimmedContext && SCREEN_BIAS[trimmedContext]
+      ? `\n\nSCREEN CONTEXT: ${SCREEN_BIAS[trimmedContext]}`
+      : "";
+
+    const systemPrompt = `You are The Conductor, the voice and intelligence of the Conductor household platform. You have complete awareness of this household's signals, deadlines, health, weather, crew, and history. Answer questions directly from what you know. Never make things up. Never mention Claude or AI. Speak as The Conductor in first person: "I can see that..." or "Based on what I'm watching..." or "The Conductor has..." When introducing yourself say "I'm The Conductor — ..." (not "I'm Conductor"). Conductor is the platform brand; The Conductor is the presence you embody. Maximum 3 sentences. Plain text only.${screenBias}${langDirective}
 
 ${ratesBlock}
 
