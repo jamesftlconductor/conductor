@@ -344,6 +344,59 @@ const SETTING_MAP = {
   "midday notifications": { key: "preferences.middayEnabled", value: true, label: "midday notifications" },
 };
 
+// ---------- Conversational action allowlist ----------
+//
+// Only these preference keys can be changed via natural-language
+// requests through The Conductor. Anything else (OAuth, household
+// IDs, payment, privacy) requires the user to open Settings
+// directly. The allowlist also constrains the value space so a
+// stray Haiku extraction can't write a garbage value.
+const SETTINGS_ALLOWLIST = {
+  takeoffHour:           { kind: "hour",    label: "morning brief hour" },
+  clearanceHour:         { kind: "hour",    label: "evening brief hour" },
+  overwatchHour:         { kind: "hour",    label: "Overwatch hour" },
+  communicationTone:     { kind: "enum",    label: "voice tone",    options: ["direct", "balanced", "warm"] },
+  communicationDetail:   { kind: "enum",    label: "voice detail",  options: ["brief", "standard", "thorough"] },
+  financialAwareness:    { kind: "enum",    label: "financial mode",options: ["silent", "awareness", "tracking", "planning"] },
+  voiceResponsesEnabled: { kind: "boolean", label: "voice responses" },
+  soundEnabled:          { kind: "boolean", label: "sound language" },
+  weekendTakeoffDelay:   { kind: "boolean", label: "weekend Takeoff delay" },
+};
+
+function coerceSettingValue(key, raw) {
+  const spec = SETTINGS_ALLOWLIST[key];
+  if (!spec) return { ok: false };
+  if (spec.kind === "hour") {
+    let n = NaN;
+    if (typeof raw === "number") n = raw;
+    else if (typeof raw === "string") {
+      const m = raw.match(/(\d{1,2})\s*(am|pm|AM|PM)?/);
+      if (m) {
+        let h = parseInt(m[1], 10);
+        const period = (m[2] || "").toLowerCase();
+        if (period === "pm" && h < 12) h += 12;
+        if (period === "am" && h === 12) h = 0;
+        n = h;
+      }
+    }
+    if (!isNaN(n) && n >= 0 && n <= 23) return { ok: true, value: n };
+    return { ok: false };
+  }
+  if (spec.kind === "enum") {
+    const v = String(raw || "").toLowerCase().trim();
+    if (spec.options.includes(v)) return { ok: true, value: v };
+    return { ok: false };
+  }
+  if (spec.kind === "boolean") {
+    if (raw === true || raw === false) return { ok: true, value: raw };
+    const v = String(raw || "").toLowerCase().trim();
+    if (["on", "true", "yes", "enable", "enabled"].includes(v)) return { ok: true, value: true };
+    if (["off", "false", "no", "disable", "disabled"].includes(v)) return { ok: true, value: false };
+    return { ok: false };
+  }
+  return { ok: false };
+}
+
 const PRODUCT_KNOWLEDGE = {
   vault: "The Vault is your household's permanent record — insurance policies, subscriptions, warranties, registrations, leases, and deadlines. Conductor populates it from your Gmail automatically. You can also scan physical documents or add items manually.",
   brief: "The brief is a 3-5 sentence morning summary of what matters most in your household today. It arrives at 7am and gets smarter as Conductor learns your patterns.",
@@ -390,12 +443,15 @@ async function classifyIntent(question) {
             properties: {
               intent: {
                 type: "string",
-                enum: ["NAVIGATE", "SETTINGS_CHANGE", "CREATE", "EXPLAIN", "QUERY"],
+                enum: ["NAVIGATE", "SETTINGS_CHANGE", "CREATE", "RESOLVE", "EXPLAIN", "QUERY"],
               },
               destination: { type: ["string", "null"] },
               settingKey: { type: ["string", "null"] },
+              settingValue: { type: ["string", "null"] },
               entity: { type: ["string", "null"] },
               explainTopic: { type: ["string", "null"] },
+              signalDescription: { type: ["string", "null"] },
+              signalEta: { type: ["string", "null"] },
             },
             required: ["intent"],
           },
@@ -407,15 +463,17 @@ async function classifyIntent(question) {
           role: "user",
           content: `Classify this household question into one of these intents:
 - NAVIGATE: wants to go to a screen ("show me vault", "take me to crew", "open settings")
-- SETTINGS_CHANGE: wants to change a setting ("turn on face id", "enable midday")
-- CREATE: wants to create something ("add a reminder", "create a signal")
-- EXPLAIN: wants to understand the product ("what is the vault", "how do I add crew", "what does rest mean")
+- SETTINGS_CHANGE: wants to change a setting ("change my brief to 8am", "set voice to warm", "turn off financial signals", "Overwatch at midnight")
+- CREATE: wants to create a signal/reminder ("add a reminder to call the plumber Friday", "remind me to pay HOA next week", "create a signal for Mia's dentist")
+- RESOLVE: wants to mark an existing signal done ("resolve the plumber signal", "mark the Amazon delivery as done", "rest the HVAC signal")
+- EXPLAIN: wants to understand the product ("what is the vault", "what does rest mean")
 - QUERY: wants household-specific info (everything else, including "what's coming up" / "what should this cost" / "how am I doing")
 
 For NAVIGATE, set destination to the short label (e.g. "vault", "crew", "horizon").
-For EXPLAIN, set explainTopic to the concept being asked about (e.g. "vault", "pulse").
-For SETTINGS_CHANGE, set settingKey to a phrase like "face id" or "midday brief".
-For CREATE, set entity to "signal" or "crew_member".
+For EXPLAIN, set explainTopic to the concept being asked about.
+For SETTINGS_CHANGE, set settingKey to one of: takeoffHour, clearanceHour, overwatchHour, communicationTone, communicationDetail, financialAwareness, voiceResponsesEnabled, soundEnabled, weekendTakeoffDelay, face_id, midday_brief. Set settingValue to the requested value as a string (e.g. "8am", "warm", "thorough", "silent", "off", "midnight").
+For CREATE, set entity to "signal", signalDescription to the action, and signalEta to the timing phrase ("Friday", "next week", null if unspecified).
+For RESOLVE, set signalDescription to the target signal's name/topic ("HVAC", "Amazon delivery").
 
 Question: "${question}"`,
         },
@@ -496,6 +554,226 @@ function buildIntentResponse(intent, question) {
       confidence: "high",
       action: { type: "navigate_offer", destination: routeForTopic(topic) },
     };
+  }
+  return null;
+}
+
+// ---------- Action execution layer ----------
+//
+// Where buildIntentResponse just *routes* (navigate / offer / confirm
+// dialog), executeIntent actually *does the thing*: writes a setting,
+// creates a signal, resolves a signal. Returns a response shape
+// compatible with the mobile ConductorSheet renderer or null to fall
+// through to buildIntentResponse for offer-style intents.
+//
+// Critical invariants:
+//   - SETTINGS_CHANGE only writes keys in SETTINGS_ALLOWLIST. Anything
+//     else falls back to the existing navigate-to-Your-House offer.
+//   - CREATE generates a server-side signal id mirroring the manual
+//     POST shape in signals.js so brief/horizon/radar code paths see it
+//     identically to user-typed signals from the AddSignalSheet.
+//   - RESOLVE requires a single high-confidence (>=0.8) match. Multiple
+//     matches return a chip-style action so the mobile can prompt; zero
+//     matches falls through with a not-found answer + offer to add.
+
+function describeSetting(key, value) {
+  const spec = SETTINGS_ALLOWLIST[key];
+  if (!spec) return `setting`;
+  if (spec.kind === "hour") {
+    const h = value % 12 || 12;
+    const period = value >= 12 ? "pm" : "am";
+    return `${spec.label} to ${h}${period}`;
+  }
+  if (spec.kind === "enum") return `${spec.label} to ${value}`;
+  if (spec.kind === "boolean") return `${spec.label} ${value ? "on" : "off"}`;
+  return spec.label;
+}
+
+async function executeSettingsChange(intent, userId) {
+  const rawKey = String(intent.settingKey || "").trim();
+  const spec = SETTINGS_ALLOWLIST[rawKey];
+  if (!spec) return null; // Not in allowlist — fall through to confirm/navigate.
+  const coerced = coerceSettingValue(rawKey, intent.settingValue);
+  if (!coerced.ok) return null;
+  try {
+    const existingRaw = await redis.get(`user:${userId}:preferences`);
+    const existing = safeJson(existingRaw) || {};
+    const merged = { ...existing, [rawKey]: coerced.value };
+    await redis.set(`user:${userId}:preferences`, JSON.stringify(merged));
+  } catch (err) {
+    console.warn("[ask] executeSettingsChange failed:", err?.message);
+    return null;
+  }
+  const detail = describeSetting(rawKey, coerced.value);
+  const answer = `Done — ${detail}.`;
+  return {
+    answer,
+    spokenAnswer: answer,
+    confidence: "high",
+    action: {
+      type: "setting_changed",
+      settingKey: rawKey,
+      newValue: coerced.value,
+      label: spec.label,
+      detail,
+    },
+    skipCache: true,
+  };
+}
+
+async function executeCreateSignal(intent, userId) {
+  const description = String(intent.signalDescription || "").trim();
+  if (!description) return null;
+  const eta = typeof intent.signalEta === "string" && intent.signalEta.trim().length > 0
+    ? intent.signalEta.trim()
+    : null;
+  const householdId = await resolveHouseholdId(userId);
+  const signal = {
+    id: Date.now(),
+    description,
+    type: "unknown",
+    eta,
+    sender: null,
+    status: null,
+    state: "incoming",
+    source: "conductor",
+    userId,
+    emotionalValence: "neutral",
+    emotionalIntensity: "low",
+    lastUpdate: new Date().toLocaleString(),
+    createdAt: Date.now(),
+  };
+  try {
+    await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
+  } catch (err) {
+    console.warn("[ask] executeCreateSignal failed:", err?.message);
+    return null;
+  }
+  const etaPhrase = eta ? ` for ${eta}` : "";
+  const answer = `Done — added to the radar${etaPhrase}.`;
+  return {
+    answer,
+    spokenAnswer: answer,
+    confidence: "high",
+    action: {
+      type: "signal_created",
+      signal: {
+        id: signal.id,
+        description: signal.description,
+        eta: signal.eta,
+      },
+    },
+    skipCache: true,
+  };
+}
+
+function scoreResolveMatch(target, signal) {
+  const t = target.toLowerCase().trim();
+  if (!t || !signal?.description) return 0;
+  const d = String(signal.description).toLowerCase();
+  if (d === t) return 1;
+  if (d.includes(t) || t.includes(d)) return 0.9;
+  const tTokens = t.split(/\s+/).filter((w) => w.length >= 3);
+  if (tTokens.length === 0) return 0;
+  const dTokens = new Set(d.split(/\s+/));
+  const hits = tTokens.filter((w) => dTokens.has(w) || d.includes(w)).length;
+  return hits / tTokens.length;
+}
+
+async function executeResolveSignal(intent, userId) {
+  const target = String(intent.signalDescription || "").trim();
+  if (!target) return null;
+  const householdId = await resolveHouseholdId(userId);
+  let raw;
+  try {
+    raw = await redis.lrange(`household:${householdId}:signals`, 0, -1);
+  } catch (err) {
+    console.warn("[ask] executeResolveSignal load failed:", err?.message);
+    return null;
+  }
+  const activeStates = new Set(["incoming", "active", "noted", "held"]);
+  const candidates = [];
+  for (const r of raw || []) {
+    let parsed;
+    try { parsed = typeof r === "string" ? JSON.parse(r) : r; } catch { continue; }
+    if (!parsed || !activeStates.has(parsed.state || "incoming")) continue;
+    const score = scoreResolveMatch(target, parsed);
+    if (score >= 0.5) candidates.push({ signal: parsed, raw: r, score });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+
+  if (candidates.length === 0) {
+    const answer = `I don't see a signal for "${target}" on the radar.`;
+    return {
+      answer,
+      spokenAnswer: answer,
+      confidence: "medium",
+      action: { type: "resolve_not_found", target },
+      skipCache: true,
+    };
+  }
+
+  const top = candidates[0];
+  const second = candidates[1];
+  const ambiguous = top.score < 0.8 || (second && (top.score - second.score) < 0.15);
+
+  if (ambiguous) {
+    return {
+      answer: `Which one — ${candidates.slice(0, 3).map((c) => `"${c.signal.description}"`).join(", ")}?`,
+      spokenAnswer: `Which one did you mean?`,
+      confidence: "medium",
+      action: {
+        type: "resolve_disambiguate",
+        target,
+        candidates: candidates.slice(0, 3).map((c) => ({
+          id: c.signal.id,
+          description: c.signal.description,
+        })),
+      },
+      skipCache: true,
+    };
+  }
+
+  // High-confidence single match — flip state to resolved.
+  const updated = {
+    ...top.signal,
+    state: "resolved",
+    resolvedAt: new Date().toISOString(),
+    lastUpdate: new Date().toLocaleString(),
+  };
+  try {
+    await redis.lrem(`household:${householdId}:signals`, 0, top.raw);
+    await redis.lpush(`household:${householdId}:signals`, JSON.stringify(updated));
+  } catch (err) {
+    console.warn("[ask] executeResolveSignal patch failed:", err?.message);
+    return null;
+  }
+  const answer = `Done — rested "${updated.description}".`;
+  return {
+    answer,
+    spokenAnswer: answer,
+    confidence: "high",
+    action: {
+      type: "signal_resolved",
+      signal: {
+        id: updated.id,
+        description: updated.description,
+      },
+    },
+    skipCache: true,
+  };
+}
+
+async function executeIntent(intent, userId) {
+  if (!intent || !intent.intent) return null;
+  if (intent.intent === "SETTINGS_CHANGE") {
+    return await executeSettingsChange(intent, userId);
+  }
+  if (intent.intent === "CREATE" && String(intent.entity || "").toLowerCase().includes("signal")) {
+    return await executeCreateSignal(intent, userId);
+  }
+  if (intent.intent === "RESOLVE") {
+    return await executeResolveSignal(intent, userId);
   }
   return null;
 }
@@ -855,12 +1133,23 @@ export default async function handler(req, res) {
   }
 
   // Intent classification — fast Haiku call before the heavyweight
-  // Sonnet path. NAVIGATE / SETTINGS_CHANGE / CREATE / EXPLAIN
-  // intents short-circuit with a structured action; QUERY falls
-  // through to the existing knowledge-base answer.
+  // Sonnet path. SETTINGS_CHANGE / CREATE / RESOLVE try to *execute*
+  // first via executeIntent; if that returns null (out-of-allowlist
+  // setting, ambiguous create, etc.) we fall through to
+  // buildIntentResponse for the offer/navigate experience. NAVIGATE
+  // and EXPLAIN go straight to the offer path. QUERY falls all the
+  // way through to the knowledge-base answer.
   try {
     const intent = await classifyIntent(trimmedQuestion);
     if (intent && intent.intent !== "QUERY") {
+      const executed = await executeIntent(intent, userId);
+      if (executed) {
+        const { skipCache, ...payload } = executed;
+        if (!skipCache) {
+          try { await redis.set(cacheKey, JSON.stringify(payload), { ex: 600 }); } catch { /* skip */ }
+        }
+        return res.status(200).json({ ...payload, cached: false });
+      }
       const shortcut = buildIntentResponse(intent, trimmedQuestion);
       if (shortcut) {
         try {
