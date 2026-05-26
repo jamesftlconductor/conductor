@@ -36,7 +36,7 @@ export default async function handler(req, res) {
 
   if (error) {
     return res.redirect(
-      `conductorapp://auth?nextdoorError=${encodeURIComponent(error_description || error)}`
+      `conductormobile://auth?nextdoorError=${encodeURIComponent(error_description || error)}`
     );
   }
   if (!code) return res.status(400).json({ error: "No code provided" });
@@ -90,7 +90,7 @@ export default async function handler(req, res) {
       method: "GET",
     }).catch((err) => console.error("Nextdoor initial scan error:", err));
 
-    return res.redirect(`conductorapp://settings?nextdoorConnected=1`);
+    return res.redirect(`conductormobile://settings?nextdoorConnected=1`);
   } catch (err) {
     console.error("Nextdoor callback error:", err);
     return res.status(500).json({ error: "Nextdoor authentication failed" });

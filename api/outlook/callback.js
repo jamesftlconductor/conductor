@@ -22,7 +22,7 @@ export default async function handler(req, res) {
 
   if (error) {
     return res.redirect(
-      `conductorapp://auth?outlookError=${encodeURIComponent(error_description || error)}`
+      `conductormobile://auth?outlookError=${encodeURIComponent(error_description || error)}`
     );
   }
   if (!code) {
@@ -106,7 +106,7 @@ export default async function handler(req, res) {
     // Redirect back into the mobile app. The Settings screen polls
     // /api/outlook/status so it will flip to Connected within a
     // refresh cycle.
-    return res.redirect(`conductorapp://settings?outlookConnected=1`);
+    return res.redirect(`conductormobile://settings?outlookConnected=1`);
   } catch (err) {
     console.error("Outlook callback error:", err);
     return res.status(500).json({ error: "Outlook authentication failed" });

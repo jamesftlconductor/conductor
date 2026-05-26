@@ -19,7 +19,7 @@ export default async function handler(req, res) {
 
   if (error) {
     return res.redirect(
-      `conductorapp://auth?ringError=${encodeURIComponent(error_description || error)}`
+      `conductormobile://auth?ringError=${encodeURIComponent(error_description || error)}`
     );
   }
   if (!code) return res.status(400).json({ error: "No code provided" });
@@ -64,7 +64,7 @@ export default async function handler(req, res) {
     };
     await redis.set(`user:${userId}:ringTokens`, JSON.stringify(tokenData));
 
-    return res.redirect(`conductorapp://settings?ringConnected=1`);
+    return res.redirect(`conductormobile://settings?ringConnected=1`);
   } catch (err) {
     console.error("Ring callback error:", err);
     return res.status(500).json({ error: "Ring authentication failed" });

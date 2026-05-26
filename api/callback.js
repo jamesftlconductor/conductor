@@ -35,7 +35,7 @@ export default async function handler(req, res) {
   const { code, error, state: stateRaw } = req.query;
 
   if (error) {
-    return res.redirect("conductorapp://auth?error=" + error);
+    return res.redirect("conductormobile://auth?error=" + error);
   }
 
   if (!code) {
