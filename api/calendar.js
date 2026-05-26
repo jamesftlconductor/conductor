@@ -147,9 +147,23 @@ export async function runCalendarSync(userId) {
 
   // Identify work calendars from metadata before fetching events.
   const workCalendarIds = new Set();
+  // Consumer-primary safeguard set: a user's own primary calendar on a
+  // consumer email domain (gmail.com, icloud.com, etc.) is by definition
+  // personal — its events should never be opaque-stripped to time
+  // blocks even if Haiku flags them as work. Workspace users get the
+  // strip because their primary is corporate; consumer users don't.
+  const consumerPrimaryCalendarIds = new Set();
+  const userDomain = (userEmail || "").split("@")[1]?.toLowerCase() || "";
+  const userIsConsumer = !!userDomain && CONSUMER_EMAIL_DOMAINS.has(userDomain);
   for (const cal of calendars) {
     if (isWorkCalendar(cal, userEmail, userWorkCalendarName)) workCalendarIds.add(cal.id);
+    if (cal?.primary === true && userIsConsumer) consumerPrimaryCalendarIds.add(cal.id);
   }
+  console.log(
+    `[calendar] ${userId} domain=${userDomain || "(unknown)"} ` +
+    `consumer=${userIsConsumer} primaryCals=${consumerPrimaryCalendarIds.size} ` +
+    `workCals=${workCalendarIds.size}`
+  );
 
   let allEvents = [];
 
@@ -241,9 +255,19 @@ Return only the JSON object.`,
       // workConflictCheck=true), persist only the time block. The title
       // and description were sent to Claude for the classification call
       // itself but are dropped before storage.
+      //
+      // Consumer-primary safeguard: an event on the user's own primary
+      // calendar of a consumer-email account (gmail.com, icloud.com,
+      // etc.) is personal by definition. Haiku will sometimes flag
+      // doctor visits, recurring meetings, or "could conflict" items
+      // as workConflictCheck=true; stripping those leaves the user
+      // staring at unlabeled time-blocks on what is their primary
+      // life calendar. So: keep the full record on consumer-primary,
+      // strip everywhere else.
       const isWorkByLLM =
         classification.type === "work" || classification.workConflictCheck === true;
-      if (isWorkByLLM) {
+      const isOnConsumerPrimary = consumerPrimaryCalendarIds.has(event.calendarId);
+      if (isWorkByLLM && !isOnConsumerPrimary) {
         classified.push(stripToTimeBlock(event, "llm"));
       } else {
         classified.push({ ...event, ...classification, classifiedBy: "llm" });

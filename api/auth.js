@@ -5,6 +5,7 @@ export default async function handler(req, res) {
   const scopes = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/contacts.readonly",
     "email",
     "profile",
   ].join(" ");
