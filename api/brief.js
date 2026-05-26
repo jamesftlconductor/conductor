@@ -1094,6 +1094,19 @@ function eventClassifiedAs(e, keywords) {
   return keywords.some((k) => haystack.includes(k));
 }
 
+// Calendar titles are often generic ("Sarah / James", "Untitled") when
+// Google auto-creates them from flight/hotel confirmation emails. The
+// real specifics — flight number, confirmation code, hotel address,
+// restaurant name — live in the description. Surface a 100-char
+// snippet alongside the title so the brief + transparency layers can
+// reason about what an event actually is, not just when it is.
+function formatEventTitleWithDesc(e) {
+  const title = e?.title || "Untitled";
+  const raw = typeof e?.description === "string" ? e.description : "";
+  const desc = raw.replace(/\s+/g, " ").trim().slice(0, 100);
+  return desc ? `${title} — ${desc}` : title;
+}
+
 function isWithinNextHours(date, hours) {
   const ms = date.getTime() - Date.now();
   return ms >= -HOUR_MS && ms <= hours * HOUR_MS;
@@ -1122,7 +1135,7 @@ async function generateTransparency(brief, pools) {
   };
   const eventList = (arr) => {
     if (!arr || arr.length === 0) return "(none)";
-    return arr.map((e) => `- ${e.title || "Untitled"}`).join("\n");
+    return arr.map((e) => `- ${formatEventTitleWithDesc(e)}`).join("\n");
   };
   const horizonPhrase =
     pools.horizon?.eta ? daysFromTodayPhrase(pools.horizon.eta) : null;
@@ -1239,7 +1252,7 @@ async function generateTheRead(brief, pools) {
   };
   const eventList = (arr) => {
     if (!arr || arr.length === 0) return "(none)";
-    return arr.map((e) => `- ${e.title || "Untitled"}`).join("\n");
+    return arr.map((e) => `- ${formatEventTitleWithDesc(e)}`).join("\n");
   };
 
   const prompt = `You just wrote this brief: ${brief}
@@ -3580,7 +3593,7 @@ export default async function handler(req, res) {
       const owner = `[${ownershipTag(e, userId, householdNameMap, isSingleMember)}]`;
       const friendly = friendlyDateTime(e.start);
       const when = friendly || (e.start ? `raw: ${e.start}` : "Unknown");
-      return `- ${owner} ${e.title || "Untitled"} | ${when}`;
+      return `- ${owner} ${formatEventTitleWithDesc(e)} | ${when}`;
     };
 
     // ---------- first-run branch ----------

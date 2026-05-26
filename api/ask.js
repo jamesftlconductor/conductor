@@ -140,7 +140,14 @@ function formatHealth(health) {
 function formatCalendarLine(ev) {
   const title = ev.title || "Untitled";
   const start = ev.start || "?";
-  return `- ${title} | ${start}`;
+  // Surface description snippet so questions like "what time is my
+  // Paris flight?" can be answered from the description (flight
+  // numbers, confirmation codes, hotel addresses) when the title
+  // is generic. 100-char cap keeps the context block bounded.
+  const rawDesc = typeof ev.description === "string" ? ev.description : "";
+  const desc = rawDesc.replace(/\s+/g, " ").trim().slice(0, 100);
+  const titleWithDesc = desc ? `${title} — ${desc}` : title;
+  return `- ${titleWithDesc} | ${start}`;
 }
 
 function formatProviderLine(p) {
