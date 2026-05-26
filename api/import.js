@@ -427,9 +427,15 @@ async function detectAndStampRecurring(householdId, newSignal) {
   newSignal.recurringInterval = Math.round(avgDays * 10) / 10;
   newSignal.recurringPattern = pattern;
 
-  // Upsert the pattern in household:{id}:patterns hash, keyed by
+  // Upsert the pattern in household:{id}:senderPatterns hash, keyed by
   // "{type}:{senderKey}". Stores enough metadata for the anticipated-
-  // signal generator to fire from the next sync.
+  // signal generator in sync.js to fire on the next run.
+  //
+  // NOTE — the legacy key `household:{id}:patterns` is a LIST written
+  // by onboard-worker.js (observation-pattern records with free-form
+  // {description, frequency} shape) and read by brief.js + signals.js.
+  // The sender-recurrence HASH must live on its own key to avoid the
+  // WRONGTYPE that fires when sync.js does hgetall on a LIST.
   const patternKey = `${newSignal.type}:${senderKey}`;
   const patternRecord = {
     type: newSignal.type,
@@ -443,7 +449,7 @@ async function detectAndStampRecurring(householdId, newSignal) {
     updatedAt: Date.now(),
   };
   try {
-    await redis.hset(`household:${householdId}:patterns`, {
+    await redis.hset(`household:${householdId}:senderPatterns`, {
       [patternKey]: JSON.stringify(patternRecord),
     });
   } catch (err) {

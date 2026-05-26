@@ -109,13 +109,28 @@ async function selfHealHousehold(redis, householdId, members) {
   }
 }
 
-// Anticipated-signal generator. Reads household:{id}:patterns; for each
-// pattern whose last signal is overdue by >20% of its interval, drops
-// an "anticipated" signal into :signals so the brief can surface the
+// Anticipated-signal generator. Reads
+// household:{id}:senderPatterns (HASH, written by api/import.js
+// when a recurring sender pattern is detected); for each pattern
+// whose last signal is overdue by >20% of its interval, drops an
+// "anticipated" signal into :signals so the brief can surface the
 // missing recurring item softly. Idempotent — re-checks for existing
 // anticipated entries before adding a new one.
+//
+// IMPORTANT: this used to read household:{id}:patterns, but that key
+// is a LIST written by onboard-worker.js (observation patterns from
+// the email/calendar sweep) — calling hgetall on it produced
+// WRONGTYPE on every sync. The HASH lives on its own key now.
 async function generateAnticipatedSignals(redis, householdId) {
-  const patternsRaw = await redis.hgetall(`household:${householdId}:patterns`);
+  let patternsRaw;
+  try {
+    patternsRaw = await redis.hgetall(`household:${householdId}:senderPatterns`);
+  } catch (err) {
+    // Defensive: if a future migration leaves the key in an unexpected
+    // type, swallow rather than crashing the entire sync sweep.
+    console.warn(`[anticipated] senderPatterns read failed for ${householdId}:`, err?.message || err);
+    return 0;
+  }
   if (!patternsRaw || Object.keys(patternsRaw).length === 0) return 0;
 
   const signalsKey = `household:${householdId}:signals`;
