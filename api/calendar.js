@@ -19,6 +19,19 @@ const CONSUMER_EMAIL_DOMAINS = new Set([
 
 function isWorkCalendar(cal, userEmail, userWorkCalendarName) {
   const summary = (cal?.summary || "").toLowerCase();
+  // Consumer-primary hard refuse: a user's own primary calendar on a
+  // consumer-email account (gmail.com, icloud.com, etc.) can never be
+  // classified as work, no matter what `/\bwork\b/` regex hits the
+  // summary or what userWorkCalendarName is set to. This guards
+  // against the smart-picker UX where a user accidentally selects
+  // their own primary as their "work calendar" and accidentally
+  // privacy-strips every personal event they own. The
+  // Workspace-primary heuristic still fires for non-consumer
+  // domains via the cal.primary clause below.
+  if (cal?.primary === true && userEmail) {
+    const domain = userEmail.split("@")[1]?.toLowerCase();
+    if (domain && CONSUMER_EMAIL_DOMAINS.has(domain)) return false;
+  }
   if (/\b(work|office)\b/.test(summary)) return true;
   // User-supplied calendar name from Settings (case-insensitive whole-word
   // match). Lets users tag a non-default calendar like "Day Job" or
@@ -75,8 +88,9 @@ function stripToTimeBlock(event, classifiedBy) {
   };
 }
 
-export async function runCalendarSync(userId) {
+export async function runCalendarSync(userId, options = {}) {
   if (!userId) throw new Error("No userId provided");
+  const { force = false } = options;
 
   // Resolve household first so we can check the per-household sync cooldown.
   const hidEarly = await redis.get(`user:${userId}:household`);
@@ -87,6 +101,10 @@ export async function runCalendarSync(userId) {
   // their own runCalendarSync independently and shouldn't block each
   // other on a shared stamp. Reads the legacy household-level stamp as
   // a one-time fallback so post-deploy syncs don't all double-fire.
+  //
+  // `force` bypasses the cooldown. Used by diagnostic callers (manual
+  // POST with force:true) and by the recovery path after clearing a
+  // stale workCalendarName that was poisoning the primary.
   let lastSyncRaw = await redis.get(`user:${userId}:calendarLastSync`);
   if (lastSyncRaw == null) {
     lastSyncRaw = await redis.get(`household:${householdEarly}:calendarLastSync`);
@@ -95,7 +113,7 @@ export async function runCalendarSync(userId) {
     ? (typeof lastSyncRaw === "number" ? lastSyncRaw : parseInt(lastSyncRaw, 10))
     : 0;
   const TWENTY_THREE_HOURS_MS = 23 * 60 * 60 * 1000;
-  if (lastSync && Date.now() - lastSync < TWENTY_THREE_HOURS_MS) {
+  if (!force && lastSync && Date.now() - lastSync < TWENTY_THREE_HOURS_MS) {
     return {
       skipped: true,
       reason: "synced recently",
@@ -358,11 +376,20 @@ export default async function handler(req, res) {
           isWorkCalendar: isWork,
         };
       });
+      // Surface email + consumer flag so the mobile picker can refuse
+      // to save when the user selects their own primary calendar on a
+      // consumer domain. Without this, the picker would happily POST
+      // workCalendarName=james.totalhome@gmail.com and re-introduce the
+      // exact bug Fix B addresses on the backend.
+      const userDomain = (userEmail || "").split("@")[1]?.toLowerCase() || "";
+      const userIsConsumer = !!userDomain && CONSUMER_EMAIL_DOMAINS.has(userDomain);
       return res.status(200).json({
         userId,
         calendars,
         detectedWorkCalendar,
         overrideName,
+        userEmail: userEmail || null,
+        userIsConsumer,
       });
     } catch (err) {
       console.error("Calendar list error:", err);
@@ -374,14 +401,14 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  const { userId } = req.body;
+  const { userId, force } = req.body;
 
   if (!userId) {
     return res.status(400).json({ error: "No userId provided" });
   }
 
   try {
-    const result = await runCalendarSync(userId);
+    const result = await runCalendarSync(userId, { force: force === true });
     return res.status(200).json(result);
   } catch (error) {
     console.error("Calendar error:", error);
