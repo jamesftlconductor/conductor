@@ -3911,6 +3911,15 @@ ${isSingleMember
       travelPrep,
     });
     if (anniversary) synthesisState.anniversaryYearStats = anniversary.yearStats;
+    // Weather canary — surfaces whether the weather fetch actually
+    // populated the synthesis state or came back null, so we can tell
+    // a "Pulse isn't mentioning weather" complaint (data) apart from a
+    // prompt-wiring issue (it's wired — see generatePulseNote).
+    console.log(
+      `[brief] weather canary userId=${userId} weatherState=${synthesisState.weatherState ?? "null"} ` +
+      `tempF=${synthesisState.tempF ?? "null"} humidity=${synthesisState.humidity ?? "null"} ` +
+      `heatIndex=${synthesisState.heatIndex ?? "null"} rawWeather=${weather ? "present" : "null"}`
+    );
     synthesisState.synthesisNote = await generatePulseNote(synthesisState);
 
     // Emotional calibration block — only emitted when there's an

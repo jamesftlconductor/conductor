@@ -1468,6 +1468,18 @@ ${emailText.substring(0, 1000)}`,
         ? signal.emotionalIntensity
         : "low";
 
+      // Subscription / renewal override: money housekeeping is
+      // important but not stressful. Claude sometimes tags an
+      // auto-renew as stressful/high which then drives the brief into
+      // "lead with the stressful signal" mode and reddens the Minimap
+      // weather-vane. Force neutral/low so these read as calm
+      // background, matching the brief-side guard in api/brief.js.
+      const renewalText = `${signal.description || ""}`.toLowerCase();
+      if (/\bsubscription\b|\brenewal\b|auto-?renew|recurring (charge|payment|bill)/.test(renewalText)) {
+        signal.emotionalValence = "neutral";
+        if (signal.emotionalIntensity === "high") signal.emotionalIntensity = "low";
+      }
+
       // Mark as imported once parsing succeeds — covers both the lpush path
       // below and the stale-eta skip, so neither gets re-processed.
       await redis.sadd(importedSetKey, message.id);

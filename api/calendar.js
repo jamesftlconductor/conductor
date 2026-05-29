@@ -317,6 +317,66 @@ Return only the JSON object.`,
   // Stamp per-user so each member's 23h cooldown is independent.
   await redis.set(`user:${userId}:calendarLastSync`, Date.now());
 
+  // Promote upcoming travel events into travel-type signals so they
+  // surface on the Hover radar. Calendar events otherwise only reach
+  // the brief (via calendar-loader) — the signals list that Hover
+  // renders never sees them. A flight/hotel/trip on the calendar
+  // should show up as a dot on the radar like any other signal.
+  //
+  // Dedup by Google's stable event id (singleEvents=true keeps ids
+  // stable across syncs) stamped on the promoted signal as
+  // sourceEventId, so re-sync never creates duplicates.
+  let promotedTravel = 0;
+  try {
+    const signalsKey = `household:${householdId}:signals`;
+    const existingRaw = await redis.lrange(signalsKey, 0, -1);
+    const existingEventIds = new Set();
+    for (const r of existingRaw || []) {
+      try {
+        const sg = typeof r === "string" ? JSON.parse(r) : r;
+        if (sg && sg.sourceEventId) existingEventIds.add(String(sg.sourceEventId));
+      } catch { /* skip malformed */ }
+    }
+    const nowMs = Date.now();
+    for (const ev of classified) {
+      if (ev.type !== "travel") continue;
+      if (!ev.title) continue; // stripped/time-block events carry no title
+      const startMs = ev.start ? Date.parse(ev.start) : NaN;
+      if (isNaN(startMs) || startMs < nowMs) continue; // future only
+      const eventId = ev.id || `${ev.start}|${ev.title}`;
+      if (existingEventIds.has(String(eventId))) continue;
+      const d = new Date(startMs);
+      const when = d.toLocaleString("en-US", {
+        weekday: "short", month: "short", day: "numeric",
+        hour: "numeric", minute: "2-digit",
+      });
+      const signal = {
+        id: Date.now() + promotedTravel,
+        type: "travel",
+        description: `${ev.title} — ${when}`,
+        eta: ev.start,
+        sender: null,
+        status: null,
+        state: "active",
+        source: "calendar",
+        sourceEventId: String(eventId),
+        userId,
+        emotionalValence: "joyful",
+        emotionalIntensity: "high",
+        lastUpdate: new Date().toLocaleString(),
+        createdAt: Date.now(),
+      };
+      await redis.lpush(signalsKey, JSON.stringify(signal));
+      existingEventIds.add(String(eventId));
+      promotedTravel++;
+    }
+    if (promotedTravel > 0) {
+      console.log(`[calendar] promoted ${promotedTravel} travel events to signals for ${userId}`);
+    }
+  } catch (err) {
+    console.warn("[calendar] travel promotion failed:", err?.message || err);
+  }
+
   const householdEvents = classified.filter(e => e.householdRelevant).length;
   const workEvents = classified.filter(e => e.type === "work").length;
   const preTaggedWork = classified.filter(
@@ -329,6 +389,7 @@ Return only the JSON object.`,
     work: workEvents,
     preTagged: preTaggedWork,
     workCalendars: workCalendarIds.size,
+    promotedTravel,
   };
 }
 
