@@ -629,6 +629,15 @@ function safeJson(value) {
   }
 }
 
+// Subscription renewals + recurring financial deadlines are important
+// but not stressful — they shouldn't lead the brief or trip the
+// urgent ring. Detected by description keyword since the classifier
+// types them as "deadline"/"financial" with the cue in the text.
+function isSubscriptionRenewal(s) {
+  const d = (s.description || "").toLowerCase();
+  return /\bsubscription\b|\brenewal\b|auto-?renew|recurring (charge|payment|bill)/.test(d);
+}
+
 function classifyUrgent(s) {
   if (s.priority === "urgent") return true;
   const eta = parseDateLoose(s.eta);
@@ -638,7 +647,11 @@ function classifyUrgent(s) {
     if (s.type === "service" || s.type === "reservation") return true;
     if (s.status === "Out for Delivery") return true;
   }
-  if (s.type === "deadline" && withinNextDays(eta, 3)) return true;
+  // Deadline-within-3-days is urgent EXCEPT subscription/renewal —
+  // those are low-stress money housekeeping. They still flow into the
+  // near-window pool (gated by financialAwareness's 7-day rule), just
+  // never into the urgent bucket where they'd read as alarms.
+  if (s.type === "deadline" && withinNextDays(eta, 3) && !isSubscriptionRenewal(s)) return true;
   return false;
 }
 
@@ -1781,7 +1794,14 @@ function synthesizeHouseholdState({
   // ACTIVE" / "HIGH STRESS" / "MILESTONE" blocks only need one
   // anchoring signal each to calibrate tone.
   const highIntensitySignals = (activeSignals || []).filter(
-    (s) => s?.emotionalIntensity === "high" && (!s.state || s.state === "incoming" || s.state === "active")
+    (s) =>
+      s?.emotionalIntensity === "high" &&
+      (!s.state || s.state === "incoming" || s.state === "active") &&
+      // A subscription renewal is never a stressor, no matter how the
+      // import classifier tagged its valence/intensity. Excluding it
+      // here keeps it out of activeStress so the brief doesn't switch
+      // into "lead with the stressful signal" mode over an auto-renew.
+      !isSubscriptionRenewal(s)
   );
   const dominantValence = highIntensitySignals.length > 0
     ? highIntensitySignals[0].emotionalValence || "neutral"
