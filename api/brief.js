@@ -2725,7 +2725,11 @@ export default async function handler(req, res) {
     // returns the cached response verbatim. firstRun branch is
     // deliberately not cached (one-shot welcome flow).
     const CURRENT_TAKEOFF_TTL_S = 6 * 60 * 60;
-    if (userId) {
+    // ?fresh=1 bypasses the currentTakeoff cache to force a full
+    // regeneration. Diagnostic/QA lever — lets us see the effect of a
+    // signal or prompt change without waiting out the 6h TTL.
+    const forceFresh = req.query?.fresh === "1" || req.query?.fresh === "true";
+    if (userId && !forceFresh) {
       const cached = safeJson(await redis.get(`user:${userId}:currentTakeoff`));
       if (cached && typeof cached.brief === "string") {
         return res.status(200).json(cached);

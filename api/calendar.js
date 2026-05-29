@@ -320,21 +320,38 @@ Return only the JSON object.`,
   // Promote upcoming travel events into travel-type signals so they
   // surface on the Hover radar. Calendar events otherwise only reach
   // the brief (via calendar-loader) — the signals list that Hover
-  // renders never sees them. A flight/hotel/trip on the calendar
-  // should show up as a dot on the radar like any other signal.
+  // renders never sees them.
   //
-  // Dedup by Google's stable event id (singleEvents=true keeps ids
-  // stable across syncs) stamped on the promoted signal as
-  // sourceEventId, so re-sync never creates duplicates.
+  // Emotional intensity scales with PROXIMITY, not the fact that it's
+  // travel. A trip three weeks out is calm background; only the
+  // imminent legs deserve high intensity. Without this, a far-out
+  // flight became the household's high-intensity "milestone" anchor
+  // and the brief led with it — fabricating "Miami tomorrow night"
+  // for an arrival 24 days away. Bands:
+  //   <= 2 days  → high   (this is happening now)
+  //   <= 10 days → medium (coming up, worth holding)
+  //   else       → low    (on the horizon, quiet)
+  //
+  // Upsert by Google's stable event id (sourceEventId): on re-sync we
+  // UPDATE the existing signal's intensity (so the band tightens as
+  // the trip approaches) rather than skip — and never create dupes.
+  function travelIntensityFor(startMs, nowMs) {
+    const days = (startMs - nowMs) / (24 * 60 * 60 * 1000);
+    if (days <= 2) return "high";
+    if (days <= 10) return "medium";
+    return "low";
+  }
+
   let promotedTravel = 0;
+  let updatedTravel = 0;
   try {
     const signalsKey = `household:${householdId}:signals`;
     const existingRaw = await redis.lrange(signalsKey, 0, -1);
-    const existingEventIds = new Set();
-    for (const r of existingRaw || []) {
+    const existingByEventId = new Map();
+    for (let i = 0; i < (existingRaw || []).length; i++) {
       try {
-        const sg = typeof r === "string" ? JSON.parse(r) : r;
-        if (sg && sg.sourceEventId) existingEventIds.add(String(sg.sourceEventId));
+        const sg = typeof existingRaw[i] === "string" ? JSON.parse(existingRaw[i]) : existingRaw[i];
+        if (sg && sg.sourceEventId) existingByEventId.set(String(sg.sourceEventId), { i, sg });
       } catch { /* skip malformed */ }
     }
     const nowMs = Date.now();
@@ -343,8 +360,25 @@ Return only the JSON object.`,
       if (!ev.title) continue; // stripped/time-block events carry no title
       const startMs = ev.start ? Date.parse(ev.start) : NaN;
       if (isNaN(startMs) || startMs < nowMs) continue; // future only
-      const eventId = ev.id || `${ev.start}|${ev.title}`;
-      if (existingEventIds.has(String(eventId))) continue;
+      const eventId = String(ev.id || `${ev.start}|${ev.title}`);
+      const intensity = travelIntensityFor(startMs, nowMs);
+
+      const existing = existingByEventId.get(eventId);
+      if (existing) {
+        // Upsert: keep state/id, refresh the proximity-derived
+        // intensity so an aging trip tightens correctly. Only write
+        // if something actually changed.
+        const { i, sg } = existing;
+        if (sg.emotionalIntensity !== intensity || sg.emotionalValence !== "joyful") {
+          sg.emotionalIntensity = intensity;
+          sg.emotionalValence = "joyful";
+          sg.lastUpdate = new Date().toLocaleString();
+          await redis.lset(signalsKey, i, JSON.stringify(sg));
+          updatedTravel++;
+        }
+        continue;
+      }
+
       const d = new Date(startMs);
       const when = d.toLocaleString("en-US", {
         weekday: "short", month: "short", day: "numeric",
@@ -359,19 +393,19 @@ Return only the JSON object.`,
         status: null,
         state: "active",
         source: "calendar",
-        sourceEventId: String(eventId),
+        sourceEventId: eventId,
         userId,
         emotionalValence: "joyful",
-        emotionalIntensity: "high",
+        emotionalIntensity: intensity,
         lastUpdate: new Date().toLocaleString(),
         createdAt: Date.now(),
       };
       await redis.lpush(signalsKey, JSON.stringify(signal));
-      existingEventIds.add(String(eventId));
+      existingByEventId.set(eventId, { i: -1, sg: signal });
       promotedTravel++;
     }
-    if (promotedTravel > 0) {
-      console.log(`[calendar] promoted ${promotedTravel} travel events to signals for ${userId}`);
+    if (promotedTravel > 0 || updatedTravel > 0) {
+      console.log(`[calendar] travel promotion for ${userId}: +${promotedTravel} new, ${updatedTravel} updated`);
     }
   } catch (err) {
     console.warn("[calendar] travel promotion failed:", err?.message || err);
