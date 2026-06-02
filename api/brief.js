@@ -4,6 +4,7 @@ import { loadCamouflageRules, applyCamouflage } from "./signals.js";
 import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
 import { loadNetworkContext } from "./network.js";
 import { isMaintenanceOfferReady } from "./maintenance.js";
+import { groupSignalsByTrip } from "./trip-threads.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -3440,6 +3441,34 @@ export default async function handler(req, res) {
       return lines.join("\n");
     }
 
+    // TRIP THREAD — multi-leg trips (flights, hotels, connections,
+    // possibly spanning several cities) grouped under one stable threadId
+    // by api/trip-threads.js. When present, the brief narrates the WHOLE
+    // trip as a single item rather than listing each leg as its own
+    // signal. Distinct from TRAVEL PREP, which only fires inside the 72h
+    // pre-departure window; a trip thread surfaces as soon as its legs
+    // share the trip window, even weeks out.
+    const tripThreads = groupSignalsByTrip(activeSignals);
+    const tripThemeById = new Map();
+    for (const g of tripThreads) {
+      for (const s of g.signals) tripThemeById.set(String(s.id), g.window.theme);
+    }
+    function formatTripThreadBlock() {
+      if (!tripThreads.length) return null;
+      const lift = (eta) => {
+        const phrase = eta ? daysFromTodayPhrase(eta) : null;
+        return phrase ? ` (${phrase})` : "";
+      };
+      return tripThreads
+        .map((g) => {
+          const legs = g.signals
+            .map((s) => `  - ${s.description || "Travel"}${lift(s.eta)}`)
+            .join("\n");
+          return `${g.window.theme} | destination: ${g.window.destination} | ${g.signals.length} linked signals:\n${legs}`;
+        })
+        .join("\n");
+    }
+
     // FLAGGED CATEGORIES — match against nearSignals + calendar events.
     // nearSignals is already background-filtered above, so flagged-category
     // matches inherit the mute behavior automatically.
@@ -3611,7 +3640,13 @@ export default async function handler(req, res) {
         typeof s.briefCount === "number" && s.briefCount >= 3
           ? ` | briefCount: ${s.briefCount}`
           : "";
-      return `- ${owner} ${tenant}${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}${freshnessTag(s)}${carryTag}`;
+      // Trip tag ties a near-window leg back to its TRIP THREAD block so
+      // the model collapses the legs into one trip mention rather than
+      // re-listing each as a standalone signal. Routing metadata only —
+      // the prompt is told never to print it.
+      const tripTheme = tripThemeById.get(String(s.id));
+      const tripTag = tripTheme ? ` | trip: ${tripTheme}` : "";
+      return `- ${owner} ${tenant}${s.description || "Unknown"} | ${s.status || "Unknown"} | ETA: ${etaWithFriendly(s.eta)} | Type: ${s.type || "unknown"}${freshnessTag(s)}${carryTag}${tripTag}`;
     };
     const formatEvent = (e) => {
       const owner = `[${ownershipTag(e, userId, householdNameMap, isSingleMember)}]`;
@@ -3996,6 +4031,9 @@ ${isSingleMember
       `TRAVEL PREP (within 72 hours — when this layer is non-empty, lead with it):`,
       travelPrep ? formatTravelPrepBlock() : "None",
       ``,
+      `TRIP THREAD (multiple travel signals that belong to ONE trip — narrate the trip as a single item, never as separate signals):`,
+      tripThreads.length > 0 ? formatTripThreadBlock() : "None",
+      ``,
       `CONFLICTS DETECTED (surface these naturally and specifically — these are the most important things to mention):`,
       conflictLines,
       ``,
@@ -4191,6 +4229,7 @@ ${isSingleMember
 - Anticipated signals: signals with type "anticipated" OR anticipated:true represent a recurring sender that's overdue — they're inferred, not confirmed. Frame them as expected-but-unconfirmed: "Your usual [description] from [sender] is due — hasn't arrived yet." Never frame as definite ("the renewal is here"); never invent timing for them beyond what the expectedByDate field carries.
 - LOCAL SAFETY (Nextdoor): signals with type "local_safety" come from the household's Nextdoor neighborhood feed (sender: "Nextdoor"). These are tier-1 — surface them regardless of signal load, and lead with them when present today. Frame as neighborhood awareness, not panic: "A break-in was reported on the next block — worth locking the side gate before bed." Never invent details beyond what the description carries; if the description is sparse, keep the mention short and add "from a Nextdoor post" so the user can verify in-app.
 - Threaded signals: when multiple signals share the same threadId, narrate them as ONE item rather than separately. Use the thread summary as the subject and weave the individual pieces into the same sentence. Example: instead of "Your hotel reservation is confirmed. Your dinner reservation is set. Your airport transfer is booked." write "Your Paris trip has three things moving — hotel, dinner, and airport transfer all look set." Treat the thread as the single referent for purposes of the uniqueness rule (one mention, one sentence, one closer).
+- TRIP THREAD (highest priority for travel grouping): when the TRIP THREAD layer is non-empty, the entire trip is ONE referent — never enumerate its individual flights, hotels, or connections as separate signals, and never count those legs against the brief as distinct mentions. Use the provided theme verbatim as the subject (e.g. "Paris trip — June 12-23") and collapse the legs into a single sentence naming the trip and that the pieces are in motion. Apply the household's ownership framing to the subject (e.g. "James and Sarah's Paris trip is June 12-23 — flights, hotels, and connections are all on the radar."). Any near-window signal line tagged "| trip: {theme}" is one of those legs — it has already been absorbed into the trip sentence, so do NOT mention it again on its own. The trip counts as exactly one signal for the uniqueness rule. If the trip is more than 14 days out, the standard horizon-closer eligibility still applies; if within 14 days, reference it by its date range, not a horizon closer.
 - CRITICAL — NO INVENTED DATE RANGES OR WINDOWS: When a signal has no specific ETA, do NOT fabricate a date range or vague window in place of the missing date. Specifically banned: "sometime between {X} and {Y}", "expected sometime in {month/season}", "by the end of {the year/month/quarter}", "around the {end/middle/start} of {month/year}", "in the next {month/quarter/season} or so", "anywhere from {X} to {Y}", "{date} through {date}" when neither bound came from the authoritative ETA. A signal with no ETA stays dateless — acceptable phrasings: "no confirmed date yet", "still in motion", "details still coming through", "Conductor is watching for it". Fabricated windows are NEVER acceptable, even when they feel like a reasonable guess (e.g. a "Chime Card on its way" signal does NOT get "expected sometime between mid-December and the end of the year" — it stays dateless).
 - CRITICAL RULE — INTER-SIGNAL GAP PHRASES: When two future-dated items appear in the same brief, do NOT characterize the gap between them with a relative-duration phrase. ANY number — digit ("11", "5", "8") OR spelled out ("eleven", "five", "eight", "twelve", "fifteen", "twenty", "thirty", any English number word) OR quantifier ("a", "a few", "several", "a couple of", "about two", "roughly three") — combined with ANY time unit ("day", "days", "week", "weeks", "month", "months", "year", "years") and ANY linking preposition or adverb ("later", "after", "before", "ahead", "out", "away", "from now", "earlier", "down the line", "down the road", "afterward", "subsequently", "thereafter") forms a FORBIDDEN gap phrase. Concrete forbidden examples (all banned): "eleven days later", "11 days later", "five days after", "5 days after", "a week later", "two weeks later", "twelve days afterward", "eight days out", "three weeks ahead", "a couple of days after". The dates themselves convey the timing — May 20 and May 28 already tell the reader the gap. Permitted sequential framings: "the following Thursday", "and another", "then", "on the {weekday}, {date}", or just two complete sentences with both dates. If you wrote a sentence containing any "<number-or-quantifier> <time-unit> <linking-word>" pattern referring to the spacing between two signals, DELETE that phrase and let the dates stand alone.
 - The ETA friendly field includes an authoritative parenthesized phrase like "(in 6 days)", "(in 2 weeks)", "(today)", or "(tomorrow)". The server picks the unit — it emits a weeks-form ONLY when the gap is an exact multiple of 7 days; otherwise it emits days. If you want to convey how soon something is, lift that phrase VERBATIM as a contiguous substring of your sentence — character-for-character, including the leading word ("in"). Examples of CORRECT lifts: "renewing in 5 days", "her birthday is in 1 week", "due today". Examples of INCORRECT lifts even though they preserve the timing: "gives you a week to think" (dropped "in", changed "1" → "a"), "5 days from today" (added "from today"), "a week away" (paraphrased "in 1 week"). The exact authoritative tokens must appear; embedding into a longer prose phrase is fine as long as the lifted substring is intact. Never substitute one unit for another: do NOT convert "(in 14 days)" to "in 2 weeks", do NOT convert "(in 5 days)" to "a few days", do NOT round "(in 13 days)" to "in 2 weeks". The ONLY two acceptable timing forms in the brief are: (1) the lifted parenthesized phrase verbatim, and (2) the day-and-date ("Wednesday, May 20"). Any other quantified duration is forbidden — this is a PATTERN rule, not a list-of-examples rule. The forbidden pattern is "<number-or-quantifier> <time-unit> <preposition>" where number-or-quantifier is anything like "5", "five", "a", "a couple of", "several", "a few", "about two", time-unit is days/weeks/months/years (singular OR plural), and preposition is away/out/left/remaining/from now/to <verb>/until <date>/later/before. Non-exhaustive examples that are ALL forbidden: "five days away", "5 days out", "five days left", "five days to renew", "two weeks later", "two weeks out", "two weeks away", "two weeks left", "a week out", "a couple of weeks away", "in about three weeks", "a few days from now", "next week", "soon", "shortly". If you find yourself constructing any duration phrase that isn't the lifted parenthesized phrase, stop and use the date alone instead — the day-and-date is always sufficient on its own. When using a lifted "(in N days)" phrase, NEVER place it after the word "until", "before", or "by" — the construction "until in N days", "before in N days", "by in N days" is ungrammatical and always reads as broken English. Examples of FORBIDDEN glue: "doesn't come due until in 11 days", "isn't needed before in 5 days", "wraps up by in 3 days". Instead either (1) use the date only — "doesn't come due until Thursday, May 28" — or (2) restructure so the lifted phrase starts the timing clause — "comes due in 11 days, on Thursday, May 28". The lifted phrase belongs at the start of a timing reference, not glued after a preposition. Also forbidden: window phrases like "in the next N days/weeks", "over the next N days", "within the next N days", "the next N days", "in the coming N days". N here means ANY quantity slot — digit ("3", "11"), spelled-out number ("three", "eleven"), OR quantifier ("few", "several", "couple", "handful", "couple of", "a few", "a couple of"). Every variant is forbidden: "in the next three days", "in the next 3 days", "in the next few days", "in the next several days", "over the coming couple of days", "within the next handful of days" — all banned. These are paraphrased windows, not lifted authoritative phrases. Use specific dates only, or lift the exact parenthesized phrase provided. Example: instead of "Two subscriptions need attention in the next three days" or "Two subscriptions need attention in the next few days" write "Two subscriptions are due this week — Health Tech Nerds on Wednesday and Google Home on the 28th."

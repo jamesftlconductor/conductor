@@ -4,6 +4,7 @@ import { loadHouseholdCalendar } from "./calendar-loader.js";
 import { detectOrLoadLocation, saveHouseholdLocation, loadHouseholdLocation } from "./location.js";
 import { writeCommonsRecord } from "./commons.js";
 import { IMAP_PRESETS, encrypt, validateImapConnection } from "./imap-import.js";
+import { synthesizeTripThreads } from "./trip-threads.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -4341,6 +4342,14 @@ export default async function handler(req, res) {
 
     if (req.method === "GET") {
       const householdId = await resolveHouseholdId(req.query.userId);
+      // Synthesize known multi-leg trips into a single thread BEFORE
+      // loading — stamps threadId on the member signals + writes the
+      // thread record so the radar can cluster them and the thread-read
+      // endpoint can expand them. Best-effort: a failure here must never
+      // block the signals list.
+      await synthesizeTripThreads(redis, householdId).catch((err) =>
+        console.warn("[trip-thread] synthesis failed:", err?.message || err)
+      );
       const [{ signals }, camouflageRules] = await Promise.all([
         loadSignals(householdId),
         loadCamouflageRules(householdId),
