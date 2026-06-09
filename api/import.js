@@ -7,6 +7,7 @@ import {
 } from "./carrier.js";
 import { writeCommonsRecord, logAutoResolvedMemory } from "./commons.js";
 import { extractSignalLocation } from "./places.js";
+import { matchTripWindow } from "./trip-threads.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -1208,6 +1209,176 @@ function safeParseSignal(raw) {
   }
 }
 
+// ---------- household-aware context ----------
+//
+// Loaded once per import run and reused across every email so the
+// classifier sees who this household is, what's already on their plate,
+// and how they tend to act — without an extra Redis round-trip per email.
+
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December",
+];
+
+function currentSeason(monthIdx) {
+  // Northern-hemisphere buckets; the household market is US-based.
+  if (monthIdx === 11 || monthIdx <= 1) return "winter";
+  if (monthIdx <= 4) return "spring";
+  if (monthIdx <= 7) return "summer";
+  return "autumn";
+}
+
+async function loadHouseholdContext(householdId, userId) {
+  const [rawSenderPatterns, rawMemory, rawPrefs, rawSignals] = await Promise.all([
+    redis.hgetall(`household:${householdId}:senderPatterns`).catch(() => null),
+    redis.lrange(`household:${householdId}:memory`, 0, 199).catch(() => []),
+    redis.get(`user:${userId}:preferences`).catch(() => null),
+    redis.lrange(`household:${householdId}:signals`, 0, 199).catch(() => []),
+  ]);
+
+  // senderPatterns hash holds two record shapes: recurrence records keyed
+  // "{type}:{senderKey}" (written by detectAndStampRecurring) and per-sender
+  // aggregates keyed "sender:{senderKey}" (written by updateSenderLearning).
+  // We only want the aggregates here.
+  const senderAgg = new Map();
+  if (rawSenderPatterns && typeof rawSenderPatterns === "object") {
+    for (const [k, v] of Object.entries(rawSenderPatterns)) {
+      if (!k.startsWith("sender:")) continue;
+      let rec;
+      try { rec = typeof v === "string" ? JSON.parse(v) : v; } catch { continue; }
+      if (rec && rec.senderKey) senderAgg.set(rec.senderKey, rec);
+    }
+  }
+
+  const memory = (rawMemory || [])
+    .map((r) => { try { return typeof r === "string" ? JSON.parse(r) : r; } catch { return null; } })
+    .filter(Boolean);
+
+  let prefs = {};
+  try { prefs = typeof rawPrefs === "string" ? JSON.parse(rawPrefs) : (rawPrefs || {}); } catch { prefs = {}; }
+
+  const signals = (rawSignals || []).map(safeParseSignal).filter(Boolean);
+  const active = signals.filter((s) => !s.state || s.state === "incoming" || s.state === "active");
+  const activeTypeCounts = {};
+  for (const s of active) {
+    const t = s.type || "unknown";
+    activeTypeCounts[t] = (activeTypeCounts[t] || 0) + 1;
+  }
+
+  // Resolution-speed patterns per type, drawn from the memory log's resolved
+  // entries (each carries daysInSystem = how long it sat before resolving).
+  const typeSpeed = new Map();
+  for (const e of memory) {
+    if (e.action !== "resolved" || typeof e.daysInSystem !== "number") continue;
+    const t = e.type || "unknown";
+    const cur = typeSpeed.get(t) || { sum: 0, n: 0 };
+    cur.sum += e.daysInSystem;
+    cur.n += 1;
+    typeSpeed.set(t, cur);
+  }
+  const typeAvg = [...typeSpeed.entries()].map(([type, v]) => ({ type, avgDays: v.sum / v.n }));
+  const fastTypes = typeAvg.filter((x) => x.avgDays <= 1).sort((a, b) => a.avgDays - b.avgDays).map((x) => x.type).slice(0, 3);
+  const slowTypes = typeAvg.filter((x) => x.avgDays >= 3).sort((a, b) => b.avgDays - a.avgDays).map((x) => x.type).slice(0, 3);
+
+  const now = new Date();
+  return {
+    senderAgg,
+    memory,
+    prefs,
+    activeCount: active.length,
+    activeTypeCounts,
+    fastTypes,
+    slowTypes,
+    month: MONTH_NAMES[now.getMonth()],
+    season: currentSeason(now.getMonth()),
+  };
+}
+
+// One human-readable line summarizing what this household has seen from a
+// given sender. Feeds the HOUSEHOLD CONTEXT prompt block.
+function senderHistoryLine(ctx, sender) {
+  const key = normalizeSenderForPattern(sender);
+  if (!key) return "Unknown sender.";
+  const agg = ctx.senderAgg.get(key);
+  if (!agg) return "New sender — no prior signals from them.";
+  const types = agg.typeCounts && Object.keys(agg.typeCounts).length
+    ? Object.entries(agg.typeCounts).sort((a, b) => b[1] - a[1]).map(([t, n]) => `${t}×${n}`).join(", ")
+    : "unknown types";
+  const resol = typeof agg.avgResolutionHours === "number"
+    ? `avg resolution ~${Math.round(agg.avgResolutionHours)}h`
+    : "no resolution history yet";
+  const acted = (agg.restedCount != null || agg.ignoredCount != null)
+    ? `; ${agg.restedCount || 0} rested / ${agg.ignoredCount || 0} let expire`
+    : "";
+  return `${agg.emailCount || 0} prior emails (types: ${types}); ${resol}${acted}`;
+}
+
+function buildHouseholdContextBlock(ctx, from) {
+  const priorities = Array.isArray(ctx.prefs?.priorities) && ctx.prefs.priorities.length
+    ? ctx.prefs.priorities.join(", ")
+    : (ctx.prefs?.communicationStyle ? `communication style: ${ctx.prefs.communicationStyle}` : "none set");
+  const activeBreakdown = Object.keys(ctx.activeTypeCounts).length
+    ? ` (${Object.entries(ctx.activeTypeCounts).map(([t, n]) => `${t}×${n}`).join(", ")})`
+    : "";
+  const busy = ctx.activeCount >= 8 ? " — this is a busy signal week" : "";
+  return `HOUSEHOLD CONTEXT (use this to classify more accurately — it informs confidence, urgency, and emotional intensity, but NEVER invent fields it doesn't support):
+Sender history: ${senderHistoryLine(ctx, from)}
+Active signal load: ${ctx.activeCount} signals currently active${activeBreakdown}${busy}
+Household priorities: ${priorities}
+Financial awareness: ${ctx.prefs?.financialAwareness || "default"}
+Recent patterns: handles ${ctx.fastTypes.length ? ctx.fastTypes.join("/") : "—"} quickly; lets ${ctx.slowTypes.length ? ctx.slowTypes.join("/") : "—"} sit longer
+Season/timing: ${ctx.month} (${ctx.season})
+
+Guidance:
+- A renewal/subscription from a sender they've never acted on is lower priority — lean toward lower confidence and low intensity.
+- A service/appointment email during a busy signal week may warrant higher urgency.
+- Respect the household's financial-awareness setting when scoring financial signals (a "low" setting means downplay routine money housekeeping).
+- Do not let this context override what the email plainly says — it breaks ties, it doesn't fabricate.`;
+}
+
+// Sender learning — after a signal lands, fold it into the per-sender
+// aggregate so future imports get a richer prior. emailCount + type mix come
+// from the live stream; resolution outcomes are recomputed from the memory
+// log (which records sender + action + daysInSystem on every resolution), so
+// the model improves without hooking the resolve path.
+async function updateSenderLearning(householdId, signal, ctx) {
+  const key = normalizeSenderForPattern(signal.sender);
+  if (!key) return;
+  let resHoursSum = 0, resN = 0, rested = 0, ignored = 0;
+  for (const e of ctx.memory) {
+    if (normalizeSenderForPattern(e.sender) !== key) continue;
+    if (e.action === "resolved") {
+      rested += 1;
+      if (typeof e.daysInSystem === "number") { resHoursSum += e.daysInSystem * 24; resN += 1; }
+    } else if (e.action === "expired") {
+      ignored += 1;
+    }
+  }
+  const existing = ctx.senderAgg.get(key) || {};
+  const typeCounts = { ...(existing.typeCounts || {}) };
+  const t = signal.type || "unknown";
+  typeCounts[t] = (typeCounts[t] || 0) + 1;
+  const rec = {
+    sender: signal.sender || existing.sender || null,
+    senderKey: key,
+    emailCount: (existing.emailCount || 0) + 1,
+    typeCounts,
+    restedCount: rested,
+    ignoredCount: ignored,
+    avgResolutionHours: resN > 0 ? Math.round((resHoursSum / resN) * 10) / 10 : (existing.avgResolutionHours ?? null),
+    firstSeenAt: existing.firstSeenAt || Date.now(),
+    lastSeenAt: Date.now(),
+  };
+  try {
+    await redis.hset(`household:${householdId}:senderPatterns`, { [`sender:${key}`]: JSON.stringify(rec) });
+    // Keep ctx fresh so later emails in the same run from this sender see
+    // the bumped count immediately.
+    ctx.senderAgg.set(key, rec);
+  } catch (err) {
+    console.warn("[sender-learning] write failed:", err?.message || err);
+  }
+}
+
 export async function runImport(userId, customQuery = null) {
   if (!userId) throw new Error("No userId provided");
 
@@ -1234,6 +1405,15 @@ export async function runImport(userId, customQuery = null) {
 
   if (!searchData.messages || searchData.messages.length === 0) {
     return { imported: 0, debug: "No messages found" };
+  }
+
+  // Household-aware context — loaded once, reused for every email this run.
+  // Best-effort: a failure here degrades to context-free classification.
+  let householdContext = null;
+  try {
+    householdContext = await loadHouseholdContext(householdId, userId);
+  } catch (err) {
+    console.warn("[context] load failed:", err?.message || err);
   }
 
   let imported = 0;
@@ -1432,7 +1612,7 @@ And intensity:
 When in doubt, default to neutral/low — most package deliveries and routine
 service reminders are neutral/low. Only mark high-intensity when the signal
 genuinely changes the shape of the day.
-
+${householdContext ? "\n" + buildHouseholdContextBlock(householdContext, from) + "\n" : ""}
 Subject: ${subject}
 From: ${from}
 
@@ -1711,15 +1891,27 @@ ${emailText.substring(0, 1000)}`,
         console.error("[recurring] detection error:", err?.message || err);
       }
 
-      // Thread detection — groups related signals (same sender within
-      // 30d, ETA within 7d of an existing same-sender signal, or
-      // shared destination/city keyword). Stamps threadId on the new
-      // signal AND backfills onto matched existing signals so the
-      // brief and Hover can narrate/render them as one item.
-      try {
-        await detectAndStampThread(householdId, signal);
-      } catch (err) {
-        console.error("[thread] detection error:", err?.message || err);
+      // Trip-window auto-assignment takes precedence over the generic
+      // thread detector. If this signal's description + ETA fall inside a
+      // known trip window (api/trip-threads.js), stamp the stable trip
+      // threadId directly so every leg — even across different cities the
+      // generic detector would split — lands under one thread. The thread
+      // record itself is (re)written by synthesizeTripThreads on the next
+      // signals GET. Otherwise fall back to the generic same-sender/city
+      // thread detector.
+      const tripWindow = matchTripWindow(signal);
+      if (tripWindow) {
+        signal.threadId = tripWindow.threadId;
+        signal.tripThread = tripWindow.threadId;
+        console.log(
+          `[trip] auto-assigned signal "${(signal.description || "").slice(0, 50)}" → ${tripWindow.threadId}`
+        );
+      } else {
+        try {
+          await detectAndStampThread(householdId, signal);
+        } catch (err) {
+          console.error("[thread] detection error:", err?.message || err);
+        }
       }
 
       // Location extraction — service / appointment / reservation
@@ -1820,6 +2012,16 @@ ${emailText.substring(0, 1000)}`,
       await redis.lpush(signalsKey, JSON.stringify(signal));
       await redis.sadd(fingerprintSetKey, fp);
       imported++;
+
+      // Sender learning — fold this sender into the per-sender aggregate
+      // so the next run's HOUSEHOLD CONTEXT block is a little smarter.
+      if (householdContext) {
+        try {
+          await updateSenderLearning(householdId, signal, householdContext);
+        } catch (err) {
+          console.warn("[sender-learning] update error:", err?.message || err);
+        }
+      }
 
       // Provider extraction — runs only when the signal looks like a
       // service-company touchpoint (classified type "service" or sender
