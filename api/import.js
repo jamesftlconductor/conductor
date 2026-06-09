@@ -32,6 +32,12 @@ function contentFingerprint(signal) {
 // like "special buys" / "save up to" were added empirically after the patterns
 // endpoint surfaced Home Depot Pro promo emails escaping the original list.
 const PROMO_REGEX = /\b(?:sale|off|discount|promo|deal|offer|coupon|shop now|limited time|exclusive|unsubscribe|special buys?|save up to|promo code|shop today|now extended|free shipping|free delivery)\b|%\s*off/i;
+// Death-certificate / obituary / estate-probate vocabulary. These emails are
+// almost always spam, legal/financial solicitations ("order a certified
+// death certificate"), or deeply personal notices — none of which should
+// ever become an actionable household signal. Matched against the classified
+// description + sender so a misclassified one is dropped at the gate.
+const DEATH_NOISE_REGEX = /\b(?:death\s*certificate|certificate\s*of\s*death|obituary|obituaries|funeral|memorial\s*service|estate\s*(?:settlement|planning|administration)|probate|condolence|in\s*memoriam|next\s*of\s*kin|bereavement|cremation|mortuary)\b/i;
 const PROMO_SENDER_PREFIXES = ["noreply", "no-reply", "marketing", "promotions"];
 
 // Substrings that, when present anywhere in the From header, mark the email
@@ -1095,6 +1101,11 @@ function postParseDiscardReason(signal, from) {
   // email carries no real arrival. Checked first so it short-circuits the
   // other gates.
   if (isBounceFrom(from)) return "bounce-sender";
+
+  // Death-certificate / obituary / estate noise — never a real signal.
+  if (DEATH_NOISE_REGEX.test(`${signal.description || ""} ${signal.sender || ""} ${from || ""}`)) {
+    return "death-certificate-noise";
+  }
 
   // Promo language in the description — Claude correctly extracted the words
   // but the email is marketing, not a real arrival.
