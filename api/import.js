@@ -37,7 +37,12 @@ const PROMO_REGEX = /\b(?:sale|off|discount|promo|deal|offer|coupon|shop now|lim
 // death certificate"), or deeply personal notices — none of which should
 // ever become an actionable household signal. Matched against the classified
 // description + sender so a misclassified one is dropped at the gate.
-const DEATH_NOISE_REGEX = /\b(?:death\s*certificate|certificate\s*of\s*death|obituary|obituaries|funeral|memorial\s*service|estate\s*(?:settlement|planning|administration)|probate|condolence|in\s*memoriam|next\s*of\s*kin|bereavement|cremation|mortuary)\b/i;
+const DEATH_NOISE_REGEX = /\b(?:death\s*certificate|certificate\s*of\s*death|obituary|obituaries|funeral(?:\s*home)?|funeral\s*services?|memorial\s*service|estate\s*(?:settlement|planning|administration)|probate|condolence|in\s*memoriam|next\s*of\s*kin|bereavement|cremation|crematorium|mortuary|interment|casket|graveside|pallbearer|burial)\b/i;
+// Funeral-industry stems matched WITHOUT word boundaries, tested only
+// against the sender / From header — catches funeral-home senders whose
+// term is glued into the display name or domain (e.g. "legacymortuary.com",
+// "ABCFuneralHome"). Sender-scoped so casual body mentions don't trip it.
+const FUNERAL_SENDER_RE = /(funeral|mortuary|cremator|cremation|memorialchapel|funeralhome)/i;
 const PROMO_SENDER_PREFIXES = ["noreply", "no-reply", "marketing", "promotions"];
 
 // Substrings that, when present anywhere in the From header, mark the email
@@ -1103,7 +1108,10 @@ function postParseDiscardReason(signal, from) {
   if (isBounceFrom(from)) return "bounce-sender";
 
   // Death-certificate / obituary / estate noise — never a real signal.
-  if (DEATH_NOISE_REGEX.test(`${signal.description || ""} ${signal.sender || ""} ${from || ""}`)) {
+  if (
+    DEATH_NOISE_REGEX.test(`${signal.description || ""} ${signal.sender || ""} ${from || ""}`) ||
+    FUNERAL_SENDER_RE.test(`${signal.sender || ""} ${from || ""}`)
+  ) {
     return "death-certificate-noise";
   }
 
