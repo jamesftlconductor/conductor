@@ -1917,6 +1917,26 @@ ${emailText.substring(0, 1000)}`,
         console.log(
           `[trip] auto-assigned signal "${(signal.description || "").slice(0, 50)}" → ${tripWindow.threadId}`
         );
+        // If the trip thread already exists, this is an absorption of a NEW
+        // signal into an established trip — let the household know.
+        try {
+          const existed = await redis.get(`household:${householdId}:threads:${tripWindow.threadId}`);
+          if (existed) {
+            await fetch("https://conductor-ivory.vercel.app/api/notify?type=tracking", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                householdId,
+                title: tripWindow.theme,
+                body: `Added to your trip: ${(signal.description || "a new item").slice(0, 80)}`,
+                kind: "trip_absorption",
+              }),
+            });
+            console.log(`[trip] absorption notify sent for ${tripWindow.threadId}`);
+          }
+        } catch (err) {
+          console.warn("[trip] absorption notify failed:", err?.message || err);
+        }
       } else {
         try {
           await detectAndStampThread(householdId, signal);

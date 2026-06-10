@@ -7,6 +7,7 @@ import { refreshLocalEventsCache } from "./events.js";
 import { runOutlookImport } from "./outlook-import.js";
 import { runImapImport } from "./imap-import.js";
 import { runNextdoorScan } from "./nextdoor-scan.js";
+import { synthesizeTripThreads } from "./trip-threads.js";
 
 const qstash = process.env.QSTASH_TOKEN
   ? new Client({
@@ -253,6 +254,14 @@ export default async function handler(req, res) {
         } catch (err) {
           errors.push({ stage: "import", householdId, userId, message: err.message });
         }
+      }
+      // Refresh trip threads after the Gmail import pass so any signals
+      // absorbed this cycle land in their configured/auto thread records
+      // (and new auto-threads form). Best-effort — never blocks the sync.
+      try {
+        await synthesizeTripThreads(redis, householdId);
+      } catch (err) {
+        errors.push({ stage: "trip-threads", householdId, message: err.message });
       }
       // Outlook import per member who has tokens. Gmail failure
       // doesn't block this — they're independent driver paths.
