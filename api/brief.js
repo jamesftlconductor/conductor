@@ -118,7 +118,7 @@ function classifyWeather(code, tempF) {
 // (network, timeout, malformed payload) so the brief still ships
 // without weather context. 3s timeout keeps the overall brief
 // latency bounded even when Open-Meteo is slow.
-async function fetchWeather(location) {
+export async function fetchWeather(location) {
   // Use the household's stored coordinates when available; fall back to
   // the LOCATION_FALLBACK (Fort Lauderdale) so a household with no
   // location set still gets weather context.
@@ -2193,8 +2193,56 @@ Return JSON: { "question": string | null }`;
   }
 }
 
-async function generatePulseNote(state) {
+export async function generatePulseNote(state) {
   if (!state) return null;
+
+  // Evening Pulse — clearance / Dusk context. Synthesizes what got handled
+  // today, the overnight weather, and a gentle nod toward rest before
+  // tomorrow. Self-contained so callers don't have to assemble the full
+  // morning synthesis state.
+  if (state.context === "clearance") {
+    const resolved = state.resolvedCount ?? 0;
+    const w = state.weather || null;
+    const weatherLine = w
+      ? `${w.summary || "mild"}${w.tempF != null ? `, around ${w.tempF}°F` : ""}${w.isRaining ? ", currently raining" : ""}`
+      : "unknown";
+    const region = state.locationContext || "south_florida";
+    const locationLabel = state.locationLabel || "Fort Lauderdale, FL";
+    const prompt = `Write the EVENING Pulse for a household — one or two short sentences closing out the day. Synthesize:
+1. What got handled today (${resolved} signal${resolved === 1 ? "" : "s"} rested today).
+2. The overnight weather, but ONLY if it's worth knowing before tomorrow morning (rain moving through, a front, a cold snap). Use a calm location-aware observation for ${locationLabel}; if the weather is unremarkable, leave it out.
+3. A gentle nod toward rest / tomorrow.
+
+Tone: calm, warm, end-of-day. Example: "Six signals handled today. Rain moves through overnight — worth knowing before tomorrow morning."
+
+Tonight's weather: ${weatherLine}
+Signals rested today: ${resolved}
+Location: ${locationLabel} (${region})
+
+The signal count IS allowed as a numeral (it's a tally of what got done). For WEATHER, never quote raw numbers/units — translate them ("around 58°F" → "cool overnight", rain probability → "rain moves through"). Maximum two short sentences. No preamble. This is the evening Pulse.`;
+    try {
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 120,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+      if (!response.ok) return null;
+      const data = await response.json();
+      const text = data?.content?.[0]?.text?.trim() || "";
+      return text ? text.replace(/^["'“”]+|["'“”]+$/g, "").trim() : null;
+    } catch (err) {
+      console.error("Evening Pulse generation failed:", err?.message || err);
+      return null;
+    }
+  }
 
   const flagsLine = state.synthesisFlags.length > 0
     ? state.synthesisFlags.join(", ")

@@ -1586,7 +1586,7 @@ ${isSingleMember
       eveningLocation = await loadHouseholdLocation(householdId);
     } catch { /* fall through — non-water cards still ship */ }
 
-    const [segments, transparency, weekInReview, monthInReview, yearInReview, eveningCards] = await Promise.all([
+    const [segments, transparency, weekInReview, monthInReview, yearInReview, eveningCards, eveningPulse] = await Promise.all([
       tagBriefSegments(brief, tagSet),
       generateTransparency(brief, {
         resolvedToday,
@@ -1610,6 +1610,28 @@ ${isSingleMember
         console.warn("[clearance] eveningCards top-level failed:", err?.message || err);
         return [];
       }),
+      // Evening Pulse — same generatePulseNote as the morning Pulse, with
+      // clearance context: what got handled today + overnight weather + a
+      // gentle rest nod. Best-effort; null on any failure.
+      (async () => {
+        try {
+          const { fetchWeather, generatePulseNote } = await import("./brief.js");
+          const weather = await fetchWeather(eveningLocation).catch(() => null);
+          const locationLabel = eveningLocation?.city
+            ? `${eveningLocation.city}, ${eveningLocation.state || ""}`.replace(/,\s*$/, "").trim()
+            : null;
+          return await generatePulseNote({
+            context: "clearance",
+            resolvedCount: resolvedToday.length,
+            weather,
+            locationLabel,
+            locationContext: eveningLocation?.marketRegion || null,
+          });
+        } catch (err) {
+          console.warn("[clearance] evening pulse failed:", err?.message || err);
+          return null;
+        }
+      })(),
     ]);
 
     // Write narrated signal snapshots into the shared briefedToday hash so the
@@ -1714,6 +1736,9 @@ ${isSingleMember
       // app. The renderer filters out any nulls/empties, so we ship
       // whatever generateEveningCards produced — even if that's [].
       eveningCards: Array.isArray(eveningCards) ? eveningCards.filter(Boolean) : [],
+      // Evening Pulse — shown on Ground in Clearance/Dusk mode at the same
+      // position as the morning Pulse.
+      eveningPulse: typeof eveningPulse === "string" && eveningPulse.length > 0 ? eveningPulse : null,
       weeklyAchievements,
       household: householdId,
       user: userName,
