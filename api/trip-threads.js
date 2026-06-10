@@ -28,6 +28,12 @@ export const TRIP_WINDOWS = [
     keywords: ["paris", "nice", "montpellier", "flight", "hotel"],
     etaStart: "2026-06-12T00:00:00",
     etaEnd: "2026-06-23T23:59:59",
+    // etaOnly: pull ANY still-open signal whose ETA lands in the trip
+    // window into the thread, regardless of type or keyword — so a leg
+    // that doesn't name a city (and any household member's signals,
+    // including Sarah's, since synthesis runs over the whole household
+    // signal list) all fold into the one Paris trip.
+    etaOnly: true,
   },
 ];
 
@@ -49,7 +55,7 @@ export function matchTripWindow(signal) {
     const startMs = Date.parse(w.etaStart);
     const endMs = Date.parse(w.etaEnd);
     if (etaMs < startMs || etaMs > endMs) continue;
-    if (!descriptionMatchesKeywords(signal.description, w.keywords)) continue;
+    if (!w.etaOnly && !descriptionMatchesKeywords(signal.description, w.keywords)) continue;
     return w;
   }
   return null;

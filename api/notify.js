@@ -253,6 +253,13 @@ export default async function handler(req, res) {
 
           if (type === "takeoff" && cachedLocalHour !== effectiveTakeoffHour) continue;
           if (type === "clearance" && cachedLocalHour !== clearanceHour) continue;
+          // Per-user midday time — configurable via the middayHour
+          // preference (default 1pm). Fires only at the household's
+          // local middayHour, within the coarse 12-14 window above.
+          if (type === "midday") {
+            const middayHour = typeof prefs.middayHour === "number" ? prefs.middayHour : 13;
+            if (cachedLocalHour !== middayHour) continue;
+          }
         }
 
         tokensByUser.push({ userId, token });
