@@ -45,6 +45,28 @@ const DEATH_NOISE_REGEX = /\b(?:death\s*certificate|certificate\s*of\s*death|obi
 const FUNERAL_SENDER_RE = /(funeral|mortuary|cremator|cremation|memorialchapel|funeralhome)/i;
 const PROMO_SENDER_PREFIXES = ["noreply", "no-reply", "marketing", "promotions"];
 
+// Inbox-only label gate. Gmail tabs everything it considers Promotions/Social/
+// Forums into category labels, and Spam/Trash into their own — none of which
+// should ever become a household signal (marketing "your order" blasts, social
+// digests, mailing-list chatter). We only parse mail that genuinely landed in
+// the inbox or was flagged Important. UNREAD on its own is NOT a parse trigger —
+// a message must carry INBOX or IMPORTANT to qualify. Applied to the default
+// sweep only; targeted re-imports (customQuery) bypass it so an archived booking
+// email can still be pulled in on demand.
+const PARSE_ALLOW_LABELS = ["INBOX", "IMPORTANT"];
+const PARSE_BLOCK_LABELS = [
+  "SPAM",
+  "TRASH",
+  "CATEGORY_PROMOTIONS",
+  "CATEGORY_SOCIAL",
+  "CATEGORY_FORUMS",
+];
+function passesLabelGate(labelIds) {
+  const labels = Array.isArray(labelIds) ? labelIds : [];
+  if (labels.some((l) => PARSE_BLOCK_LABELS.includes(l))) return false;
+  return labels.some((l) => PARSE_ALLOW_LABELS.includes(l));
+}
+
 // Substrings that, when present anywhere in the From header, mark the email
 // as a delivery-system bounce — those carry no real signal and Claude tends
 // to classify them as "service" with a "Delayed" status that defeats the
@@ -1411,9 +1433,14 @@ export async function runImport(userId, customQuery = null) {
   // (e.g. surfacing a missed Paris flight email). When unset, falls
   // back to the default 30d sweep. Targeted queries skip the
   // `after:` window so older booking emails can be pulled in.
-  const query = customQuery && customQuery.trim().length > 0
+  const isTargeted = !!(customQuery && customQuery.trim().length > 0);
+  // The default sweep is narrowed to the inbox and away from the Promotions/
+  // Social/Forums tabs server-side (saves message fetches); the per-message
+  // passesLabelGate check below is the authoritative guard. Targeted
+  // re-imports keep their caller-supplied query untouched.
+  const query = isTargeted
     ? customQuery
-    : `after:${thirtyDaysAgo} subject:(tracking OR shipped OR "your order" OR "order confirmed" OR "order shipped" OR delivery OR arriving OR "out for delivery" OR "return confirmed" OR reservation OR flight OR hotel OR appointment OR instacart OR doordash OR charge OR payment OR transaction OR receipt OR billing OR "subscription renewed" OR "auto-renewal" OR "amount due" OR statement OR invoice)`;
+    : `after:${thirtyDaysAgo} in:inbox -category:promotions -category:social -category:forums subject:(tracking OR shipped OR "your order" OR "order confirmed" OR "order shipped" OR delivery OR arriving OR "out for delivery" OR "return confirmed" OR reservation OR flight OR hotel OR appointment OR instacart OR doordash OR charge OR payment OR transaction OR receipt OR billing OR "subscription renewed" OR "auto-renewal" OR "amount due" OR statement OR invoice)`;
 
   const searchResponse = await fetch(
     `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=5`,
@@ -1449,6 +1476,14 @@ export async function runImport(userId, customQuery = null) {
         { headers: { Authorization: `Bearer ${accessToken}` } }
       );
       const msgData = await msgResponse.json();
+
+      // Inbox-only gate — skip Promotions/Social/Forums/Spam/Trash and anything
+      // not in the inbox or flagged Important. Mark imported so re-runs don't
+      // keep re-fetching it. Bypassed for targeted re-imports (see isTargeted).
+      if (!isTargeted && !passesLabelGate(msgData.labelIds)) {
+        await redis.sadd(importedSetKey, message.id);
+        continue;
+      }
 
       const headers = msgData.payload?.headers || [];
       const subject = headers.find(h => h.name === "Subject")?.value || "";
