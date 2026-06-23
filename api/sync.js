@@ -8,6 +8,7 @@ import { runOutlookImport } from "./outlook-import.js";
 import { runImapImport } from "./imap-import.js";
 import { runNextdoorScan } from "./nextdoor-scan.js";
 import { synthesizeTripThreads } from "./trip-threads.js";
+import { renewGmailWatchIfDue } from "./gmail-watch.js";
 
 const qstash = process.env.QSTASH_TOKEN
   ? new Client({
@@ -253,6 +254,14 @@ export default async function handler(req, res) {
           }
         } catch (err) {
           errors.push({ stage: "import", householdId, userId, message: err.message });
+        }
+        // Gmail watch renewal — watches expire after 7 days; renew at 6 so
+        // real-time push never lapses. No-ops (returns "fresh") on most runs,
+        // so this stays cheap on the hourly cron. Best-effort by design.
+        try {
+          await renewGmailWatchIfDue(userId);
+        } catch (err) {
+          errors.push({ stage: "gmail-watch", householdId, userId, message: err.message });
         }
       }
       // Refresh trip threads after the Gmail import pass so any signals

@@ -218,6 +218,17 @@ export default async function handler(req, res) {
       body: JSON.stringify({ userId }),
     }).catch(err => console.error("Onboard trigger error:", err));
 
+    // Set up Gmail push notifications for real-time email monitoring. Fire-
+    // and-forget like the onboard trigger — a watch failure must never block
+    // sign-in, and the 6-day renewal in api/sync.js is the safety net if this
+    // initial call doesn't land. /api/gmail-watch reads the tokens we just
+    // stored above.
+    fetch(`${baseUrl}/api/gmail-watch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId }),
+    }).catch(err => console.error("Gmail watch trigger error:", err));
+
     // Redirect back to app — pass householdId + mode so the success page
     // renders the right welcome copy ("joined", "welcome to", "welcome back").
     const successParams = new URLSearchParams({
