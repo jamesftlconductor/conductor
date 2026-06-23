@@ -3501,6 +3501,26 @@ export default async function handler(req, res) {
     for (const g of tripThreads) {
       for (const s of g.signals) tripThemeById.set(String(s.id), g.window.theme);
     }
+    // Classify a leg's booking status from its status field + description so
+    // the trip narration can say what's confirmed vs still outstanding.
+    const tripLegStatus = (s) => {
+      const hay = `${s.status || ""} ${s.description || ""}`.toLowerCase();
+      if (/\b(not yet|unconfirmed|pending|awaiting|to be (?:booked|confirmed)|tbd|not (?:booked|confirmed)|need to book|still to book|to book|searching)\b/.test(hay)) {
+        return "pending";
+      }
+      if (/\b(confirmed|booked|reserved|issued|ticketed|checked[\s-]?in|paid|purchased)\b/.test(hay)) {
+        return "confirmed";
+      }
+      return "unknown";
+    };
+    // Coarse leg category so the paragraph can speak to departure vs lodging.
+    const tripLegCategory = (s) => {
+      const hay = `${s.type || ""} ${s.description || ""}`.toLowerCase();
+      if (/hotel|airbnb|lodg|hostel|apartment|\bstay\b|accommodation|b&b/.test(hay)) return "accommodation";
+      if (/train|eurostar|tgv|\brail\b|sncf/.test(hay)) return "rail";
+      if (/flight|\bair\b|boarding|\bgate\b|terminal|airport|cdg|orly/.test(hay)) return "flight";
+      return "other";
+    };
     function formatTripThreadBlock() {
       if (!tripThreads.length) return null;
       const lift = (eta) => {
@@ -3510,11 +3530,31 @@ export default async function handler(req, res) {
       return tripThreads
         .map((g) => {
           const legs = g.signals
-            .map((s) => `  - ${s.description || "Travel"}${lift(s.eta)}`)
+            .map((s) => `  - [${tripLegCategory(s)}/${tripLegStatus(s)}] ${s.description || "Travel"}${lift(s.eta)}`)
             .join("\n");
-          return `${g.window.theme} | destination: ${g.window.destination} | ${g.signals.length} linked signals:\n${legs}`;
+          const header = `${g.window.theme} | destination: ${g.window.destination} | ${g.signals.length} linked signals`;
+          // A trip with 3+ legs gets a comprehensive multi-sentence status
+          // paragraph rather than a one-liner. We pre-digest confirmed vs
+          // pending so the model narrates facts, not guesses.
+          if (g.signals.length >= 3) {
+            const confirmed = g.signals.filter((s) => tripLegStatus(s) === "confirmed");
+            const pending = g.signals.filter((s) => tripLegStatus(s) === "pending");
+            const fmt = (arr) =>
+              arr.length
+                ? arr.map((s) => `${s.description || "Travel"}${lift(s.eta)}`).join("; ")
+                : "none";
+            return [
+              header,
+              `  >> NARRATE AS A COMPREHENSIVE TRIP STATUS PARAGRAPH (multiple sentences, not one line). Cover: departure/flight status, accommodation status, what is CONFIRMED, and what is still PENDING. Example shape: "Paris trip June 12-23: flights confirmed, Hotel Lumen confirmed June 13, train to Nice pending, Montpellier hotel not yet confirmed."`,
+              `  Confirmed: ${fmt(confirmed)}`,
+              `  Pending: ${fmt(pending)}`,
+              `  All legs:`,
+              legs,
+            ].join("\n");
+          }
+          return `${header}:\n${legs}`;
         })
-        .join("\n");
+        .join("\n\n");
     }
 
     // FLAGGED CATEGORIES — match against nearSignals + calendar events.
@@ -4079,7 +4119,7 @@ ${isSingleMember
       `TRAVEL PREP (within 72 hours — when this layer is non-empty, lead with it):`,
       travelPrep ? formatTravelPrepBlock() : "None",
       ``,
-      `TRIP THREAD (multiple travel signals that belong to ONE trip — narrate the trip as a single item, never as separate signals):`,
+      `TRIP THREAD (multiple travel signals that belong to ONE trip — narrate the trip as a single COHERENT item, never as separate signals. When a thread is marked "NARRATE AS A COMPREHENSIVE TRIP STATUS PARAGRAPH", write a full multi-sentence status — departure/flights, accommodation, what is confirmed, what is still pending — synthesizing the legs into one narrative, not a bullet list):`,
       tripThreads.length > 0 ? formatTripThreadBlock() : "None",
       ``,
       `CONFLICTS DETECTED (surface these naturally and specifically — these are the most important things to mention):`,

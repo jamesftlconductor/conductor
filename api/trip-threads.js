@@ -25,7 +25,18 @@ export const TRIP_WINDOWS = [
     threadId: "paris-trip-june-2026",
     theme: "Paris trip — June 12-23",
     destination: "Paris/Nice/Montpellier",
-    keywords: ["paris", "nice", "montpellier", "flight", "hotel"],
+    keywords: [
+      // destinations / airports
+      "paris", "nice", "montpellier", "cdg", "orly",
+      // air
+      "flight", "hotel",
+      // rail
+      "train", "eurostar", "tgv", "rail", "sncf",
+      // travel-day artifacts
+      "check-in", "boarding pass", "gate",
+      // booking artifacts
+      "confirmation", "voucher", "itinerary",
+    ],
     etaStart: "2026-06-12T00:00:00",
     etaEnd: "2026-06-23T23:59:59",
     // etaOnly: pull ANY still-open signal whose ETA lands in the trip
