@@ -750,8 +750,15 @@ function detectConflicts({
   householdNameMap,
   requestingUserId,
   weather,
+  workContext,
 }) {
   const conflicts = [];
+  // When the user has declared a work context (Settings/onboarding
+  // workContext preference), their work calendar is load-bearing: work
+  // events get elevated in conflict detection — a presence-requiring signal
+  // that collides with the user's own work block surfaces even if other
+  // members are free, and signature-delivery collisions are raised to high.
+  const hasWorkContext = !!(workContext && String(workContext).trim());
 
   // Weather-at-signal-time check — outdoor service signal whose ETA
   // falls in an hour with > 60% precipitation probability is a real
@@ -887,8 +894,50 @@ function detectConflicts({
           type: "delivery_conflict",
           signal: s,
           reason: "nobody home for signature",
-          severity: "medium",
+          // A working household feels a missed-signature delivery more
+          // acutely (no slack to wait around) — elevate when workContext set.
+          severity: hasWorkContext ? "high" : "medium",
+          workElevated: hasWorkContext || undefined,
         });
+      }
+    }
+
+    // 2b. WORK CALENDAR — when the requesting user has a declared work
+    //     context, surface a conflict whenever THEIR OWN work schedule
+    //     overlaps a presence-requiring signal (service today/tomorrow, or
+    //     a signature delivery today), even if other members are free. This
+    //     is the "you're in meetings when the plumber comes" case, which the
+    //     all-members-blocked checks above miss in a multi-person household.
+    //     Deduped against any conflict already recorded for the same signal.
+    if (hasWorkContext && requestingUserId) {
+      const seen = new Set(
+        conflicts.filter((c) => c.signal).map((c) => `${c.type}:${c.signal.id}`)
+      );
+      for (const s of activeSignals) {
+        const presenceRequired = s.type === "service" || s.status === "Out for Delivery";
+        if (!presenceRequired) continue;
+        const eta = parseDateLoose(s.eta);
+        if (!eta) continue;
+        const offset = dayOffsetFromToday(eta);
+        if (offset !== 0 && offset !== 1) continue;
+        const winStart = eta.getTime() - 2 * HOUR_MS;
+        const winEnd = eta.getTime() + 2 * HOUR_MS;
+        if (!memberBlockedInWindow(requestingUserId, winStart, winEnd)) continue;
+        if (
+          seen.has(`service_conflict:${s.id}`) ||
+          seen.has(`delivery_conflict:${s.id}`) ||
+          seen.has(`work_calendar_conflict:${s.id}`)
+        ) {
+          continue;
+        }
+        conflicts.push({
+          type: "work_calendar_conflict",
+          signal: s,
+          reason: "your work calendar overlaps this",
+          workElevated: true,
+          severity: "high",
+        });
+        seen.add(`work_calendar_conflict:${s.id}`);
       }
     }
   }
@@ -3971,6 +4020,7 @@ ${isSingleMember
       householdNameMap,
       requestingUserId: userId,
       weather,
+      workContext: preferences.workContext,
     });
 
     // Handoff detection — runs alongside conflicts but is structurally
@@ -4175,7 +4225,7 @@ ${isSingleMember
       `TRIP THREAD (multiple travel signals that belong to ONE trip — narrate the trip as a single COHERENT item, never as separate signals. When a thread is marked "NARRATE AS A COMPREHENSIVE TRIP STATUS PARAGRAPH", write a full multi-sentence status — departure/flights, accommodation, what is confirmed, what is still pending — synthesizing the legs into one narrative, not a bullet list):`,
       tripThreads.length > 0 ? formatTripThreadBlock() : "None",
       ``,
-      `CONFLICTS DETECTED (surface these naturally and specifically — these are the most important things to mention):`,
+      `CONFLICTS DETECTED (surface these naturally and specifically — these are the most important things to mention${preferences.workContext ? `. This household has a work context (${preferences.workContext}); a conflict tagged work_calendar_conflict means the user's OWN work schedule collides with a household obligation — lead with it and name the collision plainly so they can plan coverage` : ""}):`,
       conflictLines,
       ``,
       `HANDOFF (one sentence, conversational; never use the word "handoff"; frame as natural household coordination — e.g. "Sarah is out this afternoon — the window cleaning at 2pm will need James to be home."):`,
