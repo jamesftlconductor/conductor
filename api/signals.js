@@ -83,6 +83,22 @@ async function invalidateBriefCache(householdId) {
   );
 }
 
+// Direct, single-user cache bust. invalidateBriefCache scans household
+// membership, which MISSES a user who has no user:{id}:household key — their
+// household resolves to the default fallback and they never appear in the
+// scan set, so a signal they just Rested can reappear in THEIR brief until
+// the cache TTL expires. Call this alongside the household-wide invalidation
+// on every state transition so the acting user's brief / Pulse / Ask context
+// reflect the resolution within seconds rather than the next sync cycle.
+async function bustUserBriefCache(userId) {
+  if (!userId) return;
+  await Promise.all([
+    redis.del(`user:${userId}:currentTakeoff`),
+    redis.del(`user:${userId}:currentClearance`),
+    redis.del(`user:${userId}:currentMidday`),
+  ]);
+}
+
 async function resolveHouseholdId(userId) {
   if (!userId) return "RangerOaks925";
   const hid = await redis.get(`user:${userId}:household`);
@@ -4501,6 +4517,16 @@ export default async function handler(req, res) {
             console.warn("[cache] brief invalidation failed:", err?.message || err);
           }
         }
+        // Real-time resolution — bust THIS user's cached surfaces directly so
+        // the next brief/Pulse/Ask load reflects the new state immediately,
+        // even if the household scan above wouldn't include them.
+        if (stateChanged) {
+          try {
+            await bustUserBriefCache(userId);
+          } catch (err) {
+            console.warn("[cache] direct user bust failed:", err?.message || err);
+          }
+        }
 
         // Memory log fires only on state lifecycle transitions, not on
         // pure field edits. An edit isn't a "resolved" or "held" event;
@@ -4579,6 +4605,10 @@ export default async function handler(req, res) {
       if (hasDescription || hasEta || hasStatus || deadlineStateChanged) {
         try { await invalidateBriefCache(householdId); }
         catch (err) { console.warn("[cache] deadlines brief invalidation failed:", err?.message); }
+      }
+      if (deadlineStateChanged) {
+        try { await bustUserBriefCache(userId); }
+        catch (err) { console.warn("[cache] direct user bust failed:", err?.message); }
       }
 
       if (stateProvided && (state === "resolved" || state === "active")) {
