@@ -94,6 +94,59 @@ function getAnnualEvents(marketRegion, today) {
     .map(({ event, daysUntil }) => ({ ...event, daysUntil }));
 }
 
+// ---------- family / relationship holidays ----------
+//
+// ANNUAL_EVENTS above is region-local traffic/safety. These are the
+// nationally-relevant family holidays that matter to EVERY household and
+// that a Google-Calendar holiday feed surfaces — Father's Day, Mother's
+// Day, etc. They were previously absent, which is why Father's Day
+// (June 15, 2026) never surfaced in the brief even though it showed in the
+// calendar data. Floating holidays (Mother's/Father's Day) are computed
+// per-year as the Nth Sunday of their month.
+
+// Date of the Nth given weekday in a month. weekday: 0=Sun..6=Sat.
+function nthWeekdayOfMonth(year, month /* 1-12 */, weekday, n) {
+  const first = new Date(year, month - 1, 1);
+  const offset = (weekday - first.getDay() + 7) % 7;
+  return new Date(year, month - 1, 1 + offset + (n - 1) * 7);
+}
+
+function familyHolidayDates(year) {
+  return [
+    { name: "New Year's Day", date: new Date(year, 0, 1), note: "Plans, closures" },
+    { name: "Valentine's Day", date: new Date(year, 1, 14), note: "Plan something for your partner" },
+    { name: "Mother's Day", date: nthWeekdayOfMonth(year, 5, 0, 2), note: "Plan ahead for mom — card, call, gift, or gathering" },
+    { name: "Father's Day", date: nthWeekdayOfMonth(year, 6, 0, 3), note: "Plan ahead for dad — card, call, gift, or gathering" },
+    { name: "Independence Day", date: new Date(year, 6, 4), note: "Holiday plans, closures, travel" },
+    { name: "Halloween", date: new Date(year, 9, 31), note: "Costumes, candy, evening plans" },
+    { name: "Thanksgiving", date: nthWeekdayOfMonth(year, 11, 4, 4), note: "Hosting/travel plans, closures" },
+    { name: "Christmas", date: new Date(year, 11, 25), note: "Gifts, hosting/travel, closures" },
+  ];
+}
+
+// Upcoming family holidays within `windowDays`. Spans the year boundary so a
+// January holiday still surfaces from late December. daysUntil is 0 on the
+// day itself. The default 7-day window is the Horizon reach; callers narrow
+// to <=2 for the brief itself.
+function getUpcomingHolidays(today, windowDays = 7) {
+  const d = new Date(today);
+  const todayMid = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const candidates = [
+    ...familyHolidayDates(todayMid.getFullYear()),
+    ...familyHolidayDates(todayMid.getFullYear() + 1),
+  ];
+  const byName = new Map();
+  for (const h of candidates) {
+    const when = new Date(h.date.getFullYear(), h.date.getMonth(), h.date.getDate());
+    const daysUntil = Math.round((when - todayMid) / 86400000);
+    if (daysUntil < 0 || daysUntil > windowDays) continue;
+    if (!byName.has(h.name) || daysUntil < byName.get(h.name).daysUntil) {
+      byName.set(h.name, { ...h, daysUntil });
+    }
+  }
+  return [...byName.values()].sort((a, b) => a.daysUntil - b.daysUntil);
+}
+
 // ---------- helpers ----------
 
 // Open-Meteo's WMO weather codes mapped to the small vocabulary that
@@ -4199,6 +4252,23 @@ ${isSingleMember
         return lines.length > 0
           ? lines.join("\n")
           : "No major local events this week.";
+      })(),
+      ``,
+      // Family/relationship holidays (Father's Day, Mother's Day, etc.).
+      // Surface 7 days out as Horizon awareness; 2 days out (or on the day)
+      // they belong in the brief itself so the household has time to plan.
+      `ANNUAL HOLIDAYS (family/relationship — within 2 days: surface in the brief; 3-7 days: Horizon awareness only, mention at most once near the end):`,
+      (() => {
+        const holidays = getUpcomingHolidays(new Date().toISOString(), 7);
+        if (!holidays.length) return "None within 7 days";
+        return holidays
+          .map((h) => {
+            const whenLabel =
+              h.daysUntil === 0 ? "today" : h.daysUntil === 1 ? "tomorrow" : `in ${h.daysUntil} days`;
+            const placement = h.daysUntil <= 2 ? "BRIEF" : "HORIZON";
+            return `- [${placement}] ${h.name} — ${whenLabel}: ${h.note}`;
+          })
+          .join("\n");
       })(),
       ``,
       `CHILDCARE (mention if affects today or tomorrow):`,
