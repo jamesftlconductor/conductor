@@ -37,7 +37,7 @@ const PROMO_REGEX = /\b(?:sale|off|discount|promo|deal|offer|coupon|shop now|lim
 // death certificate"), or deeply personal notices — none of which should
 // ever become an actionable household signal. Matched against the classified
 // description + sender so a misclassified one is dropped at the gate.
-const DEATH_NOISE_REGEX = /\b(?:death\s*certificate|certificate\s*of\s*death|obituary|obituaries|funeral(?:\s*home)?|funeral\s*services?|memorial\s*service|estate\s*(?:settlement|planning|administration)|probate|condolence|in\s*memoriam|next\s*of\s*kin|bereavement|cremation|crematorium|mortuary|interment|casket|graveside|pallbearer|burial)\b/i;
+const DEATH_NOISE_REGEX = /\b(?:death\s*(?:certificate|notice|record|announcement|benefit)|certificate\s*of\s*death|obituar(?:y|ies)|funeral(?:\s*(?:home|services?|director|arrangements?))?|memorial\s*(?:service|fund|donation|gift)|celebration\s*of\s*life|estate\s*(?:settlement|planning|administration|of\s*the\s*late)|probate|condolences?|sympath(?:y|ies)|in\s*memoriam|next\s*of\s*kin|bereavement|grief\s*support|passed\s*away|passing\s*of|decedent|deceased|cremation|cremated|crematorium|columbarium|mausoleum|mortuary|interment|casket|coffin|hearse|graveside|pallbearer|burial|cemetery|headstone|gravestone|tombstone|eulogy|embalming|urn\s*(?:selection|for\s*ashes)|wake\s*service|viewing\s*hours)\b/i;
 // Funeral-industry stems matched WITHOUT word boundaries, tested only
 // against the sender / From header — catches funeral-home senders whose
 // term is glued into the display name or domain (e.g. "legacymortuary.com",
