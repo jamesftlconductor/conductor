@@ -328,6 +328,53 @@ export default async function handler(req, res) {
     }
   }
 
+  // Delivery confirmation — GET ?action=messageStatus&sid=SM... returns the
+  // live status of a previously-sent message (queued → sending → sent →
+  // delivered, or undelivered/failed with an errorCode). GET-friendly.
+  if (action === "messageStatus") {
+    const accountSid = process.env.TWILIO_ACCOUNT_SID;
+    const auth = twilioAuthHeader();
+    const messageSid = req.query?.sid || req.body?.sid;
+    if (!accountSid || !auth) {
+      return res.status(200).json({ ok: false, error: "twilio not configured" });
+    }
+    if (!messageSid) return res.status(400).json({ error: "sid required" });
+    try {
+      const r = await fetch(
+        `${TWILIO_API_BASE}/Accounts/${accountSid}/Messages/${messageSid}.json`,
+        { headers: { Authorization: auth } }
+      );
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        return res.status(200).json({
+          ok: false,
+          httpStatus: r.status,
+          error: data?.message || "message lookup failed",
+          code: data?.code || null,
+        });
+      }
+      return res.status(200).json({
+        ok: true,
+        message: {
+          sid: data.sid,
+          status: data.status,
+          to: data.to,
+          from: data.from,
+          errorCode: data.error_code || null,
+          errorMessage: data.error_message || null,
+          dateSent: data.date_sent || null,
+          price: data.price || null,
+          priceUnit: data.price_unit || null,
+        },
+      });
+    } catch (err) {
+      return res.status(200).json({
+        ok: false,
+        error: err?.message || "message lookup failed",
+      });
+    }
+  }
+
   if (action === "draftMessage") {
     if (req.method !== "POST") {
       res.setHeader("Allow", "POST");
