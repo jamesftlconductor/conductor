@@ -324,7 +324,11 @@ export default async function handler(req, res) {
     if (!recipientEmail) return res.status(400).json({ error: "recipientEmail required" });
     if (!subject) return res.status(400).json({ error: "subject required" });
     if (!body) return res.status(400).json({ error: "body required" });
-    const channel = via === "gmail" ? "gmail" : "resend";
+    // User-initiated emails default to the member's own Gmail account; only
+    // an explicit via:"resend" routes through the branded Conductor sender
+    // (system mail). The mobile composer always sends `via` explicitly, so
+    // this default only governs callers that omit it.
+    const channel = via === "resend" ? "resend" : "gmail";
 
     let fromName = null;
     try {

@@ -4,6 +4,12 @@ export default async function handler(req, res) {
 
   const scopes = [
     "https://www.googleapis.com/auth/gmail.readonly",
+    // gmail.send lets user-initiated emails (the Communicate screen) go out
+    // from the household member's own Gmail account via the Gmail API,
+    // rather than branded through Resend. Additive scope — existing users
+    // must re-consent (prompt=consent below already forces the screen) to
+    // grant it before sendViaGmail stops 403-ing.
+    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar.readonly",
     "https://www.googleapis.com/auth/contacts.readonly",
     "email",
