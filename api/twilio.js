@@ -18,23 +18,27 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// Lazy-load twilio so the route still imports cleanly when the
-// package hasn't been installed yet or env isn't set.
-let twilioClient = null;
-function getTwilioClient() {
-  if (twilioClient) return twilioClient;
+// SMS is sent via Twilio's REST API directly over fetch rather than the
+// `twilio` SDK. This file is ESM; the SDK's lazy `require("twilio")` was
+// throwing in the deployed (ESM) function, which surfaced as the misleading
+// "twilio not configured" (getTwilioClient → null) even with valid creds.
+// fetch + HTTP Basic auth has no such dependency-resolution surface area.
+const TWILIO_API_BASE = "https://api.twilio.com/2010-04-01";
+
+function twilioAuthHeader() {
   const sid = process.env.TWILIO_ACCOUNT_SID;
   const tok = process.env.TWILIO_AUTH_TOKEN;
   if (!sid || !tok) return null;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const twilio = require("twilio");
-    twilioClient = twilio(sid, tok);
-    return twilioClient;
-  } catch (err) {
-    console.error("[twilio] init failed:", err?.message || err);
-    return null;
-  }
+  return "Basic " + Buffer.from(`${sid}:${tok}`).toString("base64");
+}
+
+// Twilio requires the From number in E.164 (leading +). The stored env value
+// may omit it (e.g. "17547143734"); normalize so sends don't 21212-fail.
+function toE164(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  if (s.startsWith("+")) return "+" + s.slice(1).replace(/[^0-9]/g, "");
+  return "+" + s.replace(/[^0-9]/g, "");
 }
 
 function safeJson(v) {
@@ -63,9 +67,10 @@ function normalizePhone(raw) {
 // ---------- exports for other handlers ----------
 
 export async function sendSMS(to, body, context = {}) {
-  const fromNumber = process.env.TWILIO_PHONE_NUMBER;
-  const client = getTwilioClient();
-  if (!client || !fromNumber) {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const auth = twilioAuthHeader();
+  const fromNumber = toE164(process.env.TWILIO_PHONE_NUMBER);
+  if (!sid || !auth || !fromNumber) {
     return { ok: false, error: "twilio not configured" };
   }
   const normalizedTo = normalizePhone(to);
@@ -81,15 +86,38 @@ export async function sendSMS(to, body, context = {}) {
 
   const message = String(body || "").slice(0, 320); // 2-segment cap
   try {
-    const result = await client.messages.create({
-      from: fromNumber,
-      to: normalizedTo,
-      body: message,
+    const form = new URLSearchParams({
+      To: normalizedTo,
+      From: fromNumber,
+      Body: message,
     });
+    const r = await fetch(`${TWILIO_API_BASE}/Accounts/${sid}/Messages.json`, {
+      method: "POST",
+      headers: {
+        Authorization: auth,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: form.toString(),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // Surface Twilio's structured error verbatim — e.g. code 21608 on a
+      // trial account sending to an unverified number.
+      console.error(
+        `[twilio] send failed ${r.status} code=${data?.code} ${data?.message}`
+      );
+      return {
+        ok: false,
+        error: data?.message || "twilio send failed",
+        code: data?.code || null,
+        moreInfo: data?.more_info || null,
+        httpStatus: r.status,
+      };
+    }
     console.log(
-      `[twilio] SMS sent to ${normalizedTo} for household ${context.householdId || "unknown"}`
+      `[twilio] SMS ${data.sid} → ${normalizedTo} status ${data.status} (household ${context.householdId || "unknown"})`
     );
-    return { ok: true, sid: result.sid, status: result.status };
+    return { ok: true, sid: data.sid, status: data.status };
   } catch (err) {
     console.error("[twilio] send failed:", err?.message || err);
     return { ok: false, error: err?.message || "twilio send failed" };
@@ -248,6 +276,57 @@ export default async function handler(req, res) {
   const action = req.query?.action || req.body?.action;
 
   if (action === "inbound") return handleInbound(req, res);
+
+  // Diagnostic — reports whether the TWILIO_* env vars are actually visible
+  // to the running deployment and, if so, the Twilio account type ("Trial"
+  // vs "Full") + status. Trial accounts can only send to verified numbers.
+  // GET-friendly so it can be hit from a browser/curl without a body.
+  if (action === "accountStatus") {
+    const sid = process.env.TWILIO_ACCOUNT_SID;
+    const tok = process.env.TWILIO_AUTH_TOKEN;
+    const fromNumber = process.env.TWILIO_PHONE_NUMBER || null;
+    const configured = { hasSid: !!sid, hasToken: !!tok, hasFromNumber: !!fromNumber };
+    if (!sid || !tok) {
+      return res.status(200).json({
+        ok: false,
+        configured,
+        error: "TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not visible to this deployment",
+      });
+    }
+    try {
+      const auth = Buffer.from(`${sid}:${tok}`).toString("base64");
+      const r = await fetch(
+        `https://api.twilio.com/2010-04-01/Accounts/${sid}.json`,
+        { headers: { Authorization: `Basic ${auth}` } }
+      );
+      const data = await r.json();
+      if (!r.ok) {
+        return res.status(200).json({
+          ok: false,
+          configured,
+          httpStatus: r.status,
+          error: data?.message || "twilio account lookup failed",
+          code: data?.code || null,
+        });
+      }
+      return res.status(200).json({
+        ok: true,
+        configured,
+        account: {
+          type: data.type, // "Trial" or "Full"
+          status: data.status, // "active", etc.
+          friendlyName: data.friendly_name || null,
+          fromNumber,
+        },
+      });
+    } catch (err) {
+      return res.status(200).json({
+        ok: false,
+        configured,
+        error: err?.message || "twilio account lookup failed",
+      });
+    }
+  }
 
   if (action === "draftMessage") {
     if (req.method !== "POST") {
