@@ -8,6 +8,8 @@
 
 import { Redis } from "@upstash/redis";
 import { loadCamouflageRules, applyCamouflage } from "./signals.js";
+import { generatePulseNote, synthesizeHouseholdState, fetchWeather } from "./brief.js";
+import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -123,6 +125,44 @@ ${detail}
 Generate a new midday update from scratch. The same rules apply — the violations above MUST NOT appear in the new output. Do not acknowledge this retry in the output.`;
 }
 
+// ---------- fresh midday Pulse ----------
+
+// Generate a Pulse for the afternoon from current household state, reusing
+// the morning brief's synthesis pipeline (synthesizeHouseholdState →
+// generatePulseNote) with midday's lighter signal inputs. Best-effort: any
+// failure (location/weather/health load, synthesis, or the Anthropic call)
+// returns null and the midday brief still ships without a pulse.
+async function generateMiddayPulse({ householdId, userId, activeSignals, urgentNow }) {
+  try {
+    const location = (await loadHouseholdLocation(householdId)) || LOCATION_FALLBACK;
+    const [weather, rawHealth] = await Promise.all([
+      fetchWeather(location).catch(() => null),
+      userId ? redis.get(`user:${userId}:health`).catch(() => null) : Promise.resolve(null),
+    ]);
+    const healthContext = safeJson(rawHealth);
+    const state = synthesizeHouseholdState({
+      urgentForPrompt: urgentNow || [],
+      nearForPrompt: [],
+      conflicts: [],
+      carriedForwardSignals: [],
+      activeSignals: activeSignals || [],
+      allDeadlines: [],
+      healthContext,
+      weather,
+      upcomingCelebrations: [],
+      travelPrep: null,
+      location,
+    });
+    // householdId drives the recentPulses anti-repetition history so the
+    // midday line doesn't echo this morning's Pulse.
+    state.householdId = householdId;
+    return await generatePulseNote(state);
+  } catch (err) {
+    console.warn("[midday] pulse generation failed:", err?.message || err);
+    return null;
+  }
+}
+
 // ---------- handler ----------
 
 export const config = { maxDuration: 30 };
@@ -190,6 +230,10 @@ export default async function handler(req, res) {
     );
     const urgentNow = activeSignals.filter(isUrgent);
 
+    // Fresh midday Pulse from current household state — generated for both the
+    // quiet and active paths so every midday response carries its own Pulse.
+    const pulse = await generateMiddayPulse({ householdId, userId, activeSignals, urgentNow });
+
     // Quiet path: nothing happened since morning AND nothing urgent. Skip
     // the Claude call entirely and ship a minimal honest line.
     if (
@@ -199,7 +243,7 @@ export default async function handler(req, res) {
       stillInMotion.length === 0
     ) {
       const midday = "Nothing has shifted since this morning. The afternoon is yours.";
-      const response = { midday, pulse: null, household: householdId, user: userName };
+      const response = { midday, pulse, household: householdId, user: userName };
       if (userId) {
         await redis.set(`user:${userId}:currentMidday`, JSON.stringify(response), {
           ex: CURRENT_MIDDAY_TTL_S,
@@ -310,7 +354,7 @@ Rules:
 
     const middayResponse = {
       midday,
-      pulse: null, // synthesis layer not wired into midday yet — future work
+      pulse, // fresh midday Pulse from synthesizeHouseholdState → generatePulseNote
       household: householdId,
       user: userName,
     };

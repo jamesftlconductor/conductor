@@ -1808,7 +1808,7 @@ function outdoorServiceOnOffset(s, allowedOffsets) {
 // Deterministic synthesis pass. Reads every pool the brief has already
 // bucketed and reduces to a structured state object that drives both the
 // pulse-note Claude call and the editorial framing of the main brief.
-function synthesizeHouseholdState({
+export function synthesizeHouseholdState({
   urgentForPrompt,
   nearForPrompt,
   conflicts,

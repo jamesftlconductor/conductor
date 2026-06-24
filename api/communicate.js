@@ -36,23 +36,12 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// Lazy-loaded Resend client. Without RESEND_API_KEY we skip the
-// branded path and surface a clear error instead of crashing.
-let resendClient = null;
-function getResend() {
-  if (resendClient) return resendClient;
-  const key = process.env.RESEND_API_KEY;
-  if (!key) return null;
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { Resend } = require("resend");
-    resendClient = new Resend(key);
-    return resendClient;
-  } catch (err) {
-    console.error("[communicate] resend init failed:", err?.message);
-    return null;
-  }
-}
+// Resend is called via its REST API over fetch rather than the `resend`
+// SDK. This file is ESM; the SDK's `require("resend")` was throwing in the
+// deployed function and getting swallowed into the misleading "set
+// RESEND_API_KEY" error even when the key was present. fetch + a Bearer
+// header has no dependency-resolution surface area.
+const RESEND_API_URL = "https://api.resend.com/emails";
 
 async function resolveHouseholdId(userId) {
   if (!userId) return null;
@@ -236,21 +225,38 @@ async function sendViaGmail({ userId, recipientEmail, subject, body, fromName })
 // ---------- Resend send (branded) ----------
 
 async function sendViaResend({ recipientEmail, subject, body }) {
-  const client = getResend();
-  if (!client) {
+  const key = process.env.RESEND_API_KEY;
+  if (!key) {
     return { ok: false, error: "resend not configured (set RESEND_API_KEY)" };
   }
   try {
-    const result = await client.emails.send({
-      from: "Conductor <hello@conductor.app>",
-      to: recipientEmail,
-      subject,
-      html: brandedHtml(body),
-      text: body,
+    const r = await fetch(RESEND_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: "Conductor <hello@conductor.app>",
+        to: [recipientEmail],
+        subject,
+        html: brandedHtml(body),
+        text: body,
+      }),
     });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      // Surface Resend's structured error verbatim (e.g. unverified domain).
+      console.error("[communicate] resend send failed:", r.status, data?.message || data?.name);
+      return {
+        ok: false,
+        error: data?.message || data?.name || "resend send failed",
+        httpStatus: r.status,
+      };
+    }
     return {
       ok: true,
-      messageId: result?.data?.id || result?.id || null,
+      messageId: data?.id || null,
       via: "resend",
     };
   } catch (err) {
