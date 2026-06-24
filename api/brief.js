@@ -692,6 +692,25 @@ function isSubscriptionRenewal(s) {
   return /\bsubscription\b|\brenewal\b|auto-?renew|recurring (charge|payment|bill)/.test(d);
 }
 
+// Estate / after-death "loss" life-transition checklist items (seeded into
+// the vault by api/transition.js planLoss, or surfaced from an estate email).
+// These are emotionally heavy, long-horizon administrative tasks — they must
+// NEVER lead the brief or count toward the urgent load, and the brief-side
+// deadline path drops loss-transition items entirely. Matched on the
+// transition tag first (authoritative) then on estate vocabulary as a
+// defense-in-depth for items that arrive via other paths. NOTE: legitimate
+// life-insurance/social-security *renewals* are NOT matched here — only the
+// action-verb checklist phrasing ("contact/notify/file/obtain ...") is.
+function isEstateLossItem(s) {
+  if (s.source === "transition" && s.transitionType === "loss") return true;
+  const d = (s.description || "").toLowerCase();
+  return (
+    /\bprobate\b|death certificate|certificate of death|estate settlement|next of kin|letters of administration/.test(d) ||
+    /\bnotify social security\b|\bsocial security (administration|survivor|death)\b/.test(d) ||
+    /\b(contact|notify|claim|cancel)\b[^.]*\blife insurance\b/.test(d)
+  );
+}
+
 function classifyUrgent(s) {
   if (s.priority === "urgent") return true;
   const eta = parseDateLoose(s.eta);
@@ -2346,6 +2365,27 @@ The signal count IS allowed as a numeral (it's a tally of what got done). For WE
     }
   }
 
+  // Recent-pulse history — the last 7 morning pulses for this household.
+  // Fed into the prompt as an anti-repetition list so the weather/synthesis
+  // phrasing doesn't congeal into the same handful of canned lines day after
+  // day. Best-effort: a read failure just means no de-duplication this run.
+  const pulseHouseholdId = state.householdId || null;
+  let recentPulses = [];
+  if (pulseHouseholdId) {
+    try {
+      const rawRecent = await redis.lrange(`household:${pulseHouseholdId}:recentPulses`, 0, 6);
+      recentPulses = (rawRecent || [])
+        .map((r) => (typeof r === "string" ? r : String(r || "")))
+        .map((r) => r.trim())
+        .filter(Boolean);
+    } catch (err) {
+      console.warn("[pulse] recentPulses read failed:", err?.message || err);
+    }
+  }
+  const recentPulsesBlock = recentPulses.length > 0
+    ? `RECENT PULSES (the last ${recentPulses.length} mornings — do NOT reuse or lightly reword any of these; today must feel distinct):\n${recentPulses.map((p) => `- "${p}"`).join("\n")}`
+    : "";
+
   const flagsLine = state.synthesisFlags.length > 0
     ? state.synthesisFlags.join(", ")
     : "none";
@@ -2484,6 +2524,11 @@ NEVER quote specific numbers, percentages, or units directly. The structured val
 - "5.2 hours of sleep" → "a short night" or "running on less than you'd want"
 The Pulse should feel like something a trusted friend observed — not a weather station readout. If you find yourself reaching for a numeral or a unit (%, °F, °C, bpm, ms, kcal, steps, hrs, hours), STOP and translate to a qualitative observation instead.
 
+PHRASE VARIETY (this matters — the Pulse has been reading as repetitive and trite):
+- Never use the same weather phrase twice in the same week. Vary the language significantly — not just synonyms, but a genuinely different angle on the same conditions (what it does to the day, how it feels on the skin, what it asks of you — not just "it's humid" restated).
+- Reach for specific local texture for ${locationLabel} rather than generic weather words. For South Florida that means things like the particular weight of the humidity, the afternoon sea breeze, storms stacking up by mid-afternoon, the heat index that makes midday its own decision. Pull the detail that fits today, not a stock phrase.
+- The phrase should feel freshly observed and specific every single day, as if noticed this morning for the first time.
+${recentPulsesBlock ? "\n" + recentPulsesBlock + "\nDo not use similar phrasing to the recent pulses above — pick a different image, a different rhythm, a different entry point.\n" : ""}
 Maximum one sentence. No preamble. This is The Pulse.`;
 
   try {
@@ -2504,7 +2549,18 @@ Maximum one sentence. No preamble. This is The Pulse.`;
     const data = await response.json();
     const text = data?.content?.[0]?.text?.trim() || "";
     if (!text) return null;
-    return text.replace(/^["'“”]+|["'“”]+$/g, "").trim();
+    const cleaned = text.replace(/^["'“”]+|["'“”]+$/g, "").trim();
+    // Persist into the rolling 7-entry recent-pulse history so tomorrow's
+    // prompt can steer away from today's phrasing. Best-effort.
+    if (pulseHouseholdId && cleaned) {
+      try {
+        await redis.lpush(`household:${pulseHouseholdId}:recentPulses`, cleaned);
+        await redis.ltrim(`household:${pulseHouseholdId}:recentPulses`, 0, 6);
+      } catch (err) {
+        console.warn("[pulse] recentPulses write failed:", err?.message || err);
+      }
+    }
+    return cleaned;
   } catch (err) {
     console.error("Pulse generation failed:", err?.message || err);
     return null;
@@ -3157,6 +3213,93 @@ export default async function handler(req, res) {
       console.warn("[brief] financial filter failed:", err?.message || err);
     }
 
+    // ---- Staleness sweep ----
+    // Signals that have ridden the brief many times without resolving are
+    // either un-actionable or already handled outside Conductor (e.g. an
+    // Amazon Prime renewal the user dealt with directly). Two tiers, both
+    // of which DURABLY mutate the stored record:
+    //   briefCount >= 10                      → auto-archive (state=archived),
+    //                                            dropped from the brief, one
+    //                                            archive note left on the record.
+    //   briefCount >= 5 AND unchanged ~7 days → suppressed from the brief and
+    //                                            moved to Missed Cues. The brief
+    //                                            makes ONE final mention.
+    // Newly-moved/archived counts drive that one-time mention; already-moved
+    // signals stay suppressed silently on subsequent runs.
+    let staleMovedNote = null;
+    try {
+      const STALE_BRIEF_COUNT = 5;
+      const ARCHIVE_BRIEF_COUNT = 10;
+      const SEVEN_DAYS_MS = 7 * DAY_MS;
+      const signalsListKey = `household:${householdId}:signals`;
+      const missedCuesKey = `household:${householdId}:missedCues`;
+      const rawList = await redis.lrange(signalsListKey, 0, -1);
+      const idToIndex = new Map();
+      for (let i = 0; i < rawList.length; i++) {
+        const p = safeJson(rawList[i]);
+        if (p && p.id != null) idToIndex.set(String(p.id), i);
+      }
+      let newlyMoved = 0;
+      let newlyArchived = 0;
+      const keepActive = [];
+      for (const s of activeSignals) {
+        const bc = typeof s.briefCount === "number" ? s.briefCount : 0;
+        const lastTouch = Date.parse(s.lastBriefedAt || s.lastUpdate || "") || 0;
+        // "Unchanged for ~7 days" proxy: nothing has refreshed lastBriefedAt/
+        // lastUpdate in a week. When no timestamp exists, fall back to the
+        // brief-count alone (>=5 implies it's been shown across many mornings).
+        const unchanged7d = lastTouch === 0
+          ? bc >= STALE_BRIEF_COUNT
+          : (Date.now() - lastTouch) >= SEVEN_DAYS_MS;
+        const idx = idToIndex.get(String(s.id));
+
+        if (bc >= ARCHIVE_BRIEF_COUNT) {
+          const sinceMs = Date.parse(s.notedAt || s.lastUpdate || "") || lastTouch;
+          const days = sinceMs ? Math.round((Date.now() - sinceMs) / DAY_MS) : null;
+          const archived = {
+            ...s,
+            state: "archived",
+            archivedAt: new Date().toISOString(),
+            archivedBy: "staleness",
+            archiveNote: `The Conductor archived this — it hasn't changed in ${days != null ? days : "many"} days.`,
+            missedCue: true,
+          };
+          if (idx != null) await redis.lset(signalsListKey, idx, JSON.stringify(archived));
+          await redis.lpush(missedCuesKey, JSON.stringify(archived));
+          newlyArchived++;
+          continue; // drop from the brief
+        }
+
+        if (bc >= STALE_BRIEF_COUNT && unchanged7d) {
+          if (!s.movedToMissedCues) {
+            const moved = {
+              ...s,
+              movedToMissedCues: true,
+              movedToMissedCuesAt: new Date().toISOString(),
+              missedCue: true,
+            };
+            if (idx != null) await redis.lset(signalsListKey, idx, JSON.stringify(moved));
+            await redis.lpush(missedCuesKey, JSON.stringify(moved));
+            newlyMoved++;
+          }
+          continue; // suppressed from the brief
+        }
+
+        keepActive.push(s);
+      }
+      activeSignals = keepActive;
+      const totalMoved = newlyMoved + newlyArchived;
+      if (totalMoved > 0) {
+        staleMovedNote =
+          "Several older signals haven't changed in a while and were moved to Missed Cues.";
+        console.log(
+          `[brief] staleness sweep: moved ${newlyMoved} (briefCount>=5), archived ${newlyArchived} (briefCount>=10)`
+        );
+      }
+    } catch (err) {
+      console.warn("[brief] staleness sweep failed:", err?.message || err);
+    }
+
     const calendarEvents = safeJson(rawCalendar) || [];
     const healthContext = safeJson(rawHealth);
     const preferences = safeJson(rawPreferences) || { flaggedCategories: [] };
@@ -3233,6 +3376,13 @@ export default async function handler(req, res) {
       .map(safeJson)
       .filter(Boolean)
       .filter((v) => !v.handled)
+      // After-death "loss" life-transition checklist items (death
+      // certificates, probate, notify Social Security, contact life
+      // insurance, close bank accounts) are seeded into the vault by
+      // api/transition.js. They are NOT brief-surface deadlines — they
+      // can't be cleared from Hover/Missed Cues and they lead the brief
+      // with grief-adjacent admin every morning. Drop them here.
+      .filter((v) => !(v.source === "transition" && v.transitionType === "loss"))
       .map((v) => ({
         ...v,
         eta: v.renewalDate || v.eta,
@@ -3267,7 +3417,17 @@ export default async function handler(req, res) {
       const desc = (d.description || "").toLowerCase().trim();
       if (isSimilarToExistingSignal(desc)) continue;
       const days = (eta.getTime() - Date.now()) / DAY_MS;
-      if (days >= -1 && days < 14) urgentDeadlines.push(d);
+      // Subscription renewals and estate/loss items are never "urgent" —
+      // they're low-stress (or grief-adjacent) housekeeping, not alarms.
+      // They still flow into the near-window pool so they aren't dropped;
+      // they just don't trip the urgent ring or inflate urgentCount (which
+      // drives the Pulse's "N urgent" load read). Mirrors classifyUrgent's
+      // subscription carve-out, which the vault-deadline path was missing.
+      const neverUrgent = isSubscriptionRenewal(d) || isEstateLossItem(d);
+      if (days >= -1 && days < 14) {
+        if (neverUrgent) nearDeadlines.push(d);
+        else urgentDeadlines.push(d);
+      }
       else if (days >= 14 && days <= 60) {
         // Near-window vault items get the background-filter treatment too —
         // same "don't repeat last brief" rule applies; muted items spill into
@@ -4141,6 +4301,9 @@ ${isSingleMember
       travelPrep,
     });
     if (anniversary) synthesisState.anniversaryYearStats = anniversary.yearStats;
+    // Thread householdId through so generatePulseNote can read/write the
+    // rolling recent-pulse history (household:{id}:recentPulses).
+    synthesisState.householdId = householdId;
     // Weather canary — surfaces whether the weather fetch actually
     // populated the synthesis state or came back null, so we can tell
     // a "Pulse isn't mentioning weather" complaint (data) apart from a
@@ -4233,6 +4396,9 @@ ${isSingleMember
       ``,
       `URGENT (surface first if present):`,
       urgentForPrompt.length > 0 ? urgentForPrompt.map(formatSignal).join("\n") : "None",
+      ``,
+      `OLDER SIGNALS MOVED (only if present — make exactly ONE short, calm mention near the end of the brief that a few older signals were moved to Missed Cues; do NOT enumerate them, do NOT dwell on it):`,
+      staleMovedNote || "None",
       ``,
       `HEALTH CONTEXT (one sentence if notable, silent if normal):`,
       healthContext ? JSON.stringify(healthContext) : "Not connected",

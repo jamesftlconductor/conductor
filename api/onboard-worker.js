@@ -19,6 +19,22 @@ const qstash = process.env.QSTASH_TOKEN
 
 const WORKER_URL = "https://conductor-ivory.vercel.app/api/onboard-worker";
 
+// After-death / estate administrative noise. An estate-planning or "what to
+// do when someone dies" email gets parsed into vault "deadline" items
+// (death certificates, probate, notify Social Security, contact life
+// insurance, close bank accounts) that then lead the morning brief with
+// grief-adjacent admin the user can't clear. Drop these at the vault-write
+// gate. Mirrors the DEATH_NOISE_REGEX / ESTATE_ACTION_REGEX gates in
+// api/import.js, kept local to avoid a cross-module import.
+const VAULT_ESTATE_NOISE_RE =
+  /\b(?:death\s*certificates?|certificate\s*of\s*death|obituar(?:y|ies)|funeral|burial|probate|estate\s*(?:settlement|administration)|next\s*of\s*kin|letters\s*of\s*administration|survivor\s*benefits?)\b/i;
+const VAULT_ESTATE_ACTION_RE =
+  /\b(?:notify|contact|claim|cancel|close|transfer|file\s*for|obtain|apply\s*for)\b[^.\n]{0,40}\b(?:social\s*security|life\s*insurance|the\s*estate|probate|death\s*certificates?|next\s*of\s*kin|bank\s*accounts?)\b/i;
+function isEstateVaultNoise(text) {
+  const t = String(text || "");
+  return VAULT_ESTATE_NOISE_RE.test(t) || VAULT_ESTATE_ACTION_RE.test(t);
+}
+
 // QStash signature verification — only enforced if signing keys are configured.
 const receiver =
   process.env.QSTASH_CURRENT_SIGNING_KEY
@@ -738,6 +754,11 @@ ${formatted}`,
         const etaMs = item.date ? Date.parse(item.date) : NaN;
         if (!isNaN(etaMs) && etaMs < Date.now()) continue;
         if (isDuplicateVaultItem(desc, item.date)) continue;
+        // Estate / after-death checklist noise — never a brief-surface deadline.
+        if (isEstateVaultNoise(item.description)) {
+          console.log(`[onboard] skip estate-noise vault item: "${(item.description || "").slice(0, 60)}"`);
+          continue;
+        }
         existingVaultItems.push({ description: item.description, renewalDate: item.date });
 
         // Write to :vault (not :deadlines) so brief.js's deadline pool sees
@@ -1360,6 +1381,11 @@ async function runVaultJob(userId, householdId) {
   let kept = 0;
   for (const item of crossDedup) {
     if (isDuplicateItem(item)) continue;
+    // Estate / after-death checklist noise — never a brief-surface deadline.
+    if (isEstateVaultNoise(item.description)) {
+      console.log(`[onboard] skip estate-noise vault item: "${(item.description || "").slice(0, 60)}"`);
+      continue;
+    }
     existingItems.push(item);
 
     await redis.lpush(

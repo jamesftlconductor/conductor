@@ -43,6 +43,15 @@ const DEATH_NOISE_REGEX = /\b(?:death\s*(?:certificate|notice|record|announcemen
 // term is glued into the display name or domain (e.g. "legacymortuary.com",
 // "ABCFuneralHome"). Sender-scoped so casual body mentions don't trip it.
 const FUNERAL_SENDER_RE = /(funeral|mortuary|cremator|cremation|memorialchapel|funeralhome)/i;
+// After-death / estate administrative checklist items — the action-verb
+// phrasing that an estate-planning or "what to do when someone dies" email
+// (or a misfired loss life-transition) produces: "Notify Social Security",
+// "Contact life insurance provider", "Obtain death certificates", "File for
+// probate", "Close or transfer bank accounts". DEATH_NOISE_REGEX already
+// catches the funeral/obituary/estate vocabulary; this adds the two gaps
+// (life insurance + social security) but ONLY in action-checklist context,
+// so a legitimate "your life insurance policy renews" email is NOT dropped.
+const ESTATE_ACTION_REGEX = /\b(?:notify|contact|claim|cancel|close|transfer|file\s*for|obtain|apply\s*for)\b[^.\n]{0,40}\b(?:social\s*security|life\s*insurance|the\s*estate|probate|death\s*certificates?|next\s*of\s*kin|bank\s*accounts?)\b/i;
 const PROMO_SENDER_PREFIXES = ["noreply", "no-reply", "marketing", "promotions"];
 
 // Inbox-only label gate. Gmail tabs everything it considers Promotions/Social/
@@ -1135,6 +1144,13 @@ function postParseDiscardReason(signal, from) {
     FUNERAL_SENDER_RE.test(`${signal.sender || ""} ${from || ""}`)
   ) {
     return "death-certificate-noise";
+  }
+
+  // Estate / after-death administrative checklist items (life insurance,
+  // social security, probate, death certificates, bank-account closing) in
+  // action-verb context — never an actionable household signal.
+  if (ESTATE_ACTION_REGEX.test(`${signal.description || ""} ${signal.sender || ""}`)) {
+    return "estate-checklist-noise";
   }
 
   // Promo language in the description — Claude correctly extracted the words
