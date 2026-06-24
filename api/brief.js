@@ -14,6 +14,43 @@ const redis = new Redis({
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 
+// Household profile interview — when the household is quiet (fewer than 5
+// active signals), the brief surfaces ONE question at a time to build the
+// household picture. Asked questions are recorded in
+// household:{id}:askedInterviewQuestions (a SET) and never repeated; once the
+// pool is exhausted the brief stops asking. The mobile Ground screen renders
+// the prompt under The Pulse and pre-loads the question into Ask Conductor;
+// api/ask.js?action=interviewAnswer turns the answer into a signal/vault item.
+const HOUSEHOLD_INTERVIEW_QUESTIONS = [
+  { question: "When does your car registration expire?", context: "I'll add a registration renewal reminder to your Vault." },
+  { question: "Do you have a lease or mortgage renewal coming up?", context: "I'll track the renewal date so it doesn't sneak up." },
+  { question: "What streaming subscriptions do you pay for?", context: "I'll add them to your Vault and flag any price changes." },
+  { question: "When was your HVAC last serviced?", context: "I'll set up a maintenance cadence for your system." },
+  { question: "Does anyone in your household have prescription medications that need refilling?", context: "I'll create refill reminders before you run out." },
+  { question: "What's your home insurance renewal date?", context: "I'll add the renewal with a heads-up window." },
+  { question: "Do you have any upcoming travel planned?", context: "I'll start a trip thread so the logistics stay together." },
+  { question: "When do your car insurance and home insurance renew?", context: "I'll track both so you can shop rates in time." },
+];
+const INTERVIEW_SIGNAL_THRESHOLD = 5;
+
+// Pick the next unasked interview question when the household is below the
+// active-signal threshold. Records it as asked (SADD) so it never repeats.
+// Best-effort: any Redis failure returns null and the brief ships without one.
+async function pickHouseholdInterview(householdId, activeCount) {
+  if (typeof activeCount !== "number" || activeCount >= INTERVIEW_SIGNAL_THRESHOLD) return null;
+  const askedKey = `household:${householdId}:askedInterviewQuestions`;
+  try {
+    const asked = new Set(await redis.smembers(askedKey));
+    const next = HOUSEHOLD_INTERVIEW_QUESTIONS.find((q) => !asked.has(q.question));
+    if (!next) return null; // whole pool asked — stop, never repeat
+    await redis.sadd(askedKey, next.question);
+    return { question: next.question, context: next.context };
+  } catch (err) {
+    console.warn("[interview] pick failed:", err?.message || err);
+    return null;
+  }
+}
+
 // Default coords used only when location detection genuinely failed —
 // per-household coords come from household:{id}:location now.
 const WEATHER_TIMEOUT_MS = 3000;
@@ -5635,6 +5672,11 @@ Return only the offer line.`;
       console.warn("[brief] joke offer eligibility failed:", err?.message || err);
     }
 
+    // Household interview — when the active pool is thin (< 5), surface one
+    // profile-building question. Null when the household is busy enough or the
+    // question pool is exhausted.
+    const householdInterview = await pickHouseholdInterview(householdId, activeSignals.length);
+
     const briefResponse = {
       brief: finalBrief,
       spokenSummary,
@@ -5654,6 +5696,7 @@ Return only the offer line.`;
         ? { signalId: handoff.signalId, message: handoff.message, type: handoff.type }
         : null,
       conductorQuestion: conductorQuestion || null,
+      householdInterview: householdInterview || null,
       // Maintenance plan offer — surfaced when inventory is rich
       // enough to plan against AND no offer has been shown to this
       // household in the last 7 days. The mobile Ground card reads

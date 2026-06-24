@@ -311,6 +311,133 @@ Return only the spoken text, nothing else — no preface, no quotes.`,
   return text.trim();
 }
 
+// ---------- Household-interview answer → signal/vault ----------
+//
+// When the user answers a profile-interview question (surfaced by the brief
+// as householdInterview), turn the answer into the matching Vault item(s)
+// (renewals/policies/subscriptions) or signal(s) (upcoming travel/events).
+// Best-effort Haiku tool extraction; an answer with no concrete data
+// ("none", "not sure") creates nothing.
+async function extractInterviewItems(interviewQuestion, answerText) {
+  const apiRes = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": process.env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 700,
+      tools: [{
+        name: "record_household_items",
+        description: "Turn a household interview answer into structured Vault items (recurring renewals/policies/subscriptions) or signals (one-off upcoming events like travel/appointments). Return items: [] when the answer has no concrete actionable data.",
+        input_schema: {
+          type: "object",
+          properties: {
+            items: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  kind: { type: "string", enum: ["vault", "signal"] },
+                  category: { type: "string", description: "vault only: registration|insurance|subscription|medical|lease|warranty|other" },
+                  description: { type: "string" },
+                  provider: { type: ["string", "null"] },
+                  renewalDate: { type: ["string", "null"], description: "vault: YYYY-MM-DD or null" },
+                  amount: { type: ["string", "null"] },
+                  signalType: { type: ["string", "null"], description: "signal only: travel|deadline|appointment|service" },
+                  eta: { type: ["string", "null"], description: "signal: YYYY-MM-DD or null" },
+                },
+                required: ["kind", "description"],
+              },
+            },
+          },
+          required: ["items"],
+        },
+      }],
+      tool_choice: { type: "tool", name: "record_household_items" },
+      messages: [{
+        role: "user",
+        content: `Today is ${new Date().toISOString().slice(0, 10)}.
+
+Interview question asked: "${interviewQuestion}"
+Household member's answer: "${answerText}"
+
+Extract structured items. Vault items are recurring renewals/policies/subscriptions (use renewalDate). Signals are one-off upcoming events such as travel or appointments (use eta + signalType). Convert relative dates ("next March", "in 3 months") to an absolute YYYY-MM-DD. If the answer is "no", "none", "not sure", or carries no concrete data, return items: [].`,
+      }],
+    }),
+  });
+  if (!apiRes.ok) return [];
+  const data = await apiRes.json();
+  const tool = (data?.content || []).find((b) => b?.type === "tool_use");
+  const items = tool?.input?.items;
+  return Array.isArray(items) ? items : [];
+}
+
+async function handleInterviewAnswer(userId, interviewQuestion, answerText) {
+  const householdId = (await redis.get(`user:${userId}:household`)) || userId;
+  let items = [];
+  try {
+    items = await extractInterviewItems(interviewQuestion, answerText);
+  } catch (err) {
+    console.warn("[interview] extract failed:", err?.message || err);
+  }
+  const created = [];
+  const now = Date.now();
+  for (let i = 0; i < items.length; i++) {
+    const it = items[i];
+    if (!it || !it.description) continue;
+    if (it.kind === "signal") {
+      const signal = {
+        id: now + i,
+        description: it.description,
+        type: it.signalType || "deadline",
+        eta: it.eta || it.renewalDate || null,
+        sender: "You",
+        state: "incoming",
+        source: "interview",
+        confidence: 7,
+        userId,
+        lastUpdate: new Date().toLocaleString(),
+        createdAt: now,
+      };
+      try {
+        await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
+        created.push({ kind: "signal", description: it.description });
+      } catch (err) { console.warn("[interview] signal write failed:", err?.message || err); }
+    } else {
+      const item = {
+        id: `vault_interview_${now}_${i}`,
+        category: it.category || "other",
+        description: it.description,
+        provider: it.provider || null,
+        renewalDate: it.renewalDate || null,
+        amount: it.amount || null,
+        source: "interview",
+        handled: false,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await redis.lpush(`household:${householdId}:vault`, JSON.stringify(item));
+        created.push({ kind: "vault", description: it.description });
+      } catch (err) { console.warn("[interview] vault write failed:", err?.message || err); }
+    }
+  }
+  let answer;
+  if (created.length === 0) {
+    answer = "Got it — nothing to add for that one. Thanks for letting me know.";
+  } else {
+    const vaultN = created.filter((c) => c.kind === "vault").length;
+    const sigN = created.filter((c) => c.kind === "signal").length;
+    const parts = [];
+    if (vaultN) parts.push(`${vaultN} ${vaultN > 1 ? "items" : "item"} to your Vault`);
+    if (sigN) parts.push(`${sigN} ${sigN > 1 ? "signals" : "signal"} to your radar`);
+    answer = `Done — I added ${parts.join(" and ")}: ${created.map((c) => c.description).join(", ")}.`;
+  }
+  return { answer, created, confidence: "high", interview: true };
+}
+
 // ---------- Intent classification ----------
 
 const NAVIGATE_ROUTES = {
@@ -1069,6 +1196,23 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Missing or invalid question" });
   }
   const trimmedQuestion = question.trim();
+
+  // Interview-answer path — when the user is answering a household-interview
+  // question (the original question rides along as interviewQuestion), turn
+  // the answer into signal(s)/vault item(s) instead of running normal Q&A.
+  const interviewQuestion = typeof req.body?.interviewQuestion === "string"
+    ? req.body.interviewQuestion.trim()
+    : "";
+  if (interviewQuestion) {
+    try {
+      const result = await handleInterviewAnswer(userId, interviewQuestion, trimmedQuestion);
+      return res.status(200).json({ ...result, cached: false });
+    } catch (err) {
+      console.error("[ask] interview answer failed:", err?.message || err);
+      // Fall through to the normal Q&A path on failure.
+    }
+  }
+
   // screenContext tells the LLM which surface the user invoked The
   // Conductor from. Used to bias the response toward the data
   // visible on that screen — e.g. on Vault, lean into deadlines and
