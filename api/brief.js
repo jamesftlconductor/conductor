@@ -1684,7 +1684,10 @@ function inventoryDerivedSignals(inventory, today = new Date()) {
       const target = new Date(nowYear, 4, 15);
       if (target.getTime() < nowMs) target.setFullYear(nowYear + 1);
       signals.push({
-        id: `inv_hvac_${nowMs}`,
+        // Stable id (not timestamped) so a resolve PATCH can target it —
+        // the inventory-derived resolve hook in signals.js records the
+        // service rather than 404-ing on a row that was never persisted.
+        id: "inv_hvac",
         description: `${hvac.brand || "HVAC"} system ${age} years old — pre-summer tune-up worth scheduling`,
         type: "service",
         sender: "Home Inventory",
@@ -1699,7 +1702,10 @@ function inventoryDerivedSignals(inventory, today = new Date()) {
     const lastServicedMs = hvac.lastServiced ? Date.parse(hvac.lastServiced) : NaN;
     if (!isNaN(lastServicedMs) && (nowMs - lastServicedMs) > 90 * DAY_MS) {
       signals.push({
-        id: `inv_filter_${nowMs}`,
+        // Stable id (see inv_hvac note) — resolving this updates
+        // inventory.hvac.lastServiced so the >90-day check stops firing
+        // until the filter is genuinely due again.
+        id: "inv_filter",
         description: `HVAC filter change overdue — last serviced ${hvac.lastServiced}`,
         type: "service",
         sender: "Home Inventory",

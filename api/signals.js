@@ -4583,6 +4583,41 @@ export default async function handler(req, res) {
       const deadlines = rawDeadlines.map(parseSignal);
       index = deadlines.findIndex(d => d.id === id || String(d.id) === String(id));
       if (index === -1) {
+        // Inventory-derived maintenance reminders (e.g. the HVAC filter
+        // change) are synthesized fresh in the brief from
+        // household:{id}:inventory and never persisted to any list — so a
+        // resolve PATCH finds no row and used to 404 silently, which is why
+        // the HVAC filter reminder "kept coming back" no matter how many
+        // times it was resolved. Resolving "filter change overdue" means the
+        // filter was changed: stamp inventory.hvac.lastServiced = today so the
+        // brief's >90-day check stops firing (and re-arms naturally when due).
+        if (
+          stateProvided &&
+          (state === "resolved" || state === "snoozed") &&
+          String(id) === "inv_filter"
+        ) {
+          try {
+            const invKey = `household:${householdId}:inventory`;
+            const rawInv = await redis.get(invKey);
+            const inv = rawInv
+              ? (typeof rawInv === "string" ? JSON.parse(rawInv) : rawInv)
+              : null;
+            if (inv && inv.hvac) {
+              inv.hvac.lastServiced = new Date().toISOString().slice(0, 10);
+              await redis.set(invKey, JSON.stringify(inv));
+              try { await invalidateBriefCache(householdId); } catch { /* best-effort */ }
+              try { await bustUserBriefCache(userId); } catch { /* best-effort */ }
+              return res.status(200).json({
+                household: householdId,
+                resolved: id,
+                inventoryUpdated: true,
+                lastServiced: inv.hvac.lastServiced,
+              });
+            }
+          } catch (err) {
+            console.warn("[signals] inventory-derived resolve failed:", err?.message || err);
+          }
+        }
         return res.status(404).json({ error: "signal not found" });
       }
 
