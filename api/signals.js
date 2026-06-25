@@ -2379,7 +2379,7 @@ async function handleProfile(req, res) {
   if (req.method === "POST") {
     const {
       type, ownOrRent, childrenCount, petsCount,
-      who, housing, modifiers, householdName,
+      who, housing, modifiers, householdName, householdShape,
     } = req.body || {};
     if (type && !VALID_PROFILE_TYPES.has(type)) {
       return res.status(400).json({ error: "invalid type" });
@@ -2411,6 +2411,10 @@ async function handleProfile(req, res) {
     const next = {
       ...existing,
       ...(type && { type }),
+      // householdShape is the exact UI card id (e.g. "rent_focus" vs "single",
+      // which both map to type "single") so the mobile profile screen can
+      // restore the precise selection on return visits.
+      ...(typeof householdShape === "string" && householdShape.length > 0 && { householdShape }),
       ...(ownOrRent && { ownOrRent }),
       ...(childrenCount != null && { childrenCount: Number(childrenCount) }),
       ...(petsCount != null && { petsCount: Number(petsCount) }),
