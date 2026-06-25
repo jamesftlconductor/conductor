@@ -208,6 +208,11 @@ function classifyWeather(code, tempF) {
 // (network, timeout, malformed payload) so the brief still ships
 // without weather context. 3s timeout keeps the overall brief
 // latency bounded even when Open-Meteo is slow.
+function degToCardinal(deg) {
+  const dirs = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
+  return dirs[Math.round((((deg % 360) + 360) % 360) / 22.5) % 16];
+}
+
 export async function fetchWeather(location) {
   // Use the household's stored coordinates when available; fall back to
   // the LOCATION_FALLBACK (Fort Lauderdale) so a household with no
@@ -221,11 +226,12 @@ export async function fetchWeather(location) {
     const url =
       `https://api.open-meteo.com/v1/forecast` +
       `?latitude=${lat}&longitude=${lon}` +
-      `&current=temperature_2m,relative_humidity_2m,precipitation,weathercode` +
+      `&current=temperature_2m,relative_humidity_2m,precipitation,weathercode,wind_speed_10m,wind_direction_10m` +
       `&hourly=temperature_2m,precipitation_probability,uv_index,weathercode` +
-      `&daily=sunrise,sunset,uv_index_max` +
-      `&forecast_days=1` +
+      `&daily=sunrise,sunset,uv_index_max,temperature_2m_max,temperature_2m_min,weathercode,precipitation_probability_max` +
+      `&forecast_days=2` +
       `&temperature_unit=fahrenheit` +
+      `&wind_speed_unit=mph` +
       `&timezone=${encodeURIComponent(timezone)}`;
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(t);
@@ -316,12 +322,46 @@ export async function fetchWeather(location) {
     const sunrise = Array.isArray(daily.sunrise) && daily.sunrise[0] ? fmtTimeFromIso(daily.sunrise[0]) : null;
     const sunset = Array.isArray(daily.sunset) && daily.sunset[0] ? fmtTimeFromIso(daily.sunset[0]) : null;
 
+    // Wind — current speed (mph) + cardinal direction from the heading.
+    const windSpeed = typeof current.wind_speed_10m === "number" ? Math.round(current.wind_speed_10m) : null;
+    const windDeg = typeof current.wind_direction_10m === "number" ? current.wind_direction_10m : null;
+    const windDirection = windDeg != null ? degToCardinal(windDeg) : null;
+
+    // Tomorrow's forecast — daily arrays index 1 (forecast_days=2). One-line
+    // summary plus the structured high/low/precip for the UI.
+    let tomorrow = null;
+    {
+      const dHigh = Array.isArray(daily.temperature_2m_max) ? daily.temperature_2m_max[1] : null;
+      const dLow = Array.isArray(daily.temperature_2m_min) ? daily.temperature_2m_min[1] : null;
+      const dCode = Array.isArray(daily.weathercode) ? daily.weathercode[1] : null;
+      const dPrecip = Array.isArray(daily.precipitation_probability_max) ? daily.precipitation_probability_max[1] : null;
+      if (typeof dHigh === "number" || dCode != null) {
+        const hi = typeof dHigh === "number" ? Math.round(dHigh) : null;
+        const lo = typeof dLow === "number" ? Math.round(dLow) : null;
+        // classifyWeather already embeds the high temp, so the summary adds
+        // only the low + rain to avoid printing the temperature twice.
+        const cond = classifyWeather(dCode ?? 0, hi ?? tempF);
+        const rainBit = typeof dPrecip === "number" && dPrecip >= 40 ? `, ${dPrecip}% chance of rain` : "";
+        tomorrow = {
+          high: hi,
+          low: lo,
+          weatherCode: dCode ?? null,
+          precipProb: typeof dPrecip === "number" ? dPrecip : null,
+          summary: `Tomorrow: ${cond}${lo != null ? `, low ${lo}°F` : ""}${rainBit}.`,
+        };
+      }
+    }
+
     return {
       tempF,
       humidity,
       isRaining,
       weatherCode,
       summary: classifyWeather(weatherCode, tempF),
+      windSpeed,
+      windDirection,
+      windDirectionDeg: windDeg,
+      tomorrow,
       rainWindow,
       temperaturePeak,
       uvPeak,
@@ -5259,6 +5299,11 @@ Never manufacture urgency. Never apologize for having nothing to say. The quiet 
         temperaturePeak: weather.temperaturePeak ?? null,
         sunrise: weather.sunrise ?? null,
         sunset: weather.sunset ?? null,
+        // Wind (mph + cardinal) and a one-line tomorrow forecast for the
+        // Vitals tab.
+        windSpeed: weather.windSpeed ?? null,
+        windDirection: weather.windDirection ?? null,
+        tomorrow: weather.tomorrow ?? null,
       } : null,
       signalLoad: synthesisState.signalLoad,
       urgentCount: synthesisState.urgentCount,

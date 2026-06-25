@@ -4380,7 +4380,37 @@ export default async function handler(req, res) {
       // rules are also checked at POST-rule time to scrub current
       // active signals, so this is the second line of defense.
       const filtered = applyCamouflage(signals, camouflageRules);
-      return res.status(200).json({ household: householdId, signals: filtered });
+
+      // Vitals support — last import run timestamp + signals resolved since
+      // local midnight. Both best-effort; a failure just omits the datapoint.
+      const vitalsUserId = req.query.userId;
+      let lastImportAt = null;
+      try {
+        if (vitalsUserId) {
+          const raw = await redis.get(`user:${vitalsUserId}:lastImportAt`);
+          lastImportAt = raw != null ? raw : null;
+        }
+      } catch { /* ignore */ }
+      let resolvedToday = 0;
+      try {
+        const midnight = new Date();
+        midnight.setHours(0, 0, 0, 0);
+        const startMs = midnight.getTime();
+        const rawMem = await redis.lrange(`household:${householdId}:memory`, 0, 199);
+        for (const r of rawMem) {
+          const e = safeJson(r);
+          if (!e || e.action !== "resolved") continue;
+          const ms = Date.parse(e.actionAt || e.resolvedAt || "");
+          if (!isNaN(ms) && ms >= startMs) resolvedToday++;
+        }
+      } catch { /* ignore */ }
+
+      return res.status(200).json({
+        household: householdId,
+        signals: filtered,
+        lastImportAt,
+        resolvedToday,
+      });
     }
 
     // Manual signal creation. Mobile's "+ Add Signal" sheet posts here

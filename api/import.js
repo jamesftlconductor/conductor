@@ -1472,6 +1472,7 @@ export async function runImport(userId, customQuery = null) {
   const searchData = await searchResponse.json();
 
   if (!searchData.messages || searchData.messages.length === 0) {
+    try { await redis.set(`user:${userId}:lastImportAt`, Date.now()); } catch { /* ignore */ }
     return { imported: 0, debug: "No messages found" };
   }
 
@@ -2156,6 +2157,11 @@ ${emailText.substring(0, 1000)}`,
       continue;
     }
   }
+
+  // Vitals — stamp the last successful import time for this user (read back
+  // by GET /api/signals as lastImportAt).
+  try { await redis.set(`user:${userId}:lastImportAt`, Date.now()); }
+  catch (err) { console.warn("[import] lastImportAt write failed:", err?.message || err); }
 
   return { imported };
 }
