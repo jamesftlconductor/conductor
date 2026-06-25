@@ -5,6 +5,7 @@ import { detectOrLoadLocation, saveHouseholdLocation, loadHouseholdLocation } fr
 import { writeCommonsRecord } from "./commons.js";
 import { IMAP_PRESETS, encrypt, validateImapConnection } from "./imap-import.js";
 import { synthesizeTripThreads } from "./trip-threads.js";
+import { resolveSignal } from "./resolve-signal.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -4485,7 +4486,11 @@ export default async function handler(req, res) {
         const previousLastUpdate = signals[index].lastUpdate;
         const previousState = signals[index].state || null;
         applyEditFields(signals[index]);
-        if (stateProvided) {
+        // The "resolved" transition defers its state stamp to resolveSignal
+        // (below) so the canonical path sees the pre-resolve state and runs
+        // the one-time memory/Commons writes exactly once. Every other
+        // transition stamps the state here as before.
+        if (stateProvided && state !== "resolved") {
           signals[index].state = state;
           if (state === "snoozed") {
             // Default snooze window is 24h; client may override via
@@ -4532,49 +4537,42 @@ export default async function handler(req, res) {
           }
         }
 
-        // Memory log fires only on state lifecycle transitions, not on
-        // pure field edits. An edit isn't a "resolved" or "held" event;
-        // logging it would pollute the longitudinal feed and Compass.
-        if (stateProvided && (state === "resolved" || state === "active")) {
-          const action = state === "resolved" ? "resolved" : "held";
-          const memorySignal = { ...signals[index], lastUpdate: previousLastUpdate };
-          await writeMemoryEntry(householdId, memorySignal, action, userId);
-          // Caught moment — only on resolved transitions; close-call to
-          // the signal's ETA.
-          if (state === "resolved") {
-            const criterion = detectCaughtMoment(signals[index], { kind: "signal" });
-            if (criterion) await recordCaughtMoment(householdId, signals[index], criterion, userId);
-            try { await updateStreak(householdId); } catch (err) {
-              console.warn("[streak] update failed:", err?.message || err);
-            }
-            // Commons — anonymous provider aggregation. No identifiers
-            // ever written; only resolution days + type + timestamp.
-            await writeCommonsRecord(householdId, signals[index]);
-            // Weekly Symphony — update the current week's achievement
-            // bitmap. Best-effort; failure never blocks the resolve.
-            try { await updateWeeklyAchievement(householdId, signals[index], "signal"); } catch (err) {
-              console.warn("[symphony] update failed:", err?.message || err);
-            }
-            // Conductor auto-post to Crew Channel — only for genuinely
-            // notable signals so the channel doesn't fill with noise.
-            // Threshold: high-urgency, high-intensity, or carried
-            // forward 3+ mornings.
-            try {
-              const notable =
-                signals[index]?.urgency === "high"
-                || signals[index]?.emotionalIntensity === "high"
-                || (Number(signals[index]?.briefCount) || 0) >= 3;
-              if (notable) {
-                const { postConductorMessage } = await import("./channel.js");
-                const desc = (signals[index]?.description || "A signal").slice(0, 120);
-                await postConductorMessage(householdId, `✓ ${desc} — handled.`, {
-                  attachedSignalId: signals[index].id,
-                });
-              }
-            } catch (err) {
-              console.warn("[channel] auto-post failed:", err?.message || err);
-            }
+        // Resolve routes through the canonical resolveSignal so the
+        // resolution reconciles every store (:signals state + :missedCues
+        // removal + :vault handled + :memory) plus Commons, and busts the
+        // brief cache household-wide. The PATCH-only enrichments (caught
+        // moment / streak / weekly symphony / channel auto-post) run after.
+        // "Held" (active) keeps its own memory entry; pure edits log nothing.
+        if (stateProvided && state === "resolved") {
+          const recon = await resolveSignal(householdId, id, userId, { reason: "user" });
+          if (recon?.signal) signals[index] = recon.signal;
+          const resolved = signals[index];
+          try {
+            const criterion = detectCaughtMoment(resolved, { kind: "signal" });
+            if (criterion) await recordCaughtMoment(householdId, resolved, criterion, userId);
+          } catch (err) { console.warn("[caught] failed:", err?.message || err); }
+          try { await updateStreak(householdId); } catch (err) {
+            console.warn("[streak] update failed:", err?.message || err);
           }
+          try { await updateWeeklyAchievement(householdId, resolved, "signal"); } catch (err) {
+            console.warn("[symphony] update failed:", err?.message || err);
+          }
+          try {
+            const notable =
+              resolved?.urgency === "high"
+              || resolved?.emotionalIntensity === "high"
+              || (Number(resolved?.briefCount) || 0) >= 3;
+            if (notable) {
+              const { postConductorMessage } = await import("./channel.js");
+              const desc = (resolved?.description || "A signal").slice(0, 120);
+              await postConductorMessage(householdId, `✓ ${desc} — handled.`, {
+                attachedSignalId: resolved.id,
+              });
+            }
+          } catch (err) { console.warn("[channel] auto-post failed:", err?.message || err); }
+        } else if (stateProvided && state === "active") {
+          const memorySignal = { ...signals[index], lastUpdate: previousLastUpdate };
+          await writeMemoryEntry(householdId, memorySignal, "held", userId);
         }
         return res.status(200).json({ household: householdId, signal: signals[index] });
       }

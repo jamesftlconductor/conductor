@@ -16,6 +16,7 @@ import { Redis } from "@upstash/redis";
 import { applyTrackingUpdate } from "./import.js";
 import { trackFlight, extractFlightNumbers } from "./carrier.js";
 import { writeCommonsRecord, logAutoResolvedMemory } from "./commons.js";
+import { resolveSignal } from "./resolve-signal.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -179,6 +180,8 @@ async function applyFlightUpdate(householdId, signal, flightNumber) {
       // Memory + Commons rails for the flight-landed auto-resolve.
       await logAutoResolvedMemory(householdId, parsed, "flight-landed");
       await writeCommonsRecord(householdId, parsed);
+      try { await resolveSignal(householdId, parsed.id, parsed.userId, { reason: "flight-landed" }); }
+      catch (err) { console.warn("[track] resolve reconcile failed:", err?.message || err); }
     }
     return { signal: parsed, prevStatus, prevDelay, result };
   }

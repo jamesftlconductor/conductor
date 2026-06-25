@@ -12,6 +12,7 @@
 // system continues without SMS delivery.
 
 import { Redis } from "@upstash/redis";
+import { resolveSignal } from "./resolve-signal.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -251,6 +252,12 @@ async function handleInbound(req, res) {
         s.smsReplyKeyword = keyword || body.slice(0, 40);
         s.lastUpdate = new Date().toLocaleString();
         await redis.lset(sigKey, i, JSON.stringify(s));
+        // DONE reply is a user-initiated resolve — reconcile every store
+        // (:missedCues / :vault) + bust the brief cache via the canonical path.
+        if (stateUpdate === "resolved") {
+          try { await resolveSignal(householdId, s.id, pending.userId, { reason: "sms-done" }); }
+          catch (err) { console.warn("[twilio] resolve reconcile failed:", err?.message || err); }
+        }
         break;
       }
     }

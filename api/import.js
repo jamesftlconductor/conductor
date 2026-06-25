@@ -6,6 +6,7 @@ import {
   trackPackage,
 } from "./carrier.js";
 import { writeCommonsRecord, logAutoResolvedMemory } from "./commons.js";
+import { resolveSignal } from "./resolve-signal.js";
 import { extractSignalLocation } from "./places.js";
 import { matchTripWindow } from "./trip-threads.js";
 
@@ -321,6 +322,11 @@ export async function applyTrackingUpdate(householdId, signal) {
       // anonymous resolution-time-by-provider stat.
       await logAutoResolvedMemory(householdId, parsed, "tracking");
       await writeCommonsRecord(householdId, parsed);
+      // Reconcile the other stores (:missedCues / :vault) + bust the brief
+      // cache. The signal is already resolved here, so resolveSignal's
+      // idempotency guard skips a duplicate memory/Commons write.
+      try { await resolveSignal(householdId, parsed.id, parsed.userId, { reason: "tracking" }); }
+      catch (err) { console.warn("[tracking] resolve reconcile failed:", err?.message || err); }
     }
     console.log(
       `[tracking] ${signal.trackingNumber} (${tracking.carrier}): ${previousStatus || "?"} → ${tracking.status}`
@@ -1819,6 +1825,8 @@ ${emailText.substring(0, 1000)}`,
             // stay empty for the Delivered/Cancelled status-update path.
             await logAutoResolvedMemory(householdId, patched, "status-update");
             await writeCommonsRecord(householdId, patched);
+            try { await resolveSignal(householdId, patched.id, userId, { reason: "status-update" }); }
+            catch (err) { console.warn("[status-update] resolve reconcile failed:", err?.message || err); }
           }
           console.log(
             `Updated signal ${updateExisting.id} status to ${signal.status} from confirmation email`
