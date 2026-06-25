@@ -4861,6 +4861,17 @@ ${isSingleMember
       console.warn("[brief] hobbies rule failed:", err?.message);
     }
 
+    // Quiet-day proactive value — when the radar is genuinely light, the
+    // brief should offer something worth reading rather than reporting
+    // silence ("nothing to report / the radar is clear" and stop). The
+    // data to draw from (local + seasonal events, hobbies, behavior
+    // patterns, the proactive question) is already assembled above; this
+    // rule tells the model to actually use ONE piece of it on a quiet day.
+    if (synthesisState.signalLoad === "clear" || synthesisState.signalLoad === "light") {
+      composedRules = `${composedRules}
+- QUIET DAY (signal load is '${synthesisState.signalLoad}'): do NOT just note that nothing is pressing and stop — a quiet day is a chance to add value, not fill with silence. After the brief calm acknowledgment, include exactly ONE genuinely useful, proactive element, whichever best fits today: a relevant local or seasonal event, a hobby invitation (when interests are known), a thoughtful observation about the household's rhythm or something small worth getting ahead of, or one light proactive question. Specific and warm, never filler or a platitude ("enjoy the quiet", "be outside more"). Frame it as an invitation, never an obligation. Keep the brief at its usual length — one added thought, not a list.`;
+    }
+
     // Seasonal personality — one-line context appended to the
     // prompt rules. Falls through silently for markets we don't
     // have a map for; other regions can be added without touching
