@@ -585,6 +585,59 @@ function extractDestination(text) {
   return null;
 }
 
+// The Overnight Letter — one specific thing noticed "while you slept". Not a
+// summary; a single observed detail, drawn from (in priority) sleep, the
+// nearest deadline, weather, then the household's quiet. Returns one sentence
+// or null. Deterministic so it reads as observed, not generated.
+function pickOvernightObservation({ healthContext, weather, activeSignals }) {
+  const NOW = Date.now();
+  const DAY = 86400000;
+  const round1 = (n) => Math.round(n * 10) / 10;
+
+  // 1. Sleep — a notably short or long night is the most personal "overnight".
+  const sleep = healthContext?.sleep?.duration ?? null;
+  if (typeof sleep === "number" && sleep > 0) {
+    if (sleep < 6) return `Your sleep ran short last night — about ${round1(sleep)} hours.`;
+    if (sleep >= 8.5) return `You slept long last night — ${round1(sleep)} hours. The body wanted it.`;
+  }
+
+  // 2. Nearest deadline within three days — a window quietly closing.
+  const soon = (activeSignals || [])
+    .filter((s) => s.type !== "travel") // travel is handled by the handoff line
+    .map((s) => ({ s, ms: parseDateLoose(s.eta)?.getTime() }))
+    .filter((x) => x.ms && x.ms > NOW && x.ms - NOW <= 3 * DAY)
+    .sort((a, b) => a.ms - b.ms);
+  if (soon.length) {
+    const days = Math.max(1, Math.round((soon[0].ms - NOW) / DAY));
+    const what = (soon[0].s.description || "Something on your list").replace(/\.\s*$/, "");
+    return `${what} — that window closes in ${days === 1 ? "a day" : `${days} days`}.`;
+  }
+
+  // 3. Weather as it stands this morning — respect the code so we never claim
+  // "clear" over a storm summary.
+  if (weather) {
+    if (weather.isRaining) {
+      return `Rain moved in overnight${weather.tempF != null ? ` — ${weather.tempF}°F right now` : ""}.`;
+    }
+    const code = typeof weather.weatherCode === "number" ? weather.weatherCode : null;
+    if (code != null && code <= 3) {
+      // Open-Meteo: 0 clear, 1 mainly clear, 2 partly cloudy, 3 overcast.
+      const word = code <= 1 ? "Clear and settled" : code === 2 ? "Soft and partly cloudy" : "Grey but calm";
+      return `${word} this morning${weather.tempF != null ? `, ${weather.tempF}°F` : ""}.`;
+    }
+    if (weather.summary) {
+      // An unsettled code with no active precip — name it without claiming clear.
+      return `${weather.summary} in the forecast — dry for the moment.`;
+    }
+  }
+
+  // 4. Quiet — genuinely nothing.
+  if ((activeSignals || []).length === 0) {
+    return `The house stayed quiet overnight — nothing new came in.`;
+  }
+  return null;
+}
+
 // Geocode + weather lookup for a destination city. Best-effort with a
 // 3s timeout (same budget as the local fetchWeather). Returns null on
 // any failure so the brief still ships without destination weather.
@@ -5751,6 +5804,51 @@ Return only the offer line.`;
       }
     } catch { /* best-effort — reveal never blocks the brief */ }
 
+    const nowMsBrief = Date.now();
+    const DAY_MS_BRIEF = 86400000;
+
+    // The Overnight Letter — one observed detail (sleep / nearest deadline /
+    // weather / quiet). Mobile shows it between the greeting and the brief body.
+    let overnightObservation = null;
+    try {
+      overnightObservation = pickOvernightObservation({ healthContext, weather, activeSignals });
+    } catch { /* best-effort */ }
+
+    // The Handoff — when ANOTHER member is away on a trip, the non-traveling
+    // reader opens with one steadying line. Trip = active travel signal owned
+    // by someone else whose ETA places them gone-or-leaving-imminently
+    // (recent past through the next 2 days), so "is in [destination]" reads true.
+    let handoffNote = null;
+    try {
+      const travelByOthers = (activeSignals || [])
+        .filter((s) =>
+          s.type === "travel" &&
+          s.userId && s.userId !== userId &&
+          (!s.state || s.state === "active" || s.state === "incoming")
+        )
+        .map((s) => ({ s, ms: parseDateLoose(s.eta)?.getTime() }))
+        .filter((x) => x.ms && x.ms >= nowMsBrief - 14 * DAY_MS_BRIEF && x.ms <= nowMsBrief + 2 * DAY_MS_BRIEF)
+        .sort((a, b) => a.ms - b.ms);
+      if (travelByOthers.length) {
+        const t = travelByOthers[0].s;
+        const travelerName = householdNameMap?.get(t.userId) || "Someone";
+        const dest = t.destination || extractDestination(t.description || "");
+        handoffNote = dest
+          ? `${travelerName} is in ${dest}. The Conductor has the house.`
+          : `${travelerName} is traveling. The Conductor has the house.`;
+      }
+    } catch { /* best-effort */ }
+
+    // The Quiet Room — when GENUINELY clear (no active signals), close with the
+    // stillness line rather than trailing into silence. Not for low-priority-
+    // but-present loads — only a truly empty board.
+    if (synthesisState.signalLoad === "clear" && activeSignals.length === 0) {
+      const quietLine = "The house is quiet. Everything is handled. This is what it feels like when nothing needs your attention.";
+      if (!finalBrief.includes("what it feels like when nothing needs")) {
+        finalBrief = `${finalBrief.trimEnd()}\n\n${quietLine}`;
+      }
+    }
+
     const briefResponse = {
       brief: finalBrief,
       spokenSummary,
@@ -5783,6 +5881,8 @@ Return only the offer line.`;
       streakObservation,
       iconNote,
       sweepReveal,
+      overnightObservation,
+      handoffNote,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for
