@@ -1416,6 +1416,150 @@ ${bodyExcerpt}`;
   return { items, scanned: validHeaders.length };
 }
 
+// Stable hash key for a provider/institution name (local mirror of import.js
+// normalizeProviderName — lowercase, strip entity/title suffixes + punct).
+function normalizeExtraName(name) {
+  if (!name || typeof name !== "string") return "";
+  return name
+    .toLowerCase()
+    .replace(/[.,]/g, " ")
+    .replace(/\b(llc|inc|incorporated|co|corp|corporation|ltd|pllc|pa|pc|plc|md|dds|dmd|esq|dr)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ---------- Exhaustive extras (non-renewal data) ----------
+//
+// The vault passes above require a renewalDate. These three extractors capture
+// the rest of the exhaustive-onboarding wishlist that has no renewal date and
+// routes to other stores:
+//   1. Travel loyalty / frequent-flyer numbers  → inventory.loyalty
+//   2. Doctors / attorneys from emails           → :providers hash
+//   3. Bank / investment INSTITUTIONS            → :vault (name only, no acct #)
+// Tight per-search caps keep this within the vault job's 60s budget; realistic
+// per-category email volume is low.
+async function runExhaustiveExtras(accessToken, householdId) {
+  const afterEpoch = Math.floor((Date.now() - 365 * DAY_MS) / 1000);
+  const stats = { loyalty: 0, providers: 0, financialAccounts: 0 };
+
+  async function gather(query, cap) {
+    const ids = await gmailSearch(accessToken, `after:${afterEpoch} ${query}`, cap).catch(() => []);
+    const out = [];
+    for (let i = 0; i < ids.length; i += 15) {
+      const chunk = await Promise.all(ids.slice(i, i + 15).map((id) => fetchEmailFullBody(accessToken, id).catch(() => null)));
+      out.push(...chunk.filter(Boolean));
+    }
+    return out;
+  }
+  async function extractEach(emails, instructions, max) {
+    const results = [];
+    const slice = emails.slice(0, max);
+    for (let i = 0; i < slice.length; i += 10) {
+      const batch = slice.slice(i, i + 10);
+      const parsed = await Promise.all(batch.map(async (e) => {
+        const text = `${instructions}\n\nEmail:\nSubject: ${e.subject}\nFrom: ${e.from}\nSnippet: ${e.snippet || ""}\nBody:\n${(e.body || "").substring(0, 1500)}`;
+        return safeParseJsonText(await callClaude(text, 250).catch(() => null));
+      }));
+      results.push(...parsed);
+    }
+    return results;
+  }
+
+  // 1. Loyalty / frequent-flyer → inventory.loyalty (dedup by program name).
+  try {
+    const emails = await gather(
+      `subject:("frequent flyer" OR SkyMiles OR MileagePlus OR AAdvantage OR Bonvoy OR "Hilton Honors" OR "World of Hyatt" OR "loyalty" OR "member number" OR "rewards")`,
+      18,
+    );
+    const parsed = await extractEach(emails, `Extract a travel loyalty/rewards program membership from this email, or null. Return JSON or null:
+{ "program": "program name (e.g. Delta SkyMiles)", "type": "airline|hotel|car|other", "memberNumber": "the loyalty/member number if explicitly present, else null", "provider": "the airline/hotel brand" }
+Only return when there is a clear loyalty program. Never invent a number.`, 18);
+    const loyalty = [];
+    for (const p of parsed) if (p && p.program) loyalty.push({ program: p.program, type: p.type || "other", memberNumber: p.memberNumber || null, provider: p.provider || null, source: "gmail-extras", foundAt: Date.now() });
+    if (loyalty.length) {
+      const inv = safeJson(await redis.get(`household:${householdId}:inventory`)) || {};
+      const existing = Array.isArray(inv.loyalty) ? inv.loyalty : [];
+      const seen = new Set(existing.map((l) => (l.program || "").toLowerCase()));
+      for (const l of loyalty) { const k = (l.program || "").toLowerCase(); if (!seen.has(k)) { existing.push(l); seen.add(k); stats.loyalty++; } }
+      inv.loyalty = existing;
+      await redis.set(`household:${householdId}:inventory`, JSON.stringify(inv));
+    }
+  } catch (err) { console.warn("[extras] loyalty failed:", err?.message || err); }
+
+  // 2. Doctors / attorneys → :providers hash.
+  try {
+    const emails = await gather(
+      `subject:("appointment" OR "appointment confirmation" OR "law office" OR attorney OR "your visit" OR clinic OR "medical center" OR dental OR "legal")`,
+      22,
+    );
+    const parsed = await extractEach(emails, `Extract a doctor, medical practice, dentist, or attorney/law office from this email, or null. Return JSON or null:
+{ "name": "person or practice name", "role": "doctor|dentist|specialist|attorney|other", "specialty": "specialty/practice area or null", "phone": "phone or null", "email": "contact email or null" }
+Only return a real provider. Skip generic marketing/newsletters.`, 22);
+    for (const p of parsed) {
+      if (!p || !p.name) continue;
+      const key = normalizeExtraName(p.name);
+      if (!key) continue;
+      const hashKey = `household:${householdId}:providers`;
+      let ex = null;
+      try { const r = await redis.hget(hashKey, key); ex = r ? (typeof r === "string" ? JSON.parse(r) : r) : null; } catch { ex = null; }
+      const now = new Date().toISOString();
+      const merged = {
+        ...(ex || {}),
+        name: p.name,
+        serviceType: p.role === "attorney" ? "legal" : "medical",
+        role: p.role || ex?.role || null,
+        specialty: p.specialty || ex?.specialty || null,
+        phone: p.phone || ex?.phone || null,
+        email: p.email || ex?.email || null,
+        source: "gmail-extras",
+        firstSeen: ex?.firstSeen || now,
+        lastSeen: now,
+      };
+      await redis.hset(hashKey, { [key]: JSON.stringify(merged) });
+      stats.providers++;
+    }
+  } catch (err) { console.warn("[extras] providers failed:", err?.message || err); }
+
+  // 3. Bank / investment INSTITUTIONS → :vault (institution name only).
+  try {
+    const emails = await gather(
+      `subject:("statement" OR "your account" OR bank OR Chase OR "Bank of America" OR "Wells Fargo" OR Fidelity OR Vanguard OR Schwab OR investment OR brokerage OR "e-statement")`,
+      18,
+    );
+    const parsed = await extractEach(emails, `Identify the financial INSTITUTION this email is from (a bank or investment/brokerage), or null. Return JSON or null:
+{ "institution": "institution name ONLY (e.g. Chase, Fidelity)", "type": "bank|investment|other" }
+CRITICAL: return ONLY the institution name. NEVER include account numbers, balances, or any digits.`, 18);
+    const vaultRaw = await redis.lrange(`household:${householdId}:vault`, 0, -1);
+    const existingInst = new Set(vaultRaw.map(safeJson).filter(Boolean).filter((v) => v.category === "financial_account").map((v) => (v.provider || "").toLowerCase()));
+    const seenThis = new Set();
+    for (const p of parsed) {
+      if (!p || !p.institution) continue;
+      const inst = String(p.institution).replace(/\d/g, "").trim(); // defensively strip any stray digits
+      const lk = inst.toLowerCase();
+      if (!inst || existingInst.has(lk) || seenThis.has(lk)) continue;
+      seenThis.add(lk);
+      await redis.lpush(`household:${householdId}:vault`, JSON.stringify({
+        id: `vault_acct_${Date.now()}_${stats.financialAccounts}`,
+        category: "financial_account",
+        subtype: p.type || "bank",
+        description: `${inst} account`,
+        provider: inst,
+        renewalDate: null,
+        amount: null,
+        policyNumber: null,
+        consequence: null,
+        confidence: "low",
+        source: "gmail-extras",
+        foundAt: Date.now(),
+      }));
+      stats.financialAccounts++;
+    }
+  } catch (err) { console.warn("[extras] financial accounts failed:", err?.message || err); }
+
+  console.log(`[extras] ${householdId}: loyalty=${stats.loyalty} providers=${stats.providers} financialAccounts=${stats.financialAccounts}`);
+  return stats;
+}
+
 async function runVaultJob(userId, householdId) {
   // The exhaustive sweep is an initial-onboarding (isFirstRun) operation — it
   // runs ONCE per household, not on every import/sync. If it already ran, skip
@@ -1522,6 +1666,16 @@ async function runVaultJob(userId, householdId) {
   const processed = allItems.length;
   const dropped = processed - kept;
 
+  // Part 2 — non-renewal extras: loyalty → inventory, doctors/attorneys →
+  // providers, bank/investment institutions → vault. Best-effort; a failure
+  // here never blocks the renewal items already persisted above.
+  let extras = null;
+  try {
+    extras = await runExhaustiveExtras(accessToken, householdId);
+  } catch (err) {
+    console.warn("[vault] exhaustive extras failed:", err?.message || err);
+  }
+
   // Mark the exhaustive sweep done so it never re-runs for this household.
   try {
     await redis.set(`household:${householdId}:exhaustiveSweepDone`, new Date().toISOString());
@@ -1536,8 +1690,9 @@ async function runVaultJob(userId, householdId) {
     processed,
     kept,
     dropped,
+    extras,
   });
-  return { processed, kept, dropped };
+  return { processed, kept, dropped, extras };
 }
 
 // ---------- Job 4: Crew sweep ----------
