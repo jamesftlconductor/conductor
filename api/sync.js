@@ -155,23 +155,44 @@ async function generateAnticipatedSignals(redis, householdId) {
     const overdueBy = now - (lastMs + intervalMs);
     if (overdueBy < intervalMs * 0.2) continue;
 
-    // Skip if there's already an anticipated signal for this pattern,
-    // or a real signal arrived since the pattern was last updated.
+    // Build the description first so the dedup below can key off it.
+    const desc = pattern.description
+      ? `Expected: ${pattern.description} from ${pattern.sender}`
+      : `Expected: ${pattern.sender} (${pattern.type})`;
+
+    // Dedup: skip if a non-resolved anticipated signal with this exact
+    // description already exists in the pool.
+    //
+    // The previous guard compared `s.type === pattern.type`, but
+    // anticipated signals are stored with type:"anticipated" — never the
+    // pattern's real type — so the condition could NEVER be true. The
+    // generator therefore re-created the same item on every sync run,
+    // producing the 7+ "Expected: ... Bra from Amazon.com" duplicates.
+    //
+    // We match not-resolved (active/incoming/expired), not active-only,
+    // deliberately: anticipated signals are always created with a past
+    // ETA (expectedByDate = lastSignalAt + interval, emitted only once
+    // overdue) and fall under the 24h legacy expiry window, so they flip
+    // to "expired" within a day. An active-only check would miss the
+    // freshly-expired copy and let duplicates pile right back up. An
+    // expired copy still means "we already nudged this," so it blocks.
+    const descKey = desc.toLowerCase().trim();
     const alreadyAnticipated = existingSignals.some((s) =>
-      s.anticipated === true && s.type === pattern.type &&
-      typeof s.sender === "string" && s.sender.toLowerCase().trim() === pattern.senderKey
+      s.source === "anticipated" &&
+      s.state !== "resolved" &&
+      typeof s.description === "string" &&
+      s.description.toLowerCase().trim() === descKey
     );
     if (alreadyAnticipated) continue;
+
+    // Also skip if a real (non-anticipated) signal of this pattern's type
+    // arrived from the same sender since the pattern was last updated.
     const recentReal = existingSignals.some((s) =>
       !s.anticipated && s.type === pattern.type &&
       typeof s.sender === "string" && s.sender.toLowerCase().trim() === pattern.senderKey &&
       (s.id || 0) > lastMs
     );
     if (recentReal) continue;
-
-    const desc = pattern.description
-      ? `Expected: ${pattern.description} from ${pattern.sender}`
-      : `Expected: ${pattern.sender} (${pattern.type})`;
     const expectedByDate = new Date(lastMs + intervalMs).toISOString();
     const signal = {
       id: now + created,
