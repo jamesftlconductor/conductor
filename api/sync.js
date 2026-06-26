@@ -214,6 +214,93 @@ async function scanHouseholdKeys() {
   return keys;
 }
 
+// MM-DD anchor → days until its next occurrence (self-contained; tolerant of
+// MM-DD, MM-DD-YYYY, and YYYY-MM-DD). Returns { days, date, year } or null.
+function daysUntilAnchor(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  let mm, dd, m;
+  if ((m = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/))) { mm = +m[2]; dd = +m[3]; }
+  else if ((m = raw.match(/^(\d{1,2})-(\d{1,2})(?:-(\d{2,4}))?$/))) { mm = +m[1]; dd = +m[2]; }
+  else return null;
+  if (!(mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31)) return null;
+  // "Today" is computed in the household's local zone (ET), NOT the server's
+  // UTC — otherwise the exact 7/2-day milestone match drifts by a day near the
+  // ET-evening / UTC-next-day boundary. Diff via Date.UTC so the day-count is
+  // timezone-neutral once both anchors are ET calendar dates.
+  const [tm, td, ty] = new Date()
+    .toLocaleDateString("en-US", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" })
+    .split("/")
+    .map(Number);
+  const todayUTC = Date.UTC(ty, tm - 1, td);
+  let year = ty;
+  let candUTC = Date.UTC(ty, mm - 1, dd);
+  if (candUTC < todayUTC) { year = ty + 1; candUTC = Date.UTC(year, mm - 1, dd); }
+  return { days: Math.round((candUTC - todayUTC) / (24 * 60 * 60 * 1000)), date: new Date(candUTC), year };
+}
+
+// Birthday / anniversary signals at exactly 7 and 2 days out. Stable, per-
+// (person, occasion, year, milestone) id so the daily cron never duplicates.
+// Covers crew members and household-member profiles.
+async function createMilestoneSignals(redis, householdId) {
+  const MILESTONES = [7, 2];
+  const sigKey = `household:${householdId}:signals`;
+  const rawSignals = await redis.lrange(sigKey, 0, -1).catch(() => []);
+  const existingIds = new Set();
+  for (const r of rawSignals || []) {
+    try { const s = typeof r === "string" ? JSON.parse(r) : r; if (s?.id != null) existingIds.add(String(s.id)); } catch { /* skip */ }
+  }
+
+  const tuples = [];
+  try {
+    const rawCrew = await redis.get(`household:${householdId}:crew`);
+    const crew = Array.isArray(rawCrew) ? rawCrew : (rawCrew ? JSON.parse(rawCrew) : []);
+    for (const m of crew || []) {
+      if (m?.birthday) tuples.push({ name: m.name || "Someone", occasion: "birthday", anchor: m.birthday });
+      if (m?.anniversary) tuples.push({ name: m.name || "Someone", occasion: "anniversary", anchor: m.anniversary });
+    }
+  } catch { /* no crew */ }
+  try {
+    const members = await redis.smembers(`household:${householdId}:members`);
+    for (const uid of members || []) {
+      const raw = await redis.get(`user:${uid}:profile`);
+      const p = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
+      const first = (p?.name || "").split(/\s+/)[0] || null;
+      if (first && p?.birthday) tuples.push({ name: first, occasion: "birthday", anchor: p.birthday });
+      if (first && p?.anniversary) tuples.push({ name: first, occasion: "anniversary", anchor: p.anniversary });
+    }
+  } catch { /* no members */ }
+
+  let created = 0;
+  for (const t of tuples) {
+    const info = daysUntilAnchor(t.anchor);
+    if (!info || !MILESTONES.includes(info.days)) continue;
+    const nameKey = t.name.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const id = `milestone_${nameKey}_${t.occasion}_${info.year}_${info.days}d`;
+    if (existingIds.has(id)) continue; // already created — no duplicate
+    const possessive = /s$/i.test(t.name) ? `${t.name}'` : `${t.name}'s`;
+    const signal = {
+      id,
+      description: `${possessive} ${t.occasion} in ${info.days} days`,
+      type: "milestone",
+      eta: info.date.toISOString(),
+      sender: "Conductor",
+      status: null,
+      state: "incoming",
+      source: "milestone",
+      occasion: t.occasion,
+      emotionalValence: "joyful",
+      emotionalIntensity: "medium",
+      lastUpdate: new Date().toLocaleString(),
+      createdAt: Date.now(),
+    };
+    await redis.lpush(sigKey, JSON.stringify(signal));
+    existingIds.add(id);
+    created++;
+    console.log(`[milestone] ${householdId}: created "${signal.description}"`);
+  }
+  return created;
+}
+
 export default async function handler(req, res) {
   const errors = [];
   let signalsImported = 0;
@@ -246,6 +333,15 @@ export default async function handler(req, res) {
     const PER_HOUSEHOLD_TIMEOUT_MS = 45000;
 
     async function processHousehold(householdId, members) {
+      // Birthday/anniversary milestone signals first — it's fast and Redis-only,
+      // so it must run BEFORE the slower Google-dependent stages that can exhaust
+      // the per-household timeout (otherwise it never executes when a token is
+      // dead and import/calendar retries burn the clock).
+      try {
+        await createMilestoneSignals(redis, householdId);
+      } catch (err) {
+        errors.push({ stage: "milestone-signals", householdId, message: err.message });
+      }
       for (const userId of members) {
         try {
           const result = await runImport(userId);
