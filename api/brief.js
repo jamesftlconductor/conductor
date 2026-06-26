@@ -14,6 +14,58 @@ const redis = new Redis({
 const DAY_MS = 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 
+// Canonical category map for the per-user signalVisibility / signalPriority
+// preferences. The backend emits ~19 raw signal types (plus open-ended LLM
+// and POST-supplied strings); the mobile Customize UI exposes only these 8
+// buckets. normalizeType() collapses a raw type to its bucket so the prefs
+// lookups match the UI. We normalize ONLY for those two lookups — the raw
+// signal.type is left untouched because downstream brief logic (conflict
+// detection, trip threading, the segmenter's canonical-type coercion) keys
+// off it. Any unmapped/missing type falls through to "other".
+const TYPE_MAP = {
+  // Delivery/packages
+  package: "delivery",
+  delivery: "delivery",
+
+  // Food
+  food: "food",
+  grocery: "food",
+
+  // Service/home
+  service: "service",
+  appointment: "service",
+  reminder: "service",
+
+  // Financial
+  financial: "financial",
+
+  // Travel
+  travel: "travel",
+  reservation: "travel",
+
+  // Deadlines
+  deadline: "deadline",
+  anticipated: "deadline",
+
+  // Household/kids
+  supplies: "home",
+  junior: "home",
+  school: "home",
+  schedule: "home",
+
+  // Community
+  local_safety: "other",
+
+  // Special
+  milestone: "other",
+  unknown: "other",
+};
+
+function normalizeType(type) {
+  if (!type) return "other";
+  return TYPE_MAP[String(type).toLowerCase()] || "other";
+}
+
 // Household profile interview — when the household is quiet (fewer than 5
 // active signals), the brief surfaces ONE question at a time to build the
 // household picture. Asked questions are recorded in
@@ -3439,19 +3491,22 @@ export default async function handler(req, res) {
     if (!Array.isArray(preferences.flaggedCategories)) preferences.flaggedCategories = [];
 
     // User-tunable signal visibility and ordering, set via Settings.
-    // signalVisibility maps signal type -> boolean; any type explicitly
-    // set to false is dropped from the pool before Claude ever sees it.
-    // signalPriority is an ordered array of signal types; the pool is
-    // sorted to match that order, with unlisted types kept in their
-    // original relative order at the end (sort is index-stabilized so
-    // signals of equal rank never reshuffle).
+    // Both prefs are keyed by the 8 canonical categories from the mobile
+    // Customize UI (delivery, food, service, financial, travel, deadline,
+    // home, other), so we collapse each signal's raw type with
+    // normalizeType() before matching. signalVisibility maps category ->
+    // boolean; any category explicitly set to false is dropped from the
+    // pool before Claude ever sees it. signalPriority is an ordered array
+    // of categories; the pool is sorted to match that order, with unlisted
+    // categories kept in their original relative order at the end (sort is
+    // index-stabilized so signals of equal rank never reshuffle).
     if (
       preferences.signalVisibility &&
       typeof preferences.signalVisibility === "object"
     ) {
       const visibility = preferences.signalVisibility;
       activeSignals = activeSignals.filter(
-        (s) => visibility[s.type || "unknown"] !== false
+        (s) => visibility[normalizeType(s.type)] !== false
       );
     }
     if (
@@ -3461,8 +3516,10 @@ export default async function handler(req, res) {
       const rank = new Map(
         preferences.signalPriority.map((t, i) => [t, i])
       );
-      const rankOf = (s) =>
-        rank.has(s.type) ? rank.get(s.type) : Number.MAX_SAFE_INTEGER;
+      const rankOf = (s) => {
+        const cat = normalizeType(s.type);
+        return rank.has(cat) ? rank.get(cat) : Number.MAX_SAFE_INTEGER;
+      };
       activeSignals = activeSignals
         .map((s, i) => ({ s, i }))
         .sort((a, b) => rankOf(a.s) - rankOf(b.s) || a.i - b.i)
