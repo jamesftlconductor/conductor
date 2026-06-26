@@ -25,6 +25,10 @@
       "schedule": "0 2 * * *"
     },
     {
+      "path": "/api/journal?action=generate",
+      "schedule": "0 2 * * 1"
+    },
+    {
       "path": "/api/followup",
       "schedule": "0 * * * *"
     },

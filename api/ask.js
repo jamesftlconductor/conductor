@@ -1182,7 +1182,91 @@ async function handleEasterEgg(type, userId) {
   }
 }
 
+// Contextual opening sentence for the minimap expansion. Computes the
+// household state, derives an urgency level (which drives the mobile vapor
+// intensity), and writes one short, time-aware opening line. Urgency is
+// deterministic; the sentence is Haiku-generated with a templated fallback.
+async function handleContextGreeting(userId, res) {
+  const parse = (v) => { try { return typeof v === "string" ? JSON.parse(v) : v; } catch { return null; } };
+  const householdId = await resolveHouseholdId(userId);
+  const now = Date.now();
+  const DAY = 86400000;
+  const [rawSignals, rawMemory] = await Promise.all([
+    redis.lrange(`household:${householdId}:signals`, 0, 199).catch(() => []),
+    redis.lrange(`household:${householdId}:memory`, 0, 19).catch(() => []),
+  ]);
+  const active = (rawSignals || []).map(parse).filter(Boolean)
+    .filter((s) => !s.state || s.state === "incoming" || s.state === "active");
+  const urgent = active.filter((s) => {
+    if (s.priority === "urgent") return true;
+    if (s.emotionalIntensity === "high" && s.emotionalValence === "grief") return true;
+    const ms = s.eta ? Date.parse(s.eta) : NaN;
+    return !isNaN(ms) && ms - now < 2 * DAY && ms - now > -DAY;
+  });
+  const grief = active.some((s) => s.emotionalValence === "grief" && s.emotionalIntensity === "high");
+  const recentResolved = (rawMemory || []).map(parse).filter(Boolean)
+    .filter((e) => e.action === "resolved" && (now - (Date.parse(e.actionAt || "") || 0)) < 6 * 3600 * 1000);
+
+  const hour = parseInt(new Date().toLocaleString("en-US", { timeZone: "America/New_York", hour: "2-digit", hour12: false }), 10);
+  const partOfDay = hour < 12 ? "morning" : hour < 17 ? "afternoon" : "evening";
+
+  let urgency;
+  if (urgent.length >= 1) urgency = "high";
+  else if (active.length >= 6 || grief) urgency = "medium";
+  else if (active.length >= 1) urgency = "low";
+  else urgency = "clear";
+
+  let greeting = null;
+  try {
+    const prompt = `Write ONE short opening sentence for "The Conductor" greeting a household member, based on the state below. No preamble, no quotes — just the sentence.
+
+State:
+- Time of day: ${partOfDay}
+- Open signals: ${active.length}
+- Need attention today (urgent): ${urgent.length}
+- Just resolved (last few hours): ${recentResolved.length}
+- Emotional undercurrent: ${grief ? "grief" : "ordinary"}
+
+Style examples (match the register that fits the state):
+- Morning with signals: "Seven things on the radar — three need your attention today."
+- Quiet morning: "The house is clear. What would you like to know?"
+- Evening: "Long day. Here's where things stand."
+- After a recent resolution: "That's handled. What else?"
+- Urgent active: "Something needs your attention. I'll show you."
+
+Use real counts when they help. Warm, brief, never assistant-like. Return only the sentence.`;
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-api-key": process.env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+      body: JSON.stringify({ model: "claude-haiku-4-5-20251001", max_tokens: 80, messages: [{ role: "user", content: prompt }] }),
+    });
+    if (r.ok) {
+      const data = await r.json();
+      const text = data?.content?.[0]?.text?.trim();
+      if (text) greeting = text.replace(/^["'“”]+|["'“”]+$/g, "").trim();
+    }
+  } catch { /* fall through to template */ }
+
+  if (!greeting) {
+    if (urgency === "clear") greeting = partOfDay === "morning" ? "The house is clear. What would you like to know?" : "All quiet. What would you like to know?";
+    else if (urgency === "high") greeting = "Something needs your attention. I'll show you.";
+    else if (recentResolved.length > 0) greeting = "That's handled. What else?";
+    else if (partOfDay === "evening") greeting = "Here's where things stand.";
+    else greeting = `${active.length} on the radar${urgent.length ? ` — ${urgent.length} need${urgent.length === 1 ? "s" : ""} you today` : ""}.`;
+  }
+
+  return res.status(200).json({ greeting, urgency });
+}
+
 export default async function handler(req, res) {
+  // Contextual opening sentence (minimap expansion) — GET or POST, action-gated.
+  const action = req.query?.action || req.body?.action;
+  if (action === "context_greeting") {
+    const uid = req.query?.userId || req.body?.userId;
+    if (!uid || typeof uid !== "string") return res.status(400).json({ error: "userId required" });
+    return handleContextGreeting(uid, res);
+  }
+
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
     return res.status(405).json({ error: "Method not allowed" });
