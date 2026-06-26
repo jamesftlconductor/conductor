@@ -613,21 +613,16 @@ function pickOvernightObservation({ healthContext, weather, activeSignals }) {
     return `${what} — that window closes in ${days === 1 ? "a day" : `${days} days`}.`;
   }
 
-  // 3. Weather as it stands this morning — respect the code so we never claim
-  // "clear" over a storm summary.
-  if (weather) {
-    if (weather.isRaining) {
-      return `Rain moved in overnight${weather.tempF != null ? ` — ${weather.tempF}°F right now` : ""}.`;
+  // 3. Weather — ONLY when genuinely notable and actionable. An active storm or
+  // rain is worth knowing before heading out; generic "sunny / warm / clear /
+  // partly cloudy" is NEVER mentioned. (Severe NWS alerts — hurricane watches
+  // etc. — are surfaced upstream by the RED ALERT brief path, not here.)
+  if (weather?.isRaining && typeof weather.weatherCode === "number") {
+    if (weather.weatherCode >= 95) {
+      return `A storm system is moving through this morning — worth knowing before you head out.`;
     }
-    const code = typeof weather.weatherCode === "number" ? weather.weatherCode : null;
-    if (code != null && code <= 3) {
-      // Open-Meteo: 0 clear, 1 mainly clear, 2 partly cloudy, 3 overcast.
-      const word = code <= 1 ? "Clear and settled" : code === 2 ? "Soft and partly cloudy" : "Grey but calm";
-      return `${word} this morning${weather.tempF != null ? `, ${weather.tempF}°F` : ""}.`;
-    }
-    if (weather.summary) {
-      // An unsettled code with no active precip — name it without claiming clear.
-      return `${weather.summary} in the forecast — dry for the moment.`;
+    if (weather.weatherCode >= 61) {
+      return `Steady rain this morning — worth a glance before you head out.`;
     }
   }
 
@@ -2632,7 +2627,7 @@ The signal count IS allowed as a numeral (it's a tally of what got done). For WE
   const emoSignal = emo.activeGrief || emo.activeStress || emo.activeMilestone || null;
   const emoLine = `EMOTIONAL STATE: ${emo.dominantValence || "neutral"}\nActive high-intensity signal: ${emoSignal ? (emoSignal.description || "(unspecified)") : "none"}\n\nEmotional calibration for The Pulse:\n- Grief: quiet, present, minimal. Don't comment on productivity.\n- High stress: practical and grounding. Acknowledge the weight without adding to it.\n- Milestone joy: warm and permission-giving. Today deserves presence.\n- Neutral: normal synthesis rules apply.`;
 
-  const prompt = `Given this household state, write one sentence that synthesizes what it means for today. Be specific, warm, and honest. Use the approved list of location-aware weather observations for ${locationLabel}. If a synthesis flag is active, lead with its implication — not the data behind it.
+  const prompt = `Given this household state, write one sentence that synthesizes what it means for today. Be specific, warm, and honest. If a synthesis flag is active, lead with its implication — not the data behind it.
 
 ${emoLine}
 
@@ -2644,7 +2639,11 @@ Signal load: ${state.signalLoad}, ${state.urgentCount} urgent
 Location: ${locationLabel}
 ${ouraLine ? `\n${ouraLine}\n\nOura observations (use when readiness is notable, but follow the numeral-ban rule below — translate the tier, never echo the score):\n- Readiness low (under 50): 'Oura says recovery is low today', 'the ring says rest if you can'\n- Readiness moderate (50-69): 'recovery is moderate', 'solid but not peak'\n- Readiness high (85+): 'Oura says you're well recovered', 'the ring likes today'\n- Temperature elevated: 'body temperature is slightly up — worth watching'` : ""}
 
-${weatherVocab}
+WEATHER IS TONE, NOT TEXT. Never state the weather. Do not name conditions (humidity, heat, rain, storms, sun, cold, wind) and never quote a temperature. Instead let the day's conditions shape the MOOD and rhythm of the sentence — the Pulse is a feeling, not a forecast:
+- A heavy, humid morning → a heavier-tempo line: "Heavy morning. Things should lighten by afternoon."
+- An ordinary, mild day → something easy: "The kind of Thursday that moves at its own pace."
+- A stormy afternoon ahead → a quiet sense of something building, never named.
+The reader should FEEL the day, not be told the weather.
 
 If no synthesis flags are active and conditions are normal: write one quiet observation about the day ahead.
 If green_light: acknowledge it warmly — this is a good day.
@@ -2653,17 +2652,15 @@ If high_stress_load: acknowledge the weight without adding to it.
 If UV index peak today is above 10 (extreme): mention it briefly as "extreme UV today" or "midday sun is genuinely not worth it" — specific to the household's location context. Otherwise omit UV entirely.
 
 NEVER quote specific numbers, percentages, or units directly. The structured values above (humidity %, temperature °F, HRV, steps, sleep hours, calories) are inputs for YOUR observation — translate them into human language, never echo them back:
-- "77% humidity" → "heavy humidity" or "the air is thick today" or "the humidity has opinions"
-- "94°F" → "proper South Florida heat" or "the heat is real today"
+- humidity / temperature → do NOT translate into a weather phrase at all. Let the conditions set the sentence's TEMPO and weight instead (a heavy humid day → a slower, heavier line; a crisp clear day → a lighter, easier one). Never name the weather.
 - "HRV 42" → "recovery looks low" or "your body is asking for a lighter day"
 - "145 steps" → "you're just getting started" or "the day is early"
 - "5.2 hours of sleep" → "a short night" or "running on less than you'd want"
 The Pulse should feel like something a trusted friend observed — not a weather station readout. If you find yourself reaching for a numeral or a unit (%, °F, °C, bpm, ms, kcal, steps, hrs, hours), STOP and translate to a qualitative observation instead.
 
 PHRASE VARIETY (this matters — the Pulse has been reading as repetitive and trite):
-- Never use the same weather phrase twice in the same week. Vary the language significantly — not just synonyms, but a genuinely different angle on the same conditions (what it does to the day, how it feels on the skin, what it asks of you — not just "it's humid" restated).
-- Reach for specific local texture for ${locationLabel} rather than generic weather words. For South Florida that means things like the particular weight of the humidity, the afternoon sea breeze, storms stacking up by mid-afternoon, the heat index that makes midday its own decision. Pull the detail that fits today, not a stock phrase.
-- The phrase should feel freshly observed and specific every single day, as if noticed this morning for the first time.
+- Never reuse a mood or opening from the same week. Vary the rhythm and entry point significantly — a genuinely different angle on how the day feels, not a reworded version of the same line.
+- The sentence should feel freshly observed and specific every single day, as if noticed this morning for the first time — a mood, never a forecast.
 ${recentPulsesBlock ? "\n" + recentPulsesBlock + "\nDo not use similar phrasing to the recent pulses above — pick a different image, a different rhythm, a different entry point.\n" : ""}
 Maximum one sentence. No preamble. This is The Pulse.`;
 
@@ -3440,6 +3437,38 @@ export default async function handler(req, res) {
     const healthContext = safeJson(rawHealth);
     const preferences = safeJson(rawPreferences) || { flaggedCategories: [] };
     if (!Array.isArray(preferences.flaggedCategories)) preferences.flaggedCategories = [];
+
+    // User-tunable signal visibility and ordering, set via Settings.
+    // signalVisibility maps signal type -> boolean; any type explicitly
+    // set to false is dropped from the pool before Claude ever sees it.
+    // signalPriority is an ordered array of signal types; the pool is
+    // sorted to match that order, with unlisted types kept in their
+    // original relative order at the end (sort is index-stabilized so
+    // signals of equal rank never reshuffle).
+    if (
+      preferences.signalVisibility &&
+      typeof preferences.signalVisibility === "object"
+    ) {
+      const visibility = preferences.signalVisibility;
+      activeSignals = activeSignals.filter(
+        (s) => visibility[s.type || "unknown"] !== false
+      );
+    }
+    if (
+      Array.isArray(preferences.signalPriority) &&
+      preferences.signalPriority.length
+    ) {
+      const rank = new Map(
+        preferences.signalPriority.map((t, i) => [t, i])
+      );
+      const rankOf = (s) =>
+        rank.has(s.type) ? rank.get(s.type) : Number.MAX_SAFE_INTEGER;
+      activeSignals = activeSignals
+        .map((s, i) => ({ s, i }))
+        .sort((a, b) => rankOf(a.s) - rankOf(b.s) || a.i - b.i)
+        .map((x) => x.s);
+    }
+
     const briefedIds = new Set((rawBriefed || []).map((s) => String(s)));
 
     // Carry-forward pool — signals flagged on this run plus pre-existing ones
@@ -5023,10 +5052,11 @@ This household has a genuinely quiet day — nothing urgent, nothing approaching
 Write a brief that acknowledges this warmly. 2-3 sentences maximum.
 Options:
 - Acknowledge the quiet as a gift: "Nothing pressing today. The household is clear."
-- Use it as an opportunity: "Clear day ahead — good morning to handle something you've been putting off, or simply enjoy the space."
-- Reference the weather or season naturally: "Clear day in ${householdLocation?.city || "your city"}. Nothing in motion. Take it."
+- Use it as an opportunity: "An open morning — good time to handle something you've been putting off, or simply enjoy the space."
+- Reference the season or the rhythm of the week naturally — but NOT the weather: "A quiet one in ${householdLocation?.city || "your city"}. Nothing in motion. Take it."
 - Occasional wit: "Conductor has been watching. Nothing to report. Enjoy it — this is rare."
 
+Do not mention the weather (no "clear day", no temperatures, no humidity, no sun/rain) — the weather rule applies even on quiet days; weather belongs to The Pulse, not the brief.
 Never manufacture urgency. Never apologize for having nothing to say. The quiet brief is one of Conductor's best moments — use it well.`
       : `${layeredContext}\n\n${composedRules}`;
 
