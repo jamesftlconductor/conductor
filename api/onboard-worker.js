@@ -47,7 +47,10 @@ const receiver =
 // Disable Vercel's body parser so we can verify the signature against raw bytes.
 export const config = {
   api: { bodyParser: false },
-  maxDuration: 60,
+  // Raised from 60s: the exhaustive vault sweep (13 passes + 3 extras) on a
+  // rich mailbox can exceed 60s and get killed mid-run, persisting nothing.
+  // 300s (Pro max) gives ample headroom; lighter jobs finish far sooner.
+  maxDuration: 300,
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
