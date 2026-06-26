@@ -5739,6 +5739,18 @@ Return only the offer line.`;
     // question pool is exhausted.
     const householdInterview = await pickHouseholdInterview(householdId, activeSignals.length);
 
+    // One-time exhaustive-sweep reveal: surface the onboarding finds as a
+    // moment ("The Conductor found: …"), then mark shown so it appears once.
+    let sweepReveal = null;
+    try {
+      const raw = await redis.get(`household:${householdId}:sweepReveal`);
+      const sr = raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
+      if (sr && sr.text && !sr.shown) {
+        sweepReveal = { text: sr.text, accounts: sr.accounts || [], loyalty: sr.loyalty || [], providers: sr.providers || [] };
+        await redis.set(`household:${householdId}:sweepReveal`, JSON.stringify({ ...sr, shown: true, shownAt: new Date().toISOString() }));
+      }
+    } catch { /* best-effort — reveal never blocks the brief */ }
+
     const briefResponse = {
       brief: finalBrief,
       spokenSummary,
@@ -5770,6 +5782,7 @@ Return only the offer line.`;
       jokeOffered,
       streakObservation,
       iconNote,
+      sweepReveal,
     };
 
     // Cache the per-user response so a subsequent /api/brief call for

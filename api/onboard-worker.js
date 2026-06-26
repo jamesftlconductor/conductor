@@ -1159,23 +1159,25 @@ Return whenever you can identify a provider AND a due/renewal date.`,
   {
     key: "utilities",
     maxResults: 30,
+    estimateRenewal: true,
     query:
       `subject:(electric OR utility OR water OR "gas bill" OR internet OR comcast OR xfinity OR ` +
       `"at&t" OR verizon OR "t-mobile" OR spectrum OR "your bill" OR "payment due" OR "auto-pay")`,
     instructions: `Extract a recurring utility or telecom account with a due date. Return JSON or null:
 { "category": "utility", "subtype": "electric|water|gas|internet|phone|trash|other", "description": "service description", "provider": "utility/telecom company", "renewalDate": "YYYY-MM-DD — next due date or null", "amount": "bill amount if known or null", "frequency": "monthly|other", "consequence": "service interruption", "confidence": "high|medium|low" }
-Return whenever you can identify a provider AND a due date. NEVER capture account numbers.`,
+Return whenever you can identify a recurring utility/telecom provider — EVEN IF no due date is stated (set renewalDate to null in that case; it will be estimated). Skip pure marketing. NEVER capture account numbers.`,
   },
   {
     key: "financial",
     maxResults: 30,
+    estimateRenewal: true,
     query:
       `subject:("statement" OR "payment due" OR "minimum payment" OR "credit card" OR "your card" OR ` +
       `"loan payment" OR "student loan" OR "personal loan" OR amex OR chase OR "capital one" OR ` +
       `discover OR "due date")`,
     instructions: `Extract a credit card or loan with a payment due date. Return JSON or null:
 { "category": "financial", "subtype": "credit_card|student_loan|personal_loan|auto_loan|other", "description": "what this is (e.g. 'Chase credit card payment')", "provider": "INSTITUTION NAME ONLY", "renewalDate": "YYYY-MM-DD — payment due date or null", "amount": "payment/minimum if known or null", "frequency": "monthly|other", "consequence": "late fee / interest / credit impact", "confidence": "high|medium|low" }
-Return whenever you can identify an institution AND a due date. CRITICAL: never include account numbers, card numbers, or balances — institution name only.`,
+Return whenever you can identify a recurring institution/account — EVEN IF no due date is stated (set renewalDate to null in that case; it will be estimated). Skip pure marketing. CRITICAL: never include account numbers, card numbers, or balances — institution name only.`,
   },
   {
     key: "memberships",
@@ -1324,6 +1326,20 @@ function dedupVaultItemsAcrossPasses(items) {
         dupRule = "B";
         break;
       }
+
+      // Rule R — recurring estimated items (utilities/financial). Many monthly
+      // statement emails from the SAME provider each estimate a renewal at a
+      // different +1y date, so the 30/7-day windows above never collapse them.
+      // Date-agnostic: one entry per provider+category is enough.
+      if (
+        item.renewalEstimated && ex.renewalEstimated &&
+        newProvider && exProvider && newProvider === exProvider &&
+        (item.category || "") === (ex.category || "")
+      ) {
+        dupIndex = i;
+        dupRule = "R";
+        break;
+      }
     }
 
     if (dupIndex === -1) {
@@ -1393,9 +1409,22 @@ ${bodyExcerpt}`;
         continue;
       }
       if (!item.renewalDate) {
-        tally.noRenewalDate++;
-        console.log(`[vault:${pass.key}] drop noRenewalDate: "${subj}"`);
-        continue;
+        // Utilities + financial recur but rarely state an explicit renewal
+        // date. Rather than lose a legitimate recurring item, estimate the
+        // renewal at +1 year from the email date and flag it as estimated so
+        // the user knows it's approximate.
+        if (pass.estimateRenewal) {
+          const emailMs = Date.parse(batch[j].date || "");
+          const est = new Date(isNaN(emailMs) ? Date.now() : emailMs);
+          est.setFullYear(est.getFullYear() + 1);
+          item.renewalDate = est.toISOString().slice(0, 10);
+          item.renewalEstimated = true;
+          console.log(`[vault:${pass.key}] estimated renewalDate ${item.renewalDate} for "${subj}"`);
+        } else {
+          tally.noRenewalDate++;
+          console.log(`[vault:${pass.key}] drop noRenewalDate: "${subj}"`);
+          continue;
+        }
       }
       const ms = Date.parse(item.renewalDate);
       // Match the most permissive prompt's window (insurance: 60 days
@@ -1431,6 +1460,26 @@ function normalizeExtraName(name) {
     .trim();
 }
 
+// Normalized dedup key for a loyalty program. Prefers the member number
+// (same number ⇒ same program regardless of how the program was named);
+// otherwise the provider's first word plus the program with the brand and
+// generic loyalty terms stripped, so "Southwest Rapid Rewards" and "Rapid
+// Rewards" (provider Southwest) collapse to the same key.
+function loyaltyKey(l) {
+  if (l && l.memberNumber) {
+    const digits = String(l.memberNumber).replace(/\D/g, "");
+    if (digits.length >= 5) return "num:" + digits;
+  }
+  const prov = (l?.provider || "").toLowerCase().split(/\s+/)[0] || "";
+  let p = (l?.program || "").toLowerCase();
+  if (prov) p = p.replace(new RegExp("\\b" + prov + "\\b", "g"), " ");
+  p = p
+    .replace(/\b(rapid|reward|rewards|miles?|program|club|loyalty|member|membership|points?|plus|advantage|honors|bonvoy|skymiles|aadvantage|account|number)\b/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+  return "prog:" + (prov + "|" + p).trim();
+}
+
 // ---------- Exhaustive extras (non-renewal data) ----------
 //
 // The vault passes above require a renewalDate. These three extractors capture
@@ -1443,7 +1492,7 @@ function normalizeExtraName(name) {
 // per-category email volume is low.
 async function runExhaustiveExtras(accessToken, householdId) {
   const afterEpoch = Math.floor((Date.now() - 365 * DAY_MS) / 1000);
-  const stats = { loyalty: 0, providers: 0, financialAccounts: 0 };
+  const stats = { loyalty: 0, providers: 0, financialAccounts: 0, loyaltyNames: [], providerNames: [], accountNames: [] };
 
   async function gather(query, cap) {
     const ids = await gmailSearch(accessToken, `after:${afterEpoch} ${query}`, cap).catch(() => []);
@@ -1482,9 +1531,18 @@ Only return when there is a clear loyalty program. Never invent a number.`, 18);
     if (loyalty.length) {
       const inv = safeJson(await redis.get(`household:${householdId}:inventory`)) || {};
       const existing = Array.isArray(inv.loyalty) ? inv.loyalty : [];
-      const seen = new Set(existing.map((l) => (l.program || "").toLowerCase()));
-      for (const l of loyalty) { const k = (l.program || "").toLowerCase(); if (!seen.has(k)) { existing.push(l); seen.add(k); stats.loyalty++; } }
-      inv.loyalty = existing;
+      // Dedup by a normalized key: the member number when present (the
+      // strongest signal — "Southwest Rapid Rewards" and "Rapid Rewards"
+      // carry the SAME number), else the provider + program with brand and
+      // generic loyalty words stripped. Re-dedups the existing list too so a
+      // prior near-duplicate is collapsed on this pass.
+      const seen = new Set();
+      const merged = [];
+      for (const l of existing) { const k = loyaltyKey(l); if (!seen.has(k)) { seen.add(k); merged.push(l); } }
+      const beforeNew = merged.length;
+      for (const l of loyalty) { const k = loyaltyKey(l); if (!seen.has(k)) { seen.add(k); merged.push(l); if (l.program) stats.loyaltyNames.push(l.program); } }
+      stats.loyalty = merged.length - beforeNew;
+      inv.loyalty = merged;
       await redis.set(`household:${householdId}:inventory`, JSON.stringify(inv));
     }
   } catch (err) { console.warn("[extras] loyalty failed:", err?.message || err); }
@@ -1520,6 +1578,7 @@ Only return a real provider. Skip generic marketing/newsletters.`, 22);
       };
       await redis.hset(hashKey, { [key]: JSON.stringify(merged) });
       stats.providers++;
+      stats.providerNames.push({ name: p.name, role: p.role || null });
     }
   } catch (err) { console.warn("[extras] providers failed:", err?.message || err); }
 
@@ -1556,11 +1615,46 @@ CRITICAL: return ONLY the institution name. NEVER include account numbers, balan
         foundAt: Date.now(),
       }));
       stats.financialAccounts++;
+      stats.accountNames.push({ name: inst, type: p.type || "bank" });
     }
   } catch (err) { console.warn("[extras] financial accounts failed:", err?.message || err); }
 
   console.log(`[extras] ${householdId}: loyalty=${stats.loyalty} providers=${stats.providers} financialAccounts=${stats.financialAccounts}`);
   return stats;
+}
+
+// Compose the first-brief reveal sentence from the extras' found names.
+// e.g. "The Conductor found: Apple Cash, Chime, Robinhood (investment),
+// Southwest Rapid Rewards, Cleveland Clinic Florida as your specialist."
+function buildSweepReveal(extras) {
+  if (!extras) return null;
+  const parts = [];
+  const accts = extras.accountNames || [];
+  if (accts.length) {
+    const inv = accts.filter((a) => a.type === "investment").map((a) => a.name);
+    const other = accts.filter((a) => a.type !== "investment").map((a) => a.name);
+    const segs = [];
+    if (other.length) segs.push(other.join(", "));
+    if (inv.length) segs.push(`${inv.join(", ")} (investment)`);
+    parts.push(`${segs.join(", ")} ${accts.length === 1 ? "account" : "accounts"}`);
+  }
+  const loy = extras.loyaltyNames || [];
+  if (loy.length) parts.push(loy.join(", "));
+  const provs = extras.providerNames || [];
+  if (provs.length) {
+    const names = provs.map((p) => p.name).join(", ");
+    const role = provs[0]?.role;
+    parts.push(role && /doctor|dentist|specialist/i.test(role) ? `${names} as your ${role}` : names);
+  }
+  if (!parts.length) return null;
+  return {
+    text: `The Conductor found: ${parts.join(", ")}.`,
+    accounts: accts,
+    loyalty: loy,
+    providers: provs,
+    shown: false,
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 async function runVaultJob(userId, householdId) {
@@ -1659,7 +1753,11 @@ async function runVaultJob(userId, householdId) {
         frequency: item.frequency || null,
         consequence: item.consequence || null,
         confidence: item.confidence || "low",
-        source: "gmail",
+        // Estimated-renewal items (utilities/financial with no stated date)
+        // are tagged so the UI can show "~" / "estimated" and the user knows
+        // the date is approximate rather than lifted from the email.
+        source: item.renewalEstimated ? "gmail-estimated" : "gmail",
+        renewalEstimated: !!item.renewalEstimated,
         foundAt: Date.now(),
       })
     );
@@ -1677,6 +1775,19 @@ async function runVaultJob(userId, householdId) {
     extras = await runExhaustiveExtras(accessToken, householdId);
   } catch (err) {
     console.warn("[vault] exhaustive extras failed:", err?.message || err);
+  }
+
+  // Compose a one-time "reveal" of the notable finds so the first brief can
+  // surface them as a moment ("The Conductor found: …") rather than burying
+  // them as a silent background process.
+  try {
+    const reveal = buildSweepReveal(extras);
+    if (reveal) {
+      await redis.set(`household:${householdId}:sweepReveal`, JSON.stringify(reveal));
+      console.log(`[vault] sweepReveal stored: ${reveal.text}`);
+    }
+  } catch (err) {
+    console.warn("[vault] sweepReveal compose failed:", err?.message || err);
   }
 
   // Mark the exhaustive sweep done so it never re-runs for this household.
