@@ -1123,6 +1123,98 @@ Return the item whenever you can identify BOTH a provider AND an expiry date, ev
 { "category": "registration", "subtype": "vehicle|drivers_license|passport|lease|domain|business|other", "description": "what needs renewing", "provider": "issuing authority or company", "renewalDate": "YYYY-MM-DD or null", "amount": "fee if known or null", "consequence": "lapses or illegal or service stops", "confidence": "high|medium|low" }
 Return the item whenever you can identify BOTH an issuing authority/provider AND a renewal date, even at low confidence. Drop only if either is missing or the email is purely informational with no actionable expiry.`,
   },
+
+  // ---- Exhaustive onboarding breadth passes ----
+  // These widen the initial sweep across the rest of a household's recurring
+  // obligations. They use a lower per-pass cap (maxResults) than the core
+  // five so the parallel vault job still fits the 60s budget; most households
+  // have only a handful of emails per category, so the realistic cost is low.
+  // Every pass returns the same vault schema (renewalDate is required — the
+  // runner drops anything without one) so they flow through the same dedup +
+  // estate-noise gate + storage path.
+  {
+    key: "vehicles",
+    maxResults: 30,
+    query:
+      `subject:("auto loan" OR "car payment" OR "vehicle payment" OR "lease payment" OR ` +
+      `"payment is due" OR "parking permit" OR "toll" OR "auto-pay" OR "your vehicle" OR ` +
+      `"monthly statement" OR "amount due")`,
+    instructions: `Extract a vehicle-related recurring payment or permit (auto loan, lease, parking permit, tolls). Return JSON or null:
+{ "category": "vehicle", "subtype": "auto_loan|lease|parking_permit|toll|other", "description": "what this is (e.g. 'Honda auto loan payment')", "provider": "lender or issuing authority", "renewalDate": "YYYY-MM-DD — next due/expiry date or null", "amount": "payment if known or null", "frequency": "monthly|annual|other", "consequence": "late fee or lapse", "confidence": "high|medium|low" }
+Return whenever you can identify a provider AND a due/expiry date. Drop purely promotional mail. Never include full account numbers.`,
+  },
+  {
+    key: "housing",
+    maxResults: 30,
+    query:
+      `subject:(mortgage OR "mortgage statement" OR escrow OR HOA OR "homeowners association" OR ` +
+      `"property tax" OR "rent due" OR "rent payment" OR landlord OR "lease renewal" OR "amount due")`,
+    instructions: `Extract a housing payment or renewal (mortgage, HOA dues, property tax, rent/lease). Return JSON or null:
+{ "category": "housing", "subtype": "mortgage|hoa|property_tax|rent|lease|other", "description": "what this is", "provider": "lender / HOA / landlord / tax authority", "renewalDate": "YYYY-MM-DD — next due/renewal date or null", "amount": "payment if known or null", "frequency": "monthly|quarterly|annual|other", "consequence": "late fee / lien / eviction", "confidence": "high|medium|low" }
+Return whenever you can identify a provider AND a due/renewal date.`,
+  },
+  {
+    key: "utilities",
+    maxResults: 30,
+    query:
+      `subject:(electric OR utility OR water OR "gas bill" OR internet OR comcast OR xfinity OR ` +
+      `"at&t" OR verizon OR "t-mobile" OR spectrum OR "your bill" OR "payment due" OR "auto-pay")`,
+    instructions: `Extract a recurring utility or telecom account with a due date. Return JSON or null:
+{ "category": "utility", "subtype": "electric|water|gas|internet|phone|trash|other", "description": "service description", "provider": "utility/telecom company", "renewalDate": "YYYY-MM-DD — next due date or null", "amount": "bill amount if known or null", "frequency": "monthly|other", "consequence": "service interruption", "confidence": "high|medium|low" }
+Return whenever you can identify a provider AND a due date. NEVER capture account numbers.`,
+  },
+  {
+    key: "financial",
+    maxResults: 30,
+    query:
+      `subject:("statement" OR "payment due" OR "minimum payment" OR "credit card" OR "your card" OR ` +
+      `"loan payment" OR "student loan" OR "personal loan" OR amex OR chase OR "capital one" OR ` +
+      `discover OR "due date")`,
+    instructions: `Extract a credit card or loan with a payment due date. Return JSON or null:
+{ "category": "financial", "subtype": "credit_card|student_loan|personal_loan|auto_loan|other", "description": "what this is (e.g. 'Chase credit card payment')", "provider": "INSTITUTION NAME ONLY", "renewalDate": "YYYY-MM-DD — payment due date or null", "amount": "payment/minimum if known or null", "frequency": "monthly|other", "consequence": "late fee / interest / credit impact", "confidence": "high|medium|low" }
+Return whenever you can identify an institution AND a due date. CRITICAL: never include account numbers, card numbers, or balances — institution name only.`,
+  },
+  {
+    key: "memberships",
+    maxResults: 30,
+    query:
+      `subject:(membership OR gym OR "fitness" OR planet OR equinox OR peloton OR "hello fresh" OR ` +
+      `hellofresh OR "blue apron" OR netflix OR hulu OR disney OR spotify OR "apple music" OR adobe OR ` +
+      `"microsoft 365" OR "your subscription" OR "your plan renews" OR "next charge")`,
+    instructions: `Extract a recurring membership or subscription (gym, meal-kit/box, streaming, software). Return JSON or null:
+{ "category": "subscription", "subtype": "gym|box|streaming|software|membership|other", "description": "what this is (e.g. 'Planet Fitness membership')", "provider": "company name", "renewalDate": "YYYY-MM-DD — next renewal/charge date or null", "amount": "cost if known or null", "frequency": "monthly|annual|other", "consequence": "auto-charge / service stops", "confidence": "high|medium|low" }
+Return whenever you can identify a provider AND a renewal/charge date.`,
+  },
+  {
+    key: "education",
+    maxResults: 25,
+    query:
+      `subject:(tuition OR "tuition payment" OR "student loan" OR "loan servicer" OR nelnet OR ` +
+      `"great lakes" OR sallie OR mohela OR "payment plan" OR enrollment OR "fall semester" OR "spring semester")`,
+    instructions: `Extract a tuition payment schedule or student-loan servicer obligation. Return JSON or null:
+{ "category": "education", "subtype": "tuition|student_loan|other", "description": "what this is", "provider": "school / loan servicer", "renewalDate": "YYYY-MM-DD — next payment/due date or null", "amount": "payment if known or null", "frequency": "monthly|semester|annual|other", "consequence": "late fee / hold", "confidence": "high|medium|low" }
+Return whenever you can identify a provider AND a due date.`,
+  },
+  {
+    key: "pets",
+    maxResults: 25,
+    query:
+      `subject:("pet insurance" OR trupanion OR healthypaws OR "pet medication" OR chewy OR "auto-ship" OR ` +
+      `veterinary OR "flea" OR "heartworm" OR "refill" OR "your pet")`,
+    instructions: `Extract pet insurance or a recurring pet medication/supply subscription. Return JSON or null:
+{ "category": "pet", "subtype": "insurance|medication|supplies|other", "description": "what this is", "provider": "insurer / pharmacy / supplier", "renewalDate": "YYYY-MM-DD — renewal/refill/next-ship date or null", "amount": "cost if known or null", "frequency": "monthly|annual|other", "consequence": "lapse / runs out", "confidence": "high|medium|low" }
+Return whenever you can identify a provider AND a renewal/refill date.`,
+  },
+  {
+    key: "legal",
+    maxResults: 25,
+    query:
+      `subject:("filing deadline" OR "court date" OR "legal notice" OR attorney OR "law office" OR ` +
+      `"response required" OR "permit renewal" OR "license renewal" OR compliance OR "annual report due")`,
+    instructions: `Extract a legal or compliance DEADLINE (filing date, court date, license/permit renewal, required response). Return JSON or null:
+{ "category": "legal", "subtype": "filing|court_date|license|permit|compliance|other", "description": "what action is needed", "provider": "attorney / court / authority", "renewalDate": "YYYY-MM-DD — the deadline or null", "amount": "fee if known or null", "consequence": "default / penalty / lapse", "confidence": "high|medium|low" }
+Return whenever you can identify a clear deadline. IMPORTANT: do NOT extract death certificates, funeral, probate, estate-settlement, or any after-death checklist items — skip those entirely (return null).`,
+  },
 ];
 
 // Jaccard-against-shorter word overlap, mirrors api/import.js's
@@ -1250,7 +1342,7 @@ function dedupVaultItemsAcrossPasses(items) {
 // or against-existing dedup'd — that happens in runVaultJob).
 async function runVaultPass(accessToken, pass, afterEpoch) {
   const query = `after:${afterEpoch} ${pass.query}`;
-  const messageIds = await gmailSearch(accessToken, query, 50).catch(() => []);
+  const messageIds = await gmailSearch(accessToken, query, pass.maxResults || 50).catch(() => []);
   if (messageIds.length === 0) return { items: [], scanned: 0 };
 
   const headers = [];
@@ -1325,6 +1417,24 @@ ${bodyExcerpt}`;
 }
 
 async function runVaultJob(userId, householdId) {
+  // The exhaustive sweep is an initial-onboarding (isFirstRun) operation — it
+  // runs ONCE per household, not on every import/sync. If it already ran, skip
+  // so a re-dispatched onboard message (or a QStash retry) doesn't re-scan a
+  // year of mail. Ongoing renewals are picked up by the regular import path.
+  try {
+    const done = await redis.get(`household:${householdId}:exhaustiveSweepDone`);
+    if (done) {
+      await patchJob(householdId, "vault", {
+        state: "complete",
+        finishedAt: Date.now(),
+        skipped: "exhaustiveSweepDone",
+      });
+      return;
+    }
+  } catch (err) {
+    console.warn("[vault] sweep-flag read failed:", err?.message || err);
+  }
+
   await patchJob(householdId, "vault", { state: "running", startedAt: Date.now() });
 
   const accessToken = await getValidToken(userId);
@@ -1411,6 +1521,13 @@ async function runVaultJob(userId, householdId) {
 
   const processed = allItems.length;
   const dropped = processed - kept;
+
+  // Mark the exhaustive sweep done so it never re-runs for this household.
+  try {
+    await redis.set(`household:${householdId}:exhaustiveSweepDone`, new Date().toISOString());
+  } catch (err) {
+    console.warn("[vault] sweep-flag write failed:", err?.message || err);
+  }
 
   await patchJob(householdId, "vault", {
     state: "complete",
