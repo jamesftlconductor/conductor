@@ -12,6 +12,7 @@ import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
 import { getMarketRates, renderRatesForPrompt } from "./pricing.js";
 import { loadMovementPatterns, summarizeMovementPatterns } from "./movements.js";
 import { loadConductorLog } from "./conductor-log.js";
+import { resolveSignal } from "./resolve-signal.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -899,18 +900,15 @@ async function executeResolveSignal(intent, userId) {
     };
   }
 
-  // High-confidence single match — flip state to resolved.
-  const updated = {
-    ...top.signal,
-    state: "resolved",
-    resolvedAt: new Date().toISOString(),
-    lastUpdate: new Date().toLocaleString(),
-  };
+  // High-confidence single match — resolve through the CANONICAL path so all
+  // stores reconcile (:signals state flip, :memory log, :vault handled,
+  // missedCues cleanup, brief-cache bust, Commons record). Previously this
+  // wrote :signals directly and left the other stores stale.
+  const updated = { ...top.signal };
   try {
-    await redis.lrem(`household:${householdId}:signals`, 0, top.raw);
-    await redis.lpush(`household:${householdId}:signals`, JSON.stringify(updated));
+    await resolveSignal(householdId, top.signal.id, userId, { reason: "chat" });
   } catch (err) {
-    console.warn("[ask] executeResolveSignal patch failed:", err?.message);
+    console.warn("[ask] executeResolveSignal resolve failed:", err?.message);
     return null;
   }
   const answer = `Done — rested "${updated.description}".`;
