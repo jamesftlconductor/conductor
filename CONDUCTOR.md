@@ -12,21 +12,36 @@ continuing the build from scratch, start here.
 
 ## Product Thesis
 
-Conductor is the intelligence layer for the four pillars of family life:
-House, Work, Kids, Health. The brief leads with what matters most to each
+Conductor is the intelligence layer for the four movements of family life:
+Home, Work, Family, Wellness. The brief leads with what matters most to each
 household. The product becomes indispensable by being genuinely useful
-across all four pillars every single day.
+across all four movements every single day.
 
-### Pillar → signal mapping
+### Movement → signal mapping
 
-Each signal belongs to a pillar; the household's ranked `householdPillars`
-preference determines which pillar's signals surface first and get the most
-prose attention in the brief.
+Each signal belongs to a movement; the household's ranked `householdPillars`
+preference determines which movement's signals surface first and get the most
+prose attention in the brief. (The four movements correspond to the pillar
+keys `house` / `work` / `kids` / `health` in code.)
 
-- **House:** maintenance, service, delivery, deadline, vault
-- **Work:** calendar work blocks, work email, financial, conflicts
-- **Kids:** school, schedule, appointment, milestone, activity
-- **Health:** health type, medical, sleep, fitness
+- **Home Movement** (`house`): maintenance, service, delivery, deadline, vault
+- **Work Movement** (`work`): calendar work blocks, work email, financial, conflicts
+- **Family Movement** (`kids`): school, schedule, appointment, milestone, activity
+- **Wellness Movement** (`health`): health type, medical, sleep, fitness
+
+### Spatial mapping
+
+The four movements map to directions on the Minimap / radar:
+
+- **Up** = Home Movement
+- **Right** = Work Movement
+- **Down** = Family Movement
+- **Left** = Wellness Movement
+
+The brief speaks in movements, never "pillars": it may open "This morning
+across your four movements: …", lead with "The Work Movement is leading
+today — …", or, when nothing is active, close with "All four movements are
+quiet. The Conductor is watching."
 
 ---
 

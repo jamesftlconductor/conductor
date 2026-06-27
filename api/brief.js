@@ -70,6 +70,14 @@ function normalizeType(type) {
 // preferences.householdPillars to steer what the brief leads with.
 const PILLAR_LABELS = { house: "House", work: "Work", kids: "Kids", health: "Health" };
 const DEFAULT_PILLARS = ["house", "work", "kids", "health"];
+// Brief-facing "Movement" vocabulary for each pillar. The brief speaks in
+// movements, not pillars: Home / Work / Family / Wellness.
+const MOVEMENT_LABELS = {
+  house: "The Home Movement",
+  work: "The Work Movement",
+  kids: "The Family Movement",
+  health: "The Wellness Movement",
+};
 
 // Map a signal to its pillar (or null when it belongs to none — travel,
 // local_safety, plain unknown). Order matters: health is checked first so a
@@ -4680,6 +4688,12 @@ Lead with signals relevant to their top priorities.
 A household prioritizing Work should hear about calendar conflicts first.
 A household prioritizing Kids should hear about school and activity signals first.
 A household prioritizing Health should hear about health data and medical signals first.`,
+      ``,
+      `MOVEMENT LANGUAGE (the four life domains are spoken of as "movements", never "pillars"; this household's leading movement is ${MOVEMENT_LABELS[householdPillars[0]] || "The Home Movement"}). Movement names: Home (house), Work (work), Family (kids), Wellness (health). Use this framing when the brief touches pillar-aware content:
+- When synthesizing across domains, open with: "This morning across your four movements: ..."
+- When one movement clearly dominates the day, lead with: "${MOVEMENT_LABELS[householdPillars[0]] || "The Home Movement"} is leading today — ..."
+- When nothing is active anywhere, close with: "All four movements are quiet. The Conductor is watching."
+These are tone/vocabulary cues — adapt them naturally, do not paste them verbatim when they don't fit.`,
       ``,
       `TRAVEL PREP (within 72 hours — when this layer is non-empty, lead with it):`,
       travelPrep ? formatTravelPrepBlock() : "None",
