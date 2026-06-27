@@ -4628,6 +4628,48 @@ ${isSingleMember
       `WEATHER TODAY (silent unless it changes what someone should do about a signal):`,
       weather ? weather.summary : "Unknown",
       ``,
+      // Work-calendar shape — only when the requesting user has a work
+      // calendar connected. Gives Claude the literal shape of the day so it
+      // can name collisions with household obligations and reference how
+      // packed (or open) the day is. Overlapping/back-to-back meetings are
+      // merged into contiguous blocked ranges.
+      `WORK CALENDAR (the requesting user's own work schedule today — use to detect collisions with household obligations and to reference the shape of their day; silent if not connected):`,
+      (() => {
+        const connected = !!(preferences.workCalendarName && String(preferences.workCalendarName).trim());
+        if (!connected) return "Not connected";
+        const now = new Date();
+        const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+        const dayEnd = dayStart + 24 * HOUR_MS - 1;
+        const isWork = (e) => e.workConflictCheck === true || e.type === "work";
+        const fmtTime = (ms) => {
+          const d = new Date(ms);
+          let h = d.getHours();
+          const m = d.getMinutes();
+          const ap = h < 12 ? "am" : "pm";
+          h = h % 12; if (h === 0) h = 12;
+          return m === 0 ? `${h}${ap}` : `${h}:${String(m).padStart(2, "0")}${ap}`;
+        };
+        const blocks = (calendarEvents || [])
+          .filter((e) => e && (!userId || e.userId === userId) && isWork(e))
+          .map((e) => {
+            const s = parseDateLoose(e.start)?.getTime();
+            const en = parseDateLoose(e.end)?.getTime() || (s ? s + HOUR_MS : null);
+            return s && en ? { s, e: en } : null;
+          })
+          .filter((b) => b && b.s <= dayEnd && b.e >= dayStart)
+          .sort((a, b) => a.s - b.s);
+        if (!blocks.length) return "Connected — no meetings on the calendar today.";
+        const merged = [];
+        for (const b of blocks) {
+          const last = merged[merged.length - 1];
+          if (last && b.s <= last.e) last.e = Math.max(last.e, b.e);
+          else merged.push({ ...b });
+        }
+        const ranges = merged.map((b) => `${fmtTime(b.s)}-${fmtTime(b.e)}`);
+        const n = blocks.length;
+        return `Work calendar: ${n} meeting${n !== 1 ? "s" : ""} today, blocked ${ranges.join(" and ")}`;
+      })(),
+      ``,
       // Annual + (eventually) Eventbrite local events. Tier 1 (safety)
       // always lands; tier 2 (major) only on quiet days or when it
       // directly intersects a signal; tier 3 (awareness) is mute
@@ -5945,7 +5987,11 @@ Return only the offer line.`;
       const hasWorkCalendar = !!(
         preferences.workCalendarName && String(preferences.workCalendarName).trim()
       );
-      if (!hasWorkCalendar) {
+      // Permanent-dismiss guard: each time the user dismisses the nudge the
+      // app increments preferences.workCalendarDismissed. After 3 dismissals
+      // we stop asking for good.
+      const dismissedCount = Number(preferences.workCalendarDismissed) || 0;
+      if (!hasWorkCalendar && dismissedCount < 3) {
         const rawCreated = await redis.get(`household:${householdId}:createdAt`);
         let createdMs = rawCreated
           ? (typeof rawCreated === "string" ? Date.parse(rawCreated) : Number(rawCreated))

@@ -98,7 +98,7 @@ async function classifyMessage(subject, from, emailText) {
         role: "user",
         content: `Extract shipping/order info from this email. Return ONLY a JSON object:
 {
-  "description": "what the item or service is",
+  "description": "the most specific human-readable summary possible (see rules below)",
   "carrier": "UPS, FedEx, USPS, DHL, or Unknown",
   "trackingNumber": null,
   "status": "In Transit, Delivered, Out for Delivery, Delayed, or Unknown",
@@ -108,6 +108,20 @@ async function classifyMessage(subject, from, emailText) {
   "notes": "any additional context about timing, location, or special instructions (or null)",
   "confidence": "high, medium, or low — how confident you are in the extracted data"
 }
+
+Description must be as specific as possible.
+Include: what the item is, quantity if known, specific amount if financial,
+scheduled time if appointment, specific product name if identifiable.
+Examples:
+GOOD: 'Amazon — Lightly Lined Underwire Bra + 2 items, arriving Thursday'
+BAD: 'Amazon package'
+GOOD: 'Netflix Standard Plan — $15.49 renews July 3'
+BAD: 'Netflix renewal'
+GOOD: 'Dr. Sarah Martinez annual checkup — Cleveland Clinic, Tuesday 2pm'
+BAD: 'Doctor appointment'
+GOOD: 'Air Pros USA HVAC tune-up — scheduled Tuesday 2pm-4pm'
+BAD: 'HVAC service'
+Be specific. Users recognize items by their actual names, not categories.
 
 Subject: ${subject}
 From: ${from}
