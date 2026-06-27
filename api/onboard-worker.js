@@ -4,6 +4,7 @@ import { getValidToken } from "./refresh.js";
 import { runOutlookContactsImport } from "./outlook-contacts.js";
 import { runDriveDocumentScan } from "./drive.js";
 import { runContactsDeepScan } from "./contacts.js";
+import { runProfileExtraction } from "./profile-sweep.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -1795,6 +1796,18 @@ async function runVaultJob(userId, householdId) {
     await redis.set(`household:${householdId}:exhaustiveSweepDone`, new Date().toISOString());
   } catch (err) {
     console.warn("[vault] sweep-flag write failed:", err?.message || err);
+  }
+
+  // Profile auto-population — now that a year of signals + vault exist, infer
+  // movement profile fields (home ownership/type/era/systems, work hours/day,
+  // family school/doctor names, wellness HealthKit/meds) + ATTOM property
+  // lookup, and store the per-movement completeness so the interview only asks
+  // about what couldn't be inferred. Best-effort; never blocks job completion.
+  try {
+    const result = await runProfileExtraction(redis, userId, householdId);
+    console.log(`[vault] profile sweep populated: ${result.populated.join(", ") || "(nothing inferrable)"}`);
+  } catch (err) {
+    console.warn("[vault] profile sweep failed:", err?.message || err);
   }
 
   await patchJob(householdId, "vault", {

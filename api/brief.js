@@ -128,26 +128,39 @@ function signalPillar(s) {
 // api/ask.js?action=interviewAnswer turns the answer into a signal/vault item.
 const HOUSEHOLD_INTERVIEW_QUESTIONS = [
   { question: "When does your car registration expire?", context: "I'll add a registration renewal reminder to your Vault." },
-  { question: "Do you have a lease or mortgage renewal coming up?", context: "I'll track the renewal date so it doesn't sneak up." },
+  { question: "Do you have a lease or mortgage renewal coming up?", context: "I'll track the renewal date so it doesn't sneak up.", skipIfField: "housingOwnership" },
   { question: "What streaming subscriptions do you pay for?", context: "I'll add them to your Vault and flag any price changes." },
-  { question: "When was your HVAC last serviced?", context: "I'll set up a maintenance cadence for your system." },
-  { question: "Does anyone in your household have prescription medications that need refilling?", context: "I'll create refill reminders before you run out." },
+  { question: "When was your HVAC last serviced?", context: "I'll set up a maintenance cadence for your system.", skipIfField: "homeSystemsToWatch" },
+  { question: "Does anyone in your household have prescription medications that need refilling?", context: "I'll create refill reminders before you run out.", skipIfField: "medicationReminders" },
   { question: "What's your home insurance renewal date?", context: "I'll add the renewal with a heads-up window." },
   { question: "Do you have any upcoming travel planned?", context: "I'll start a trip thread so the logistics stay together." },
   { question: "When do your car insurance and home insurance renew?", context: "I'll track both so you can shop rates in time." },
 ];
 const INTERVIEW_SIGNAL_THRESHOLD = 5;
 
+// A preference field counts as "populated" when it's a non-empty value.
+function fieldPopulated(preferences, field) {
+  if (!preferences || !field) return false;
+  const v = preferences[field];
+  if (v == null) return false;
+  if (Array.isArray(v)) return v.length > 0;
+  return true;
+}
+
 // Pick the next unasked interview question when the household is below the
 // active-signal threshold. Records it as asked (SADD) so it never repeats.
-// Best-effort: any Redis failure returns null and the brief ships without one.
-async function pickHouseholdInterview(householdId, activeCount) {
+// Questions whose skipIfField was already filled by the first-use sweep are
+// skipped entirely — we only ask about what couldn't be inferred. Best-effort:
+// any Redis failure returns null and the brief ships without one.
+async function pickHouseholdInterview(householdId, activeCount, preferences) {
   if (typeof activeCount !== "number" || activeCount >= INTERVIEW_SIGNAL_THRESHOLD) return null;
   const askedKey = `household:${householdId}:askedInterviewQuestions`;
   try {
     const asked = new Set(await redis.smembers(askedKey));
-    const next = HOUSEHOLD_INTERVIEW_QUESTIONS.find((q) => !asked.has(q.question));
-    if (!next) return null; // whole pool asked — stop, never repeat
+    const next = HOUSEHOLD_INTERVIEW_QUESTIONS.find(
+      (q) => !asked.has(q.question) && !fieldPopulated(preferences, q.skipIfField)
+    );
+    if (!next) return null; // whole pool asked or inferred — stop, never repeat
     await redis.sadd(askedKey, next.question);
     return { question: next.question, context: next.context };
   } catch (err) {
@@ -6148,7 +6161,16 @@ Return only the offer line.`;
     // Household interview — when the active pool is thin (< 5), surface one
     // profile-building question. Null when the household is busy enough or the
     // question pool is exhausted.
-    const householdInterview = await pickHouseholdInterview(householdId, activeSignals.length);
+    const householdInterview = await pickHouseholdInterview(householdId, activeSignals.length, preferences);
+
+    // Movement completeness — per-movement profile fill (0-100) computed by the
+    // first-use sweep. Returned so mobile knows which movements still need
+    // interview questions.
+    let movementCompleteness = null;
+    try {
+      const rawMc = await redis.get(`household:${householdId}:movementCompleteness`);
+      movementCompleteness = safeJson(rawMc) || null;
+    } catch { /* best-effort */ }
 
     // One-time exhaustive-sweep reveal: surface the onboarding finds as a
     // moment ("The Conductor found: …"), then mark shown so it appears once.
@@ -6357,6 +6379,7 @@ Return only the offer line.`;
       quietDay,
       workCalendarNudge,
       quietDayIntelligence,
+      movementCompleteness,
       segments,
       transparency,
       theRead,
