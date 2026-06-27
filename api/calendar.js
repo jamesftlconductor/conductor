@@ -228,6 +228,10 @@ export async function runCalendarSync(userId, options = {}) {
             : [],
           start: event.start?.dateTime || event.start?.date,
           end: event.end?.dateTime || event.end?.date,
+          // All-day events expose start.date with no start.dateTime. The
+          // raw distinction is lost once start is collapsed above, so capture
+          // it here — all-day events must never be classified as work.
+          isAllDay: !!(event.start?.date && !event.start?.dateTime),
           calendar: calendar.summary,
           calendarId: calendar.id,
           // Google's structured event-type signal — outOfOffice / focusTime
@@ -249,6 +253,25 @@ export async function runCalendarSync(userId, options = {}) {
   const classified = [];
   const needsClassification = [];
   for (const ev of allEvents) {
+    // All-day events and public-holiday calendars are NEVER work — they must
+    // never enter The Work Movement. Classify them as personal up front,
+    // before the work-strip pre-tag or the LLM ever sees them. (Juneteenth /
+    // Independence Day etc. were landing as type:"work" and polluting the
+    // Work pillar.) "Holidays in United States" and similar holiday calendars
+    // match on the calendar name.
+    const isHolidayCalendar = /\bholidays?\b/i.test(ev.calendar || "");
+    if (ev.isAllDay || isHolidayCalendar) {
+      const record = {
+        ...ev,
+        type: "personal",
+        householdRelevant: false,
+        workConflictCheck: false,
+        classifiedBy: isHolidayCalendar ? "holiday-calendar" : "all-day",
+      };
+      if (accessLevel !== "full") delete record.attendees;
+      classified.push(record);
+      continue;
+    }
     const fromWorkCal = workCalendarIds.has(ev.calendarId);
     const structurallyBlocking =
       ev.eventType === "outOfOffice" || ev.eventType === "focusTime";
