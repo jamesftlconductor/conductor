@@ -66,6 +66,36 @@ function normalizeType(type) {
   return TYPE_MAP[String(type).toLowerCase()] || "other";
 }
 
+// Household pillars — the four life domains a household can rank in
+// preferences.householdPillars to steer what the brief leads with.
+const PILLAR_LABELS = { house: "House", work: "Work", kids: "Kids", health: "Health" };
+const DEFAULT_PILLARS = ["house", "work", "kids", "health"];
+
+// Map a signal to its pillar (or null when it belongs to none — travel,
+// local_safety, plain unknown). Order matters: health is checked first so a
+// medical appointment outranks the generic "appointment -> kids" rule.
+//   house:  service, delivery/package/food/grocery, deadline, vault, anticipated, reminder, maintenance
+//   work:   financial, work-tagged, work-calendar blocks
+//   kids:   school, schedule, supplies, junior, milestone, (pediatric) appointment
+//   health: health type or medical-keyword descriptions
+function signalPillar(s) {
+  if (!s) return null;
+  const t = (s.type || "").toLowerCase();
+  const d = (s.description || "").toLowerCase();
+  if (
+    t === "health" ||
+    /\b(doctor|clinic|dentist|pediatric|pediatrician|medical|prescription|refill|therapy|cardiolog|dermatolog|specialist|lab work|blood test)\b/.test(d)
+  ) return "health";
+  if (["school", "schedule", "supplies", "junior", "milestone"].includes(t)) return "kids";
+  if (t === "appointment") return "kids"; // medical appointments are caught above
+  if (t === "financial" || t === "work" || s.workConflictCheck === true) return "work";
+  if (
+    ["service", "delivery", "package", "food", "grocery", "deadline", "anticipated", "reminder", "maintenance"].includes(t) ||
+    s._isDeadline === true
+  ) return "house";
+  return null;
+}
+
 // Household profile interview — when the household is quiet (fewer than 5
 // active signals), the brief surfaces ONE question at a time to build the
 // household picture. Asked questions are recorded in
@@ -3507,6 +3537,14 @@ export default async function handler(req, res) {
     const preferences = safeJson(rawPreferences) || { flaggedCategories: [] };
     if (!Array.isArray(preferences.flaggedCategories)) preferences.flaggedCategories = [];
 
+    // Household pillars — the ranked life domains (house/work/kids/health)
+    // the household cares about most. Drives both the pillar-weighted signal
+    // ordering below and the editorial steer in the synthesis prompt.
+    const householdPillars =
+      Array.isArray(preferences.householdPillars) && preferences.householdPillars.length
+        ? preferences.householdPillars.filter((p) => PILLAR_LABELS[p])
+        : DEFAULT_PILLARS;
+
     // User-tunable signal visibility and ordering, set via Settings.
     // Both prefs are keyed by the 8 canonical categories from the mobile
     // Customize UI (delivery, food, service, financial, travel, deadline,
@@ -3540,6 +3578,22 @@ export default async function handler(req, res) {
       activeSignals = activeSignals
         .map((s, i) => ({ s, i }))
         .sort((a, b) => rankOf(a.s) - rankOf(b.s) || a.i - b.i)
+        .map((x) => x.s);
+    }
+
+    // Pillar-weighted ordering — the dominant sort. Signals belonging to the
+    // household's top-ranked pillar surface first; pillar-less signals sink to
+    // the end. Applied AFTER the category sort so that order is preserved as a
+    // stable tiebreak within each pillar (index-stabilized sort).
+    {
+      const pillarRank = new Map(householdPillars.map((p, i) => [p, i]));
+      const rankOfPillar = (s) => {
+        const p = signalPillar(s);
+        return p && pillarRank.has(p) ? pillarRank.get(p) : Number.MAX_SAFE_INTEGER;
+      };
+      activeSignals = activeSignals
+        .map((s, i) => ({ s, i }))
+        .sort((a, b) => rankOfPillar(a.s) - rankOfPillar(b.s) || a.i - b.i)
         .map((x) => x.s);
     }
 
@@ -4620,6 +4674,12 @@ ${isSingleMember
       `Today is ${today}.`,
       ``,
       householdStateBlock,
+      ``,
+      `HOUSEHOLD PRIORITIES (this household prioritizes: ${householdPillars.map((p) => PILLAR_LABELS[p] || p).join(", ")}).
+Lead with signals relevant to their top priorities.
+A household prioritizing Work should hear about calendar conflicts first.
+A household prioritizing Kids should hear about school and activity signals first.
+A household prioritizing Health should hear about health data and medical signals first.`,
       ``,
       `TRAVEL PREP (within 72 hours — when this layer is non-empty, lead with it):`,
       travelPrep ? formatTravelPrepBlock() : "None",
