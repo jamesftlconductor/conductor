@@ -51,7 +51,7 @@ function isWorkCalendar(cal, userEmail, userWorkCalendarName) {
 // Conductor knows you're busy, never knows why or with whom. Conflict
 // detector reads `start`/`end` ISO strings (kept here as derivative time
 // data, not content) plus the structured date/startTime/endTime fields.
-function stripToTimeBlock(event, classifiedBy) {
+function stripToTimeBlock(event, classifiedBy, accessLevel = "essentials") {
   const startIso = event.start;
   const endIso = event.end;
   const d = startIso ? new Date(startIso) : null;
@@ -65,6 +65,17 @@ function stripToTimeBlock(event, classifiedBy) {
   const dayOfWeek = d
     ? ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][d.getDay()]
     : null;
+  // Access-level overlay. The title is kept under `workTitle` (NOT `title`)
+  // on purpose: downstream `!ev.title` guards treat work blocks as
+  // content-free so they never become household signals — only callers that
+  // opt in (brief synthesis / conflict naming) read `workTitle`.
+  const overlay = {};
+  if (accessLevel === "informed" || accessLevel === "full") {
+    overlay.workTitle = event.title || null;
+  }
+  if (accessLevel === "full") {
+    overlay.attendees = Array.isArray(event.attendees) ? event.attendees : [];
+  }
   return {
     // Synthetic id from the time block — opaque, content-free, stable
     // across syncs for the same slot. Google's event.id is intentionally
@@ -85,6 +96,7 @@ function stripToTimeBlock(event, classifiedBy) {
     end: endIso || null,
     userId: event.userId,
     classifiedBy,
+    ...overlay,
   };
 }
 
@@ -140,10 +152,17 @@ export async function runCalendarSync(userId, options = {}) {
   // isWorkCalendar can match calendars whose names don't include
   // "work"/"office" but the user has tagged as their work calendar.
   let userWorkCalendarName = null;
+  // Conductor access level — governs how much of a work event survives the
+  // privacy strip: 'essentials' (default) keeps only the time block;
+  // 'informed' also keeps the title; 'full' keeps title + attendees.
+  let accessLevel = "essentials";
   try {
     const prefsRaw = await redis.get(`user:${userId}:preferences`);
     const prefs = typeof prefsRaw === "string" ? JSON.parse(prefsRaw) : prefsRaw;
     userWorkCalendarName = prefs?.workCalendarName || null;
+    if (["essentials", "informed", "full"].includes(prefs?.conductorAccessLevel)) {
+      accessLevel = prefs.conductorAccessLevel;
+    }
   } catch {
     // ignored
   }
@@ -202,6 +221,11 @@ export async function runCalendarSync(userId, options = {}) {
           id: event.id,
           title: event.summary || "Untitled",
           description: event.description || "",
+          // Attendee identifiers, retained only so the 'full' access level
+          // can surface them; stripped for 'essentials'/'informed'.
+          attendees: Array.isArray(event.attendees)
+            ? event.attendees.map((a) => a.displayName || a.email).filter(Boolean)
+            : [],
           start: event.start?.dateTime || event.start?.date,
           end: event.end?.dateTime || event.end?.date,
           calendar: calendar.summary,
@@ -230,7 +254,7 @@ export async function runCalendarSync(userId, options = {}) {
       ev.eventType === "outOfOffice" || ev.eventType === "focusTime";
     if (fromWorkCal || structurallyBlocking) {
       const tag = fromWorkCal ? "work-calendar" : "event-type";
-      classified.push(stripToTimeBlock(ev, tag));
+      classified.push(stripToTimeBlock(ev, tag, accessLevel));
     } else {
       needsClassification.push(ev);
     }
@@ -286,20 +310,26 @@ Return only the JSON object.`,
         classification.type === "work" || classification.workConflictCheck === true;
       const isOnConsumerPrimary = consumerPrimaryCalendarIds.has(event.calendarId);
       if (isWorkByLLM && !isOnConsumerPrimary) {
-        classified.push(stripToTimeBlock(event, "llm"));
+        classified.push(stripToTimeBlock(event, "llm", accessLevel));
       } else {
-        classified.push({ ...event, ...classification, classifiedBy: "llm" });
+        // Non-work (household/personal) events keep their title as before,
+        // but attendees are only retained at the 'full' access level.
+        const record = { ...event, ...classification, classifiedBy: "llm" };
+        if (accessLevel !== "full") delete record.attendees;
+        classified.push(record);
       }
       await new Promise(r => setTimeout(r, 100));
 
     } catch (err) {
-      classified.push({
+      const record = {
         ...event,
         type: "unknown",
         householdRelevant: false,
         workConflictCheck: false,
         classifiedBy: "llm-error",
-      });
+      };
+      if (accessLevel !== "full") delete record.attendees;
+      classified.push(record);
     }
   }
 

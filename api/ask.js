@@ -1471,6 +1471,43 @@ export default async function handler(req, res) {
       })
       .slice(0, 20);
 
+    // Conductor access level (default 'essentials'). At 'full' the Conductor
+    // may reference actual email-derived content when answering questions.
+    // NOTE: raw email bodies are not persisted anywhere — emails are fetched
+    // transiently during import. The richest email content we retain lives on
+    // the signals themselves (sender, date, description, notes), so that is
+    // what the 'full' block exposes. True full-body access would require a new
+    // snippet-persistence step in the import pipeline.
+    let accessLevel = "essentials";
+    try {
+      const prefsRaw = await redis.get(`user:${userId}:preferences`);
+      const prefs = safeJson(prefsRaw);
+      if (["essentials", "informed", "full"].includes(prefs?.conductorAccessLevel)) {
+        accessLevel = prefs.conductorAccessLevel;
+      }
+    } catch { /* default essentials */ }
+
+    let emailContext = "";
+    if (accessLevel === "full") {
+      const fmtDate = (ms) => {
+        if (!ms || isNaN(ms)) return null;
+        return new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      };
+      const emailDerived = allSignals
+        .filter((s) => s.sender && (s.notes || s.description))
+        .sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0))
+        .slice(0, 15)
+        .map((s) => {
+          const when = fmtDate(Number(s.id) || Date.parse(s.lastUpdate || ""));
+          return `- From ${s.sender}${when ? ` (${when})` : ""}: ${s.description || ""}${s.notes ? ` — ${s.notes}` : ""}`;
+        });
+      if (emailDerived.length) {
+        emailContext =
+          `\n\nEMAIL CONTENT (recent email-derived detail — you may quote or reference these when answering, e.g. "in the email from Air Pros they mentioned…"):\n` +
+          emailDerived.join("\n");
+      }
+    }
+
     const contextBlock = [
       `SIGNALS:`,
       activeSignals.length > 0 ? activeSignals.slice(0, 30).map(formatSignalLine).join("\n") : "None",
@@ -1500,7 +1537,7 @@ export default async function handler(req, res) {
       ``,
       `HOME INVENTORY:`,
       formatInventoryBlock(inventory),
-    ].join("\n");
+    ].join("\n") + emailContext;
 
     const ratesBlock = renderRatesForPrompt(householdLocation.marketRegion);
 

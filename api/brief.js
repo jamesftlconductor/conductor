@@ -1037,6 +1037,19 @@ function detectConflicts({
     });
   }
 
+  // Title of the work event blocking this window, when the user's access
+  // level retained it (workTitle is only present at 'informed'/'full'). Lets
+  // the conflict read "your board meeting overlaps" instead of a bare block.
+  function blockingTitleInWindow(uid, startMs, endMs) {
+    const list = memberWork.get(uid) || [];
+    for (const e of list) {
+      const s = parseDateLoose(e.start)?.getTime();
+      const eMs = parseDateLoose(e.end)?.getTime() || (s ? s + HOUR_MS : null);
+      if (s && eMs && s <= endMs && eMs >= startMs && e.workTitle) return e.workTitle;
+    }
+    return null;
+  }
+
   function startOfDayMs(date) {
     return new Date(
       date.getFullYear(),
@@ -1126,10 +1139,14 @@ function detectConflicts({
         ) {
           continue;
         }
+        const blockingTitle = blockingTitleInWindow(requestingUserId, winStart, winEnd);
         conflicts.push({
           type: "work_calendar_conflict",
           signal: s,
-          reason: "your work calendar overlaps this",
+          reason: blockingTitle
+            ? `your "${blockingTitle}" overlaps this`
+            : "your work calendar overlaps this",
+          eventTitle: blockingTitle || undefined,
           workElevated: true,
           severity: "high",
         });
@@ -4654,11 +4671,21 @@ ${isSingleMember
           .map((e) => {
             const s = parseDateLoose(e.start)?.getTime();
             const en = parseDateLoose(e.end)?.getTime() || (s ? s + HOUR_MS : null);
-            return s && en ? { s, e: en } : null;
+            return s && en ? { s, e: en, title: e.workTitle || null } : null;
           })
           .filter((b) => b && b.s <= dayEnd && b.e >= dayStart)
           .sort((a, b) => a.s - b.s);
         if (!blocks.length) return "Connected — no meetings on the calendar today.";
+        const n = blocks.length;
+        // At 'informed'/'full' access, work blocks carry their title
+        // (workTitle), so name each meeting — the brief can say "your board
+        // meeting" instead of just "your 2pm block". At 'essentials' there
+        // are no titles, so fall back to merged blocked time ranges.
+        const hasTitles = blocks.some((b) => b.title);
+        if (hasTitles) {
+          const lines = blocks.map((b) => `${b.title || "Untitled block"} (${fmtTime(b.s)}-${fmtTime(b.e)})`);
+          return `Work calendar: ${n} meeting${n !== 1 ? "s" : ""} today — ${lines.join(", ")}`;
+        }
         const merged = [];
         for (const b of blocks) {
           const last = merged[merged.length - 1];
@@ -4666,7 +4693,6 @@ ${isSingleMember
           else merged.push({ ...b });
         }
         const ranges = merged.map((b) => `${fmtTime(b.s)}-${fmtTime(b.e)}`);
-        const n = blocks.length;
         return `Work calendar: ${n} meeting${n !== 1 ? "s" : ""} today, blocked ${ranges.join(" and ")}`;
       })(),
       ``,
