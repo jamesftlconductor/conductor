@@ -123,10 +123,17 @@ function formatCrewLine(m) {
   return `- ${name} (${role})${bday}${anniv}${eventLine}`;
 }
 
+// Full wellness snapshot — every available HealthKit (Apple Watch) and Oura
+// field, so wellness questions from the Movement screen can be answered from
+// the complete picture, not just sleep + HRV. Sarah's Oura data flows in via
+// the Oura sync (readiness, sleep stages, temperature, SpO2, activity).
 function formatHealth(health) {
   if (!health) return "Not connected";
   const parts = [];
-  if (health.sleep?.duration != null) parts.push(`sleep ${health.sleep.duration}h`);
+  const min = (s) => (s != null ? Math.round(s / 60) + "m" : null);
+  if (health.sleep?.duration != null) {
+    parts.push(`sleep ${health.sleep.duration}h${health.sleep.efficiency != null ? ` (efficiency ${Math.round(health.sleep.efficiency * 100)}%)` : ""}`);
+  }
   if (health.hrv?.current != null) {
     const baseline = health.hrv.baseline7d;
     parts.push(baseline ? `HRV ${health.hrv.current} (baseline ${baseline})` : `HRV ${health.hrv.current}`);
@@ -134,6 +141,28 @@ function formatHealth(health) {
   if (health.restingHR != null) parts.push(`resting HR ${health.restingHR}`);
   if (health.steps != null) parts.push(`${health.steps} steps`);
   if (health.activeCalories != null) parts.push(`${health.activeCalories} active calories`);
+  const o = health.oura || {};
+  if (o.readiness?.score != null) parts.push(`readiness ${o.readiness.score}/100`);
+  const c = o.readiness?.contributors || {};
+  if (c.resting_heart_rate != null) parts.push(`resting-HR contributor ${c.resting_heart_rate}/100`);
+  if (c.hrv_balance != null) parts.push(`HRV balance ${c.hrv_balance}/100`);
+  if (c.recovery_index != null) parts.push(`recovery index ${c.recovery_index}/100`);
+  if (c.body_temperature != null) parts.push(`body-temp contributor ${c.body_temperature}/100 (lower = elevated)`);
+  if (o.readiness?.temperature_deviation != null) parts.push(`temp deviation ${o.readiness.temperature_deviation}°C`);
+  if (o.sleep?.score != null) parts.push(`sleep score ${o.sleep.score}/100`);
+  const stages = [];
+  if (o.sleep?.deep_sleep_duration != null) stages.push(`deep ${min(o.sleep.deep_sleep_duration)}`);
+  if (o.sleep?.rem_sleep_duration != null) stages.push(`REM ${min(o.sleep.rem_sleep_duration)}`);
+  if (o.sleep?.awake_time != null) stages.push(`awake ${min(o.sleep.awake_time)}`);
+  if (stages.length) parts.push(`sleep stages (${stages.join(", ")})`);
+  if (o.spo2?.average != null) parts.push(`SpO2 ${o.spo2.average}%`);
+  if (o.activity && (o.activity.score != null || o.activity.steps != null)) {
+    const ap = [];
+    if (o.activity.score != null) ap.push(`score ${o.activity.score}/100`);
+    if (o.activity.active_calories != null) ap.push(`${o.activity.active_calories} active cal`);
+    if (o.activity.steps != null) ap.push(`${o.activity.steps} steps`);
+    parts.push(`activity (${ap.join(", ")})`);
+  }
   return parts.length > 0 ? parts.join(", ") : "Not connected";
 }
 

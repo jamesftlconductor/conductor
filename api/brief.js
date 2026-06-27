@@ -78,6 +78,20 @@ const MOVEMENT_LABELS = {
   kids: "The Family Movement",
   health: "The Wellness Movement",
 };
+// Movement names (as used in weeklyRhythm + signal.movement) map back to the
+// pillar keys the signal-ordering logic ranks by.
+const MOVEMENT_TO_PILLAR = { home: "house", work: "work", family: "kids", wellness: "health" };
+// weeklyRhythm — per-day leading movement. Drives which movement the brief
+// foregrounds on a given weekday. Values are movement names.
+const DEFAULT_WEEKLY_RHYTHM = {
+  monday: "work",
+  tuesday: "home",
+  wednesday: "work",
+  thursday: "family",
+  friday: "wellness",
+  saturday: "family",
+  sunday: "home",
+};
 
 // Map a signal to its pillar (or null when it belongs to none — travel,
 // local_safety, plain unknown). Order matters: health is checked first so a
@@ -1985,6 +1999,51 @@ function classifySignalLoad({ urgentCount, nearCount, conflictsCount, carriedFor
   return "clear";
 }
 
+// Full wellness snapshot for the synthesis prompt — surfaces EVERY available
+// HealthKit (Apple Watch) and Oura field, not just sleep + HRV. Absent fields
+// are skipped so the block only ever lists what's actually present.
+function formatHealthDepth(h) {
+  if (!h || typeof h !== "object") return "Not connected";
+  const lines = [];
+  const min = (s) => (s != null ? Math.round(s / 60) + "m" : null);
+  // ---- HealthKit / Apple Watch layer ----
+  if (h.sleep?.duration != null) {
+    lines.push(`Sleep: ${h.sleep.duration}h${h.sleep.efficiency != null ? ` (efficiency ${Math.round(h.sleep.efficiency * 100)}%)` : ""}`);
+  }
+  if (h.hrv?.current != null) {
+    lines.push(`HRV: ${h.hrv.current}ms${h.hrv.baseline7d != null ? ` vs 7-day baseline ${h.hrv.baseline7d}ms` : ""}`);
+  }
+  if (h.restingHR != null) lines.push(`Resting heart rate: ${h.restingHR} bpm`);
+  if (h.steps != null) lines.push(`Steps today: ${h.steps}`);
+  if (h.activeCalories != null) lines.push(`Active calories: ${h.activeCalories}`);
+  // ---- Oura layer ----
+  const o = h.oura || {};
+  if (o.readiness?.score != null) lines.push(`Readiness score: ${o.readiness.score}/100`);
+  const c = o.readiness?.contributors || {};
+  if (c.resting_heart_rate != null) lines.push(`Resting-HR contributor: ${c.resting_heart_rate}/100`);
+  if (c.hrv_balance != null) lines.push(`HRV balance: ${c.hrv_balance}/100`);
+  if (c.recovery_index != null) lines.push(`Recovery index: ${c.recovery_index}/100`);
+  if (c.body_temperature != null) lines.push(`Body-temperature contributor: ${c.body_temperature}/100 (lower = elevated)`);
+  if (o.readiness?.temperature_deviation != null) lines.push(`Temperature deviation: ${o.readiness.temperature_deviation}°C from baseline`);
+  if (o.sleep?.score != null) lines.push(`Sleep score: ${o.sleep.score}/100`);
+  const stages = [];
+  if (o.sleep?.deep_sleep_duration != null) stages.push(`deep ${min(o.sleep.deep_sleep_duration)}`);
+  if (o.sleep?.rem_sleep_duration != null) stages.push(`REM ${min(o.sleep.rem_sleep_duration)}`);
+  if (o.sleep?.awake_time != null) stages.push(`awake ${min(o.sleep.awake_time)}`);
+  if (stages.length) lines.push(`Sleep stages: ${stages.join(", ")}`);
+  if (o.spo2?.average != null) {
+    lines.push(`SpO2: ${o.spo2.average}%${o.spo2.breathing_disturbance_index != null ? ` (breathing disturbance index ${o.spo2.breathing_disturbance_index})` : ""}`);
+  }
+  if (o.activity && (o.activity.score != null || o.activity.active_calories != null || o.activity.steps != null)) {
+    const parts = [];
+    if (o.activity.score != null) parts.push(`score ${o.activity.score}/100`);
+    if (o.activity.active_calories != null) parts.push(`${o.activity.active_calories} active cal`);
+    if (o.activity.steps != null) parts.push(`${o.activity.steps} steps`);
+    lines.push(`Activity rings: ${parts.join(", ")}`);
+  }
+  return lines.length ? lines.join("\n") : "Connected, no metrics today";
+}
+
 function classifyHealthState(healthContext) {
   if (!healthContext) return null;
   const sleep = healthContext.sleep?.duration ?? null;
@@ -3553,6 +3612,17 @@ export default async function handler(req, res) {
         ? preferences.householdPillars.filter((p) => PILLAR_LABELS[p])
         : DEFAULT_PILLARS;
 
+    // Weekly rhythm — the movement the brief foregrounds on today's weekday.
+    // Computed off the same server-local basis as the `today` string so the
+    // day name the brief states matches the rhythm it applies.
+    const weeklyRhythm =
+      preferences.weeklyRhythm && typeof preferences.weeklyRhythm === "object"
+        ? { ...DEFAULT_WEEKLY_RHYTHM, ...preferences.weeklyRhythm }
+        : DEFAULT_WEEKLY_RHYTHM;
+    const todayWeekday = new Date().toLocaleDateString("en-US", { weekday: "long" });
+    const rhythmMovement = weeklyRhythm[todayWeekday.toLowerCase()] || null;
+    const rhythmPillar = rhythmMovement ? MOVEMENT_TO_PILLAR[rhythmMovement] : null;
+
     // User-tunable signal visibility and ordering, set via Settings.
     // Both prefs are keyed by the 8 canonical categories from the mobile
     // Customize UI (delivery, food, service, financial, travel, deadline,
@@ -3592,9 +3662,14 @@ export default async function handler(req, res) {
     // Pillar-weighted ordering — the dominant sort. Signals belonging to the
     // household's top-ranked pillar surface first; pillar-less signals sink to
     // the end. Applied AFTER the category sort so that order is preserved as a
-    // stable tiebreak within each pillar (index-stabilized sort).
+    // stable tiebreak within each pillar (index-stabilized sort). Today's
+    // weekly-rhythm pillar is prepended so it leads the brief regardless of
+    // the household's standing pillar order.
     {
-      const pillarRank = new Map(householdPillars.map((p, i) => [p, i]));
+      const effectivePillars = rhythmPillar
+        ? [rhythmPillar, ...householdPillars.filter((p) => p !== rhythmPillar)]
+        : householdPillars;
+      const pillarRank = new Map(effectivePillars.map((p, i) => [p, i]));
       const rankOfPillar = (s) => {
         const p = signalPillar(s);
         return p && pillarRank.has(p) ? pillarRank.get(p) : Number.MAX_SAFE_INTEGER;
@@ -4695,6 +4770,10 @@ A household prioritizing Health should hear about health data and medical signal
 - When nothing is active anywhere, close with: "All four movements are quiet. The Conductor is watching."
 These are tone/vocabulary cues — adapt them naturally, do not paste them verbatim when they don't fit.`,
       ``,
+      ...(rhythmMovement ? [
+        `TODAY'S RHYTHM: This ${todayWeekday}, The Conductor leads with ${MOVEMENT_LABELS[rhythmPillar] || "The Home Movement"}. When that movement has any live signals, foreground them at the open — e.g. "This ${todayWeekday}, The Conductor leads with ${MOVEMENT_LABELS[rhythmPillar] || "The Home Movement"}." Adapt naturally; if that movement is empty today, lead with whatever is most present.`,
+        ``,
+      ] : []),
       `TRAVEL PREP (within 72 hours — when this layer is non-empty, lead with it):`,
       travelPrep ? formatTravelPrepBlock() : "None",
       ``,
@@ -4713,8 +4792,8 @@ These are tone/vocabulary cues — adapt them naturally, do not paste them verba
       `OLDER SIGNALS MOVED (only if present — make exactly ONE short, calm mention near the end of the brief that a few older signals were moved to Missed Cues; do NOT enumerate them, do NOT dwell on it):`,
       staleMovedNote || "None",
       ``,
-      `HEALTH CONTEXT (one sentence if notable, silent if normal):`,
-      healthContext ? JSON.stringify(healthContext) : "Not connected",
+      `HEALTH CONTEXT — full wellness snapshot (Apple Watch + Oura; one sentence if notable, silent if normal; never recite raw numbers unless they change what the reader should do):`,
+      formatHealthDepth(healthContext),
       ``,
       `WEATHER TODAY (silent unless it changes what someone should do about a signal):`,
       weather ? weather.summary : "Unknown",

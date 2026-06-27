@@ -91,12 +91,27 @@ function extractReadiness(r) {
   if (!r) return null;
   return {
     score: r.score ?? null,
+    // temperature_deviation is the raw °C deviation from baseline (separate
+    // from the body_temperature contributor score). Surface both.
+    temperature_deviation: r.temperature_deviation ?? null,
     contributors: r.contributors ? {
       sleep_balance: r.contributors.sleep_balance ?? null,
       hrv_balance: r.contributors.hrv_balance ?? null,
       recovery_index: r.contributors.recovery_index ?? null,
       body_temperature: r.contributors.body_temperature ?? null,
+      resting_heart_rate: r.contributors.resting_heart_rate ?? null,
     } : null,
+  };
+}
+
+function extractSpo2(s) {
+  if (!s) return null;
+  const avg = typeof s.spo2_percentage === "object"
+    ? (s.spo2_percentage?.average ?? null)
+    : (s.spo2_percentage ?? null);
+  return {
+    average: avg,
+    breathing_disturbance_index: s.breathing_disturbance_index ?? null,
   };
 }
 
@@ -141,16 +156,18 @@ export async function runOuraSync(userId) {
   if (!accessToken) return { skipped: "no valid token" };
 
   const date = todayISO();
-  const [readinessRaw, sleepRaw, activityRaw] = await Promise.all([
+  const [readinessRaw, sleepRaw, activityRaw, spo2Raw] = await Promise.all([
     fetchOuraEndpoint(accessToken, "daily_readiness", date),
     fetchOuraEndpoint(accessToken, "daily_sleep", date),
     fetchOuraEndpoint(accessToken, "daily_activity", date),
+    fetchOuraEndpoint(accessToken, "daily_spo2", date),
   ]);
 
   const oura = {
     readiness: extractReadiness(readinessRaw),
     sleep: extractSleep(sleepRaw),
     activity: extractActivity(activityRaw),
+    spo2: extractSpo2(spo2Raw),
     syncedAt: Date.now(),
   };
 

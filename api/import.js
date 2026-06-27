@@ -34,6 +34,28 @@ async function persistSignalSnippet(signalId, bodyText) {
   }
 }
 
+// Movement attribution — tags a signal with the life "movement" it belongs
+// to (home / work / family / wellness), mirroring the brief's Movement
+// vocabulary. Stored on the signal so brief.js and the movement screens can
+// group without recomputing. Rules (first match wins):
+//   wellness: health/medical, or a doctor-context appointment
+//   work:     financial, or a work-tagged calendar block
+//   family:   attributed to a crew member, or a milestone/reminder (b'day/anniv)
+//   home:     everything else (default)
+function signalMovement(signal) {
+  const t = (signal?.type || "").toLowerCase();
+  const d = (signal?.description || "").toLowerCase();
+  if (t === "health" || t === "medical") return "wellness";
+  if (
+    t === "appointment" &&
+    /\b(doctor|dr\.?|clinic|dentist|dental|pediatric|pediatrician|physical|medical|checkup|check-up|optometr|dermatolog|cardiolog)\b/.test(d)
+  ) return "wellness";
+  if (t === "financial" || t === "work" || signal?.workConflictCheck === true) return "work";
+  if (signal?.crewMemberId) return "family";
+  if (t === "milestone" || t === "reminder") return "family";
+  return "home";
+}
+
 // Stable content key for a parsed signal. Mirrors the dedup logic used by the
 // one-shot cleanup so the messageId-less legacy entries collapse against new
 // imports of the same email.
@@ -1055,6 +1077,7 @@ async function pushLeaseRenewalSignal(householdId, item, lease, ctx) {
     createdAt: Date.now(),
     autoDetected: true,
   };
+  signal.movement = signalMovement(signal);
   await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
   console.log(`[lease] renewal signal ${signal.id} eta ${eta}`);
 }
@@ -1599,6 +1622,7 @@ export async function runImport(userId, customQuery = null) {
         // surfaces in the brief alongside other near-window items.
         for (const a of anomalies) {
           const signal = buildFinancialSignal(a, tx);
+          signal.movement = signalMovement(signal);
           await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
           await persistSignalSnippet(signal.id, emailText);
           console.log(
@@ -1770,6 +1794,9 @@ ${emailText.substring(0, 1000)}`,
         signal.emotionalValence = "neutral";
         if (signal.emotionalIntensity === "high") signal.emotionalIntensity = "low";
       }
+
+      // Movement attribution — tag which life movement this signal belongs to.
+      signal.movement = signalMovement(signal);
 
       // Mark as imported once parsing succeeds — covers both the lpush path
       // below and the stale-eta skip, so neither gets re-processed.
