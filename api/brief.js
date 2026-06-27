@@ -5,6 +5,7 @@ import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
 import { loadNetworkContext } from "./network.js";
 import { isMaintenanceOfferReady } from "./maintenance.js";
 import { groupSignalsByTrip } from "./trip-threads.js";
+import { signalMovement, loadMovementPatterns, summarizeMovementPatterns } from "./movements.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -4734,6 +4735,49 @@ ${isSingleMember
       );
     }
 
+    // Movement intelligence — load the four stored pattern profiles and
+    // build a patterns block plus a few deterministic cross-movement
+    // observations the brief can lead with. Best-effort; absent patterns just
+    // read "no data yet".
+    let movementPatternsBlock = "Not enough history yet.";
+    const crossMovementObservations = [];
+    try {
+      const mp = await loadMovementPatterns(redis, householdId);
+      movementPatternsBlock = [
+        `Home: ${summarizeMovementPatterns("home", mp.home)}`,
+        `Work: ${summarizeMovementPatterns("work", mp.work)}`,
+        `Family: ${summarizeMovementPatterns("family", mp.family)}`,
+        `Wellness: ${summarizeMovementPatterns("wellness", mp.wellness)}`,
+      ].join("\n");
+
+      const isTodayEta = (s) => {
+        const d = parseDateLoose(s.eta);
+        return d && dayOffsetFromToday(d) === 0;
+      };
+      const activeOf = (mv) => activeSignals.filter((s) => signalMovement(s) === mv);
+      const workActive = activeOf("work");
+      const familyToday = activeOf("family").filter(isTodayEta);
+      const homeServiceToday = activeOf("home").filter((s) => (s.type === "service" || s.status === "Out for Delivery") && isTodayEta(s));
+      const travelActive = activeSignals.filter((s) => (s.type || "").toLowerCase() === "travel");
+      const workHeavy = workActive.length >= 3 || synthesisState.signalLoad === "heavy";
+      const poorSleep = synthesisState.healthState === "poor" || synthesisState.healthState === "low";
+
+      // work-heavy day + a family event today
+      if (workHeavy && familyToday.length) {
+        crossMovementObservations.push(`Cross-movement conflict: a work-heavy day collides with a family event today (${familyToday[0].description || "family signal"}) — flag the squeeze.`);
+      }
+      // poor recovery + heavy work day
+      if (poorSleep && workHeavy) {
+        crossMovementObservations.push(`Cross-movement health: recovery is low going into a heavy work day — worth one gentle note about pacing.`);
+      }
+      // travel in motion + a home service that needs someone present today
+      if (travelActive.length && homeServiceToday.length) {
+        crossMovementObservations.push(`Cross-movement timing: travel is in motion while a home service (${homeServiceToday[0].description || "service"}) needs someone present today — check coverage.`);
+      }
+    } catch (err) {
+      console.warn("[brief] movement intelligence failed:", err?.message || err);
+    }
+
     const householdStateBlock = [
       `HOUSEHOLD STATE TODAY:`,
       `Signal load: ${synthesisState.signalLoad}`,
@@ -4774,6 +4818,12 @@ These are tone/vocabulary cues — adapt them naturally, do not paste them verba
         `TODAY'S RHYTHM: This ${todayWeekday}, The Conductor leads with ${MOVEMENT_LABELS[rhythmPillar] || "The Home Movement"}. When that movement has any live signals, foreground them at the open — e.g. "This ${todayWeekday}, The Conductor leads with ${MOVEMENT_LABELS[rhythmPillar] || "The Home Movement"}." Adapt naturally; if that movement is empty today, lead with whatever is most present.`,
         ``,
       ] : []),
+      `MOVEMENT PATTERNS FOR THIS HOUSEHOLD (learned from history — use to inform, never recite):`,
+      movementPatternsBlock,
+      ``,
+      `CROSS-MOVEMENT INSIGHTS (look across the four movements for conflicts and connections; surface the single most actionable cross-movement observation when one is present, naturally and specifically):`,
+      crossMovementObservations.length ? crossMovementObservations.join("\n") : "None detected — only surface a cross-movement insight if you genuinely see one.",
+      ``,
       `TRAVEL PREP (within 72 hours — when this layer is non-empty, lead with it):`,
       travelPrep ? formatTravelPrepBlock() : "None",
       ``,

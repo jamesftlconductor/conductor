@@ -9,6 +9,7 @@ import { writeCommonsRecord, logAutoResolvedMemory } from "./commons.js";
 import { resolveSignal } from "./resolve-signal.js";
 import { extractSignalLocation } from "./places.js";
 import { matchTripWindow } from "./trip-threads.js";
+import { signalMovement } from "./movements.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -32,28 +33,6 @@ async function persistSignalSnippet(signalId, bodyText) {
   } catch (err) {
     console.warn("[import] snippet persist failed:", err?.message || err);
   }
-}
-
-// Movement attribution — tags a signal with the life "movement" it belongs
-// to (home / work / family / wellness), mirroring the brief's Movement
-// vocabulary. Stored on the signal so brief.js and the movement screens can
-// group without recomputing. Rules (first match wins):
-//   wellness: health/medical, or a doctor-context appointment
-//   work:     financial, or a work-tagged calendar block
-//   family:   attributed to a crew member, or a milestone/reminder (b'day/anniv)
-//   home:     everything else (default)
-function signalMovement(signal) {
-  const t = (signal?.type || "").toLowerCase();
-  const d = (signal?.description || "").toLowerCase();
-  if (t === "health" || t === "medical") return "wellness";
-  if (
-    t === "appointment" &&
-    /\b(doctor|dr\.?|clinic|dentist|dental|pediatric|pediatrician|physical|medical|checkup|check-up|optometr|dermatolog|cardiolog)\b/.test(d)
-  ) return "wellness";
-  if (t === "financial" || t === "work" || signal?.workConflictCheck === true) return "work";
-  if (signal?.crewMemberId) return "family";
-  if (t === "milestone" || t === "reminder") return "family";
-  return "home";
 }
 
 // Stable content key for a parsed signal. Mirrors the dedup logic used by the

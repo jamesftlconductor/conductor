@@ -8,6 +8,7 @@ import { runOutlookImport } from "./outlook-import.js";
 import { runImapImport } from "./imap-import.js";
 import { runNextdoorScan } from "./nextdoor-scan.js";
 import { synthesizeTripThreads } from "./trip-threads.js";
+import { computeMovementPatterns } from "./movements.js";
 import { renewGmailWatchIfDue } from "./gmail-watch.js";
 
 const qstash = process.env.QSTASH_TOKEN
@@ -453,6 +454,13 @@ export default async function handler(req, res) {
         await generateAnticipatedSignals(redis, householdId);
       } catch (err) {
         errors.push({ stage: "anticipated", householdId, message: err.message });
+      }
+      // Movement intelligence — recompute the four per-movement pattern
+      // profiles now that signals/calendar/health are fresh this cycle.
+      try {
+        await computeMovementPatterns(redis, householdId, members);
+      } catch (err) {
+        errors.push({ stage: "movement-patterns", householdId, message: err.message });
       }
       // Eventbrite local-events cache refresh. Credential-gated; no-ops
       // when EVENTBRITE_API_KEY isn't set. Only attempts when the
