@@ -1472,12 +1472,10 @@ export default async function handler(req, res) {
       .slice(0, 20);
 
     // Conductor access level (default 'essentials'). At 'full' the Conductor
-    // may reference actual email-derived content when answering questions.
-    // NOTE: raw email bodies are not persisted anywhere — emails are fetched
-    // transiently during import. The richest email content we retain lives on
-    // the signals themselves (sender, date, description, notes), so that is
-    // what the 'full' block exposes. True full-body access would require a new
-    // snippet-persistence step in the import pipeline.
+    // may reference actual email content when answering questions, pulled from
+    // the capped per-signal snippets api/import.js persists at signal:{id}:
+    // snippet (30-day TTL). Only signals imported since that persistence
+    // shipped have a snippet, so older signals simply contribute none.
     let accessLevel = "essentials";
     try {
       const prefsRaw = await redis.get(`user:${userId}:preferences`);
@@ -1489,22 +1487,23 @@ export default async function handler(req, res) {
 
     let emailContext = "";
     if (accessLevel === "full") {
-      const fmtDate = (ms) => {
-        if (!ms || isNaN(ms)) return null;
-        return new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric" });
-      };
-      const emailDerived = allSignals
-        .filter((s) => s.sender && (s.notes || s.description))
+      // Load snippets for the 5 most recent signals.
+      const recentForSnippets = [...allSignals]
         .sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0))
-        .slice(0, 15)
-        .map((s) => {
-          const when = fmtDate(Number(s.id) || Date.parse(s.lastUpdate || ""));
-          return `- From ${s.sender}${when ? ` (${when})` : ""}: ${s.description || ""}${s.notes ? ` — ${s.notes}` : ""}`;
-        });
-      if (emailDerived.length) {
+        .slice(0, 5);
+      const snippetLines = [];
+      for (const sig of recentForSnippets) {
+        try {
+          const snip = await redis.get(`signal:${sig.id}:snippet`);
+          if (snip && typeof snip === "string" && snip.trim()) {
+            snippetLines.push(`${sig.description || "Signal"}: ${snip.trim()}`);
+          }
+        } catch { /* skip this snippet */ }
+      }
+      if (snippetLines.length) {
         emailContext =
-          `\n\nEMAIL CONTENT (recent email-derived detail — you may quote or reference these when answering, e.g. "in the email from Air Pros they mentioned…"):\n` +
-          emailDerived.join("\n");
+          `\n\nEmail context for recent signals (you may quote or reference these directly — e.g. "in the email from Air Pros they mentioned the filter was last replaced in 2024"):\n` +
+          snippetLines.join("\n");
       }
     }
 

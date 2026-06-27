@@ -15,6 +15,25 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
+// Persist a capped, HTML-stripped snippet of the source email body so the
+// Conductor can quote actual email context for 'full' access-level users
+// (api/ask.js reads signal:{id}:snippet). 30-day TTL keeps the store bounded
+// and self-cleaning. Best-effort: never blocks or fails the import.
+async function persistSignalSnippet(signalId, bodyText) {
+  if (signalId == null) return;
+  const snippet = String(bodyText || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+  if (!snippet) return;
+  try {
+    await redis.set(`signal:${signalId}:snippet`, snippet, { ex: 30 * 24 * 60 * 60 });
+  } catch (err) {
+    console.warn("[import] snippet persist failed:", err?.message || err);
+  }
+}
+
 // Stable content key for a parsed signal. Mirrors the dedup logic used by the
 // one-shot cleanup so the messageId-less legacy entries collapse against new
 // imports of the same email.
@@ -1581,6 +1600,7 @@ export async function runImport(userId, customQuery = null) {
         for (const a of anomalies) {
           const signal = buildFinancialSignal(a, tx);
           await redis.lpush(`household:${householdId}:signals`, JSON.stringify(signal));
+          await persistSignalSnippet(signal.id, emailText);
           console.log(
             `[financial] signal ${signal.id} ${a.kind}: ${signal.description}`
           );
@@ -1783,6 +1803,11 @@ ${emailText.substring(0, 1000)}`,
       signal.lastUpdate = new Date().toLocaleString();
       signal.userId = userId;
       signal.source = "import";
+
+      // Capped email-body snippet for full-access email context. Keyed by the
+      // freshly-assigned signal id; if this signal later merges into an
+      // existing one the orphan key simply expires under its 30-day TTL.
+      await persistSignalSnippet(signal.id, emailText);
 
       // Semantic dedup against the last 100 stored signals. Picks up
       // cases where the messageId differs and the content fingerprint
