@@ -10,6 +10,26 @@ continuing the build from scratch, start here.
 
 ---
 
+## Product Thesis
+
+Conductor is the intelligence layer for the four pillars of family life:
+House, Work, Kids, Health. The brief leads with what matters most to each
+household. The product becomes indispensable by being genuinely useful
+across all four pillars every single day.
+
+### Pillar → signal mapping
+
+Each signal belongs to a pillar; the household's ranked `householdPillars`
+preference determines which pillar's signals surface first and get the most
+prose attention in the brief.
+
+- **House:** maintenance, service, delivery, deadline, vault
+- **Work:** calendar work blocks, work email, financial, conflicts
+- **Kids:** school, schedule, appointment, milestone, activity
+- **Health:** health type, medical, sleep, fitness
+
+---
+
 ## 1. What Conductor Is
 
 ### Vision
