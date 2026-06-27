@@ -5936,11 +5936,152 @@ Return only the offer line.`;
       }
     }
 
+    // ---- Work-calendar nudge ----
+    // Households past 3 days of use that never connected a work calendar
+    // get a one-time nudge flag; the mobile app renders the connect prompt.
+    // Best-effort: any failure leaves the flag off.
+    let workCalendarNudge = false;
+    try {
+      const hasWorkCalendar = !!(
+        preferences.workCalendarName && String(preferences.workCalendarName).trim()
+      );
+      if (!hasWorkCalendar) {
+        const rawCreated = await redis.get(`household:${householdId}:createdAt`);
+        let createdMs = rawCreated
+          ? (typeof rawCreated === "string" ? Date.parse(rawCreated) : Number(rawCreated))
+          : null;
+        // Backfill: the createdAt key was historically never written, so
+        // pre-existing households have none. Derive a real "first seen"
+        // from the oldest signal (ids are creation-time epoch ms) or the
+        // oldest memory action, persist it once, and use it. This also
+        // repairs the NYE retrospective that reads the same key.
+        if (!createdMs || isNaN(createdMs)) {
+          let earliest = Infinity;
+          for (const s of allSignals || []) {
+            const t = Number(s.createdAt || s.id);
+            if (t && !isNaN(t) && t < earliest) earliest = t;
+          }
+          for (const r of rawMemoryEntries || []) {
+            const e = safeJson(r);
+            const t = Date.parse(e?.actionAt || "");
+            if (!isNaN(t) && t < earliest) earliest = t;
+          }
+          if (earliest !== Infinity) {
+            createdMs = earliest;
+            try { await redis.set(`household:${householdId}:createdAt`, earliest); }
+            catch { /* best-effort persist */ }
+          }
+        }
+        if (createdMs && !isNaN(createdMs) && Date.now() - createdMs >= 3 * DAY_MS) {
+          workCalendarNudge = true;
+        }
+      }
+    } catch (err) {
+      console.warn("[brief] workCalendarNudge check failed:", err?.message || err);
+    }
+
+    // ---- Proactive quiet-day intelligence ----
+    // On genuinely quiet days (load clear/light AND fewer than 3 active
+    // signals), surface ONE useful thing the Conductor knows, picked in
+    // strict priority order: (a) an upcoming regional seasonal event,
+    // (b) an observed household pattern, (c) a vault item renewing within
+    // 30 days, (d) the next household interview question. Mobile renders it
+    // below The Pulse. Best-effort throughout — each source is independently
+    // guarded so one failure can't sink the rest, and the whole block can
+    // only ever ADD an optional field.
+    let quietDayIntelligence = null;
+    try {
+      const load = synthesisState.signalLoad;
+      const isQuiet = (load === "clear" || load === "light") && activeSignals.length < 3;
+      if (isQuiet) {
+        const nowMs = Date.now();
+
+        // (a) Seasonal / regional event — soonest upcoming within its window.
+        if (!quietDayIntelligence) {
+          try {
+            const region = householdLocation?.marketRegion || "south_florida";
+            const upcoming = getAnnualEvents(region, new Date().toISOString())
+              .filter((e) => e.daysUntil >= 0)
+              .sort((a, b) => a.daysUntil - b.daysUntil);
+            const e = upcoming[0];
+            if (e) {
+              const when =
+                e.daysUntil === 0 ? "is today"
+                : e.daysUntil === 1 ? "is tomorrow"
+                : `is ${e.daysUntil} days out`;
+              const note = e.note ? ` — ${e.note}.` : ".";
+              quietDayIntelligence = { type: "seasonal_event", content: `${e.name} ${when}${note}` };
+            }
+          } catch { /* skip this source */ }
+        }
+
+        // (b) Household pattern — resolutions logged this calendar month.
+        if (!quietDayIntelligence) {
+          try {
+            const entries = (rawMemoryEntries || []).map(safeJson).filter(Boolean);
+            const d0 = new Date();
+            const monthStart = new Date(d0.getFullYear(), d0.getMonth(), 1).getTime();
+            const resolvedThisMonth = entries.filter((e) => {
+              if (e.action !== "resolved") return false;
+              const ms = Date.parse(e.actionAt || "");
+              return !isNaN(ms) && ms >= monthStart;
+            });
+            if (resolvedThisMonth.length >= 3) {
+              const byType = new Map();
+              for (const e of resolvedThisMonth) {
+                const t = (e.type || "").toLowerCase();
+                if (t) byType.set(t, (byType.get(t) || 0) + 1);
+              }
+              const top = [...byType.entries()].sort((a, b) => b[1] - a[1])[0];
+              let content;
+              if (top && top[1] >= 3) {
+                content = `You've resolved ${top[1]} ${top[0]} signal${top[1] > 1 ? "s" : ""} this month${top[0] === "service" ? " — your home has been active lately." : "."}`;
+              } else {
+                content = `You've cleared ${resolvedThisMonth.length} signals this month. The household's been moving steadily.`;
+              }
+              quietDayIntelligence = { type: "household_pattern", content };
+            }
+          } catch { /* skip this source */ }
+        }
+
+        // (c) Vault item renewing within the next 30 days — soonest first.
+        if (!quietDayIntelligence) {
+          try {
+            const renewing = (allDeadlines || [])
+              .map((v) => ({ v, ms: parseDateLoose(v.eta)?.getTime() }))
+              .filter((x) => x.ms && x.ms >= nowMs && x.ms - nowMs <= 30 * DAY_MS)
+              .sort((a, b) => a.ms - b.ms);
+            const top = renewing[0];
+            if (top) {
+              const days = Math.max(0, Math.round((top.ms - nowMs) / DAY_MS));
+              const when = days === 0 ? "today" : days === 1 ? "tomorrow" : `in ${days} days`;
+              const what = top.v.description || top.v.name || "A renewal";
+              quietDayIntelligence = {
+                type: "vault_renewal",
+                content: `${what} renews ${when} — a quiet day is a good time to handle it.`,
+              };
+            }
+          } catch { /* skip this source */ }
+        }
+
+        // (d) Next household interview question (already picked above; reuse
+        // the value rather than calling pickHouseholdInterview again, which
+        // would consume a second question via its SADD side effect).
+        if (!quietDayIntelligence && householdInterview?.question) {
+          quietDayIntelligence = { type: "interview_question", content: householdInterview.question };
+        }
+      }
+    } catch (err) {
+      console.warn("[brief] quietDayIntelligence build failed:", err?.message || err);
+    }
+
     const briefResponse = {
       brief: finalBrief,
       spokenSummary,
       householdName,
       quietDay,
+      workCalendarNudge,
+      quietDayIntelligence,
       segments,
       transparency,
       theRead,

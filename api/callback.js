@@ -161,6 +161,12 @@ export default async function handler(req, res) {
         // path, which already has a defensive WRONGTYPE recovery.
         await redis.sadd(`household:${newHouseholdId}:members`, userId);
         await redis.set(`household:${newHouseholdId}:firstRun`, "true");
+        // Onboarding timestamp — drives "days of use" gates (work-calendar
+        // nudge, NYE retrospective). Stored as epoch ms. Previously never
+        // written, so those gates silently never fired; brief.js now also
+        // backfills this key for pre-existing households from their oldest
+        // signal/memory record.
+        await redis.set(`household:${newHouseholdId}:createdAt`, Date.now());
         await redis.set(`household:${newHouseholdId}:name`, newHouseholdId);
         resolvedHouseholdId = newHouseholdId;
         mode = "create";
