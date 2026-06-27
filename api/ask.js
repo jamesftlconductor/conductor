@@ -10,6 +10,8 @@ import { Redis } from "@upstash/redis";
 import { loadHouseholdCalendar } from "./calendar-loader.js";
 import { loadHouseholdLocation, LOCATION_FALLBACK } from "./location.js";
 import { getMarketRates, renderRatesForPrompt } from "./pricing.js";
+import { loadMovementPatterns, summarizeMovementPatterns } from "./movements.js";
+import { loadConductorLog } from "./conductor-log.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -1439,7 +1441,7 @@ export default async function handler(req, res) {
     // a hard failure.
     const [
       rawSignals, rawVault, rawCrew, rawHealth, weather, calendarEvents,
-      rawMemory, rawProviders, rawInventory,
+      rawMemory, rawProviders, rawInventory, conductorLog, movementPatterns,
     ] = await Promise.all([
       redis.lrange(`household:${householdId}:signals`, 0, -1),
       redis.lrange(`household:${householdId}:vault`, 0, -1),
@@ -1450,6 +1452,10 @@ export default async function handler(req, res) {
       redis.lrange(`household:${householdId}:memory`, 0, 9),
       redis.hgetall(`household:${householdId}:providers`),
       redis.get(`household:${householdId}:inventory`),
+      // Conductor's recent memory — the last 15 rolling-log entries.
+      loadConductorLog(redis, householdId, 15),
+      // Movement pattern profiles for full household context.
+      loadMovementPatterns(redis, householdId),
     ]);
 
     const allSignals = (rawSignals || []).map(safeJson).filter(Boolean);
@@ -1565,6 +1571,19 @@ export default async function handler(req, res) {
       ``,
       `HOME INVENTORY:`,
       formatInventoryBlock(inventory),
+      ``,
+      `MOVEMENT PATTERNS (learned per movement):`,
+      [
+        `Home: ${summarizeMovementPatterns("home", movementPatterns?.home)}`,
+        `Work: ${summarizeMovementPatterns("work", movementPatterns?.work)}`,
+        `Family: ${summarizeMovementPatterns("family", movementPatterns?.family)}`,
+        `Wellness: ${summarizeMovementPatterns("wellness", movementPatterns?.wellness)}`,
+      ].join("\n"),
+      ``,
+      `CONDUCTOR LOG (your recent observations + proactive moments, newest first):`,
+      Array.isArray(conductorLog) && conductorLog.length
+        ? conductorLog.map((e) => `- ${e.text}`).join("\n")
+        : "Nothing logged yet.",
     ].join("\n") + emailContext;
 
     const ratesBlock = renderRatesForPrompt(householdLocation.marketRegion);
@@ -1602,7 +1621,7 @@ export default async function handler(req, res) {
       ? `\n\nSCREEN CONTEXT: ${SCREEN_BIAS[trimmedContext]}`
       : "";
 
-    const systemPrompt = `You are The Conductor, the voice and intelligence of the Conductor household platform. You have complete awareness of this household's signals, deadlines, health, weather, crew, and history. Answer questions directly from what you know. Never make things up. Never mention Claude or AI. Speak as The Conductor in first person: "I can see that..." or "Based on what I'm watching..." or "The Conductor has..." When introducing yourself say "I'm The Conductor — ..." (not "I'm Conductor"). Conductor is the platform brand; The Conductor is the presence you embody. Maximum 3 sentences. Plain text only.${screenBias}${langDirective}
+    const systemPrompt = `You are The Conductor — the household's quietly brilliant majordomo, in the spirit of a Jarvis: composed, anticipatory, and unfailingly attentive. You hold complete awareness of this household's signals, deadlines, calendar, health, weather, crew, home, and history — and you read between them. You speak with refined economy and a light, dry wit; never servile, never glib. You anticipate what the household will need before they ask and say the one thing that matters — candid when something needs attention, calm when it doesn't. Answer directly from what you know; never invent, never pad with filler. Draw on the CONDUCTOR LOG (your recent observations) and MOVEMENT PATTERNS below for continuity, so you sound like you've been paying attention all along. Never mention Claude or AI. Speak in the first person as The Conductor ("I've been watching…", "If I may…", "Already handled."). When introducing yourself say "I'm The Conductor — …" (not "I'm Conductor"). Conductor is the platform brand; The Conductor is the presence you embody. Maximum 3 sentences. Plain text only.${screenBias}${langDirective}
 
 ${ratesBlock}
 

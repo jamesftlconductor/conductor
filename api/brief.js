@@ -6,6 +6,7 @@ import { loadNetworkContext } from "./network.js";
 import { isMaintenanceOfferReady } from "./maintenance.js";
 import { groupSignalsByTrip } from "./trip-threads.js";
 import { signalMovement, loadMovementPatterns, summarizeMovementPatterns } from "./movements.js";
+import { pickTopProactiveMoment } from "./proactive.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -4753,7 +4754,10 @@ ${isSingleMember
     // observations the brief can lead with. Best-effort; absent patterns just
     // read "no data yet".
     let movementPatternsBlock = "Not enough history yet.";
-    const crossMovementObservations = [];
+    // Structured cross-movement insights: { movements: [a,b], insight, urgency }.
+    // The most urgent one is returned to the app (below The Pulse on Ground);
+    // all of them feed the synthesis prompt.
+    const crossMovementInsights = [];
     try {
       const mp = await loadMovementPatterns(redis, householdId);
       movementPatternsBlock = [
@@ -4763,33 +4767,91 @@ ${isSingleMember
         `Wellness: ${summarizeMovementPatterns("wellness", mp.wellness)}`,
       ].join("\n");
 
-      const isTodayEta = (s) => {
-        const d = parseDateLoose(s.eta);
-        return d && dayOffsetFromToday(d) === 0;
-      };
+      const add = (movements, insight, urgency) => crossMovementInsights.push({ movements, insight, urgency });
+      const isTodayEta = (s) => { const d = parseDateLoose(s.eta); return d && dayOffsetFromToday(d) === 0; };
+      const withinDays = (s, n) => { const d = parseDateLoose(s.eta); if (!d) return false; const off = dayOffsetFromToday(d); return off >= 0 && off <= n; };
       const activeOf = (mv) => activeSignals.filter((s) => signalMovement(s) === mv);
+      const textOf = (s) => (s?.description || "a signal");
+
       const workActive = activeOf("work");
-      const familyToday = activeOf("family").filter(isTodayEta);
+      const familyActive = activeOf("family");
+      const wellnessActive = activeOf("wellness");
+      const familyToday = familyActive.filter(isTodayEta);
       const homeServiceToday = activeOf("home").filter((s) => (s.type === "service" || s.status === "Out for Delivery") && isTodayEta(s));
-      const travelActive = activeSignals.filter((s) => (s.type || "").toLowerCase() === "travel");
-      const workHeavy = workActive.length >= 3 || synthesisState.signalLoad === "heavy";
+      const travelActive = activeSignals.filter((s) => (s.type || "").toLowerCase() === "travel" && (!s.state || s.state === "active" || s.state === "incoming"));
       const poorSleep = synthesisState.healthState === "poor" || synthesisState.healthState === "low";
 
-      // work-heavy day + a family event today
-      if (workHeavy && familyToday.length) {
-        crossMovementObservations.push(`Cross-movement conflict: a work-heavy day collides with a family event today (${familyToday[0].description || "family signal"}) — flag the squeeze.`);
+      // Work blocks (from the user's calendar) bucketed by day-offset.
+      const isWorkBlock = (e) => e && (!userId || e.userId === userId) && (e.type === "work" || e.workConflictCheck === true);
+      const workBlocks = (calendarEvents || []).filter(isWorkBlock).map((e) => ({ e, d: parseDateLoose(e.start) })).filter((x) => x.d);
+      const workBlocksOn = (off) => workBlocks.filter((x) => dayOffsetFromToday(x.d) === off);
+      const dayName = (off) => { const d = new Date(); d.setDate(d.getDate() + off); return d.toLocaleDateString("en-US", { weekday: "long" }); };
+
+      // Pending home tasks: home-movement service/deadline signals + vault deadlines.
+      const homePending = [
+        ...activeOf("home").filter((s) => s.type === "service" || s.type === "deadline"),
+        ...((allDeadlines || []).filter((v) => v && !v.handled)),
+      ];
+
+      // ---- HOME <-> WORK ----
+      // A clear work day in the next week + a pending home task -> good window.
+      if (homePending.length) {
+        for (let off = 0; off <= 6; off++) {
+          if (workBlocks.length && workBlocksOn(off).length === 0) {
+            add(["home", "work"], `Your calendar is clear ${off === 0 ? "today" : dayName(off)} — a good window for ${textOf(homePending[0])}.`, "normal");
+            break;
+          }
+        }
       }
-      // poor recovery + heavy work day
-      if (poorSleep && workHeavy) {
-        crossMovementObservations.push(`Cross-movement health: recovery is low going into a heavy work day — worth one gentle note about pacing.`);
+      // Traveling -> home unattended.
+      if (travelActive.length) {
+        add(["home", "work"], `Travel is in motion (${textOf(travelActive[0])}) — home is unattended; worth confirming coverage for anything time-sensitive.`, "normal");
       }
-      // travel in motion + a home service that needs someone present today
-      if (travelActive.length && homeServiceToday.length) {
-        crossMovementObservations.push(`Cross-movement timing: travel is in motion while a home service (${homeServiceToday[0].description || "service"}) needs someone present today — check coverage.`);
+
+      // ---- WORK <-> FAMILY ----
+      // A work block today AND a family event today -> squeeze.
+      if (workBlocksOn(0).length && familyToday.length) {
+        const wt = workBlocksOn(0).find((x) => x.e.workTitle)?.e?.workTitle;
+        add(["work", "family"], `Today holds ${wt ? `your ${wt}` : "your work schedule"} and ${textOf(familyToday[0])} — tight back-to-back.`, "high");
+      }
+      // Travel overlapping a school/family event in the next few days.
+      const familySoon = familyActive.filter((s) => withinDays(s, 3));
+      if (travelActive.length && familySoon.length) {
+        add(["work", "family"], `${textOf(travelActive[0])} overlaps ${textOf(familySoon[0])} — check who covers it.`, "high");
+      }
+
+      // ---- FAMILY <-> WELLNESS ----
+      // An active medical/wellness signal -> recovery note.
+      if (wellnessActive.length) {
+        add(["family", "wellness"], `A medical signal is active (${textOf(wellnessActive[0])}) — keep an eye on sleep and recovery this week.`, "normal");
+      }
+      // Sleep running short lately (from wellness patterns or live state).
+      const sleepVals = mp.wellness?.sleepByWeekday ? Object.values(mp.wellness.sleepByWeekday) : [];
+      const avgSleep = sleepVals.length ? sleepVals.reduce((a, b) => a + b, 0) / sleepVals.length : null;
+      if ((avgSleep != null && avgSleep < 6.5) || poorSleep) {
+        add(["family", "wellness"], `Sleep has been running short${avgSleep != null ? ` (avg ~${avgSleep.toFixed(1)}h)` : ""} — worth noting before piling on the week.`, "low");
+      }
+
+      // ---- WELLNESS <-> HOME ----
+      // Medication renewal + insurance renewal both near -> connect them.
+      const medDue = homePending.find((v) => /\b(prescription|medication|refill|pharmacy|rx)\b/i.test(`${v.description || ""}`));
+      const insuranceDue = (allDeadlines || []).find((v) => v && !v.handled && /\binsurance\b/i.test(`${v.description || ""}`) && (() => { const d = parseDateLoose(v.eta); return d && dayOffsetFromToday(d) >= 0 && dayOffsetFromToday(d) <= 30; })());
+      if (medDue && insuranceDue) {
+        add(["wellness", "home"], `A medication refill and an insurance renewal are both coming up — worth handling in one sitting.`, "normal");
+      }
+      // A wellness appointment colliding with a home service the same day.
+      const wellnessToday = wellnessActive.filter(isTodayEta);
+      if (wellnessToday.length && homeServiceToday.length) {
+        add(["wellness", "home"], `A health appointment (${textOf(wellnessToday[0])}) and a home service (${textOf(homeServiceToday[0])}) both land today — they may collide.`, "high");
       }
     } catch (err) {
       console.warn("[brief] movement intelligence failed:", err?.message || err);
     }
+
+    // Order by urgency for the prompt + response (most urgent first).
+    const URGENCY_RANK = { high: 0, normal: 1, low: 2 };
+    crossMovementInsights.sort((a, b) => (URGENCY_RANK[a.urgency] ?? 1) - (URGENCY_RANK[b.urgency] ?? 1));
+    const crossMovementObservations = crossMovementInsights.map((c) => `[${c.urgency}] ${c.movements.join(" ↔ ")}: ${c.insight}`);
 
     const householdStateBlock = [
       `HOUSEHOLD STATE TODAY:`,
@@ -6172,6 +6234,13 @@ Return only the offer line.`;
       movementCompleteness = safeJson(rawMc) || null;
     } catch { /* best-effort */ }
 
+    // Most relevant proactive moment — surfaced in the response so the app can
+    // open The Conductor chat with it.
+    let proactiveMoment = null;
+    try {
+      proactiveMoment = await pickTopProactiveMoment(redis, householdId);
+    } catch { /* best-effort */ }
+
     // One-time exhaustive-sweep reveal: surface the onboarding finds as a
     // moment ("The Conductor found: …"), then mark shown so it appears once.
     let sweepReveal = null;
@@ -6380,6 +6449,8 @@ Return only the offer line.`;
       workCalendarNudge,
       quietDayIntelligence,
       movementCompleteness,
+      proactiveMoment,
+      crossMovementInsights,
       segments,
       transparency,
       theRead,

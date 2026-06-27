@@ -9,6 +9,7 @@ import { runImapImport } from "./imap-import.js";
 import { runNextdoorScan } from "./nextdoor-scan.js";
 import { synthesizeTripThreads } from "./trip-threads.js";
 import { computeMovementPatterns } from "./movements.js";
+import { generateProactiveMoments } from "./proactive.js";
 import { renewGmailWatchIfDue } from "./gmail-watch.js";
 
 const qstash = process.env.QSTASH_TOKEN
@@ -461,6 +462,13 @@ export default async function handler(req, res) {
         await computeMovementPatterns(redis, householdId, members);
       } catch (err) {
         errors.push({ stage: "movement-patterns", householdId, message: err.message });
+      }
+      // Proactive moments — detect pre-trip / stale-signal / cross-movement /
+      // weekly-milestone triggers and record any new ones (deduped).
+      try {
+        await generateProactiveMoments(redis, householdId, members);
+      } catch (err) {
+        errors.push({ stage: "proactive-moments", householdId, message: err.message });
       }
       // Eventbrite local-events cache refresh. Credential-gated; no-ops
       // when EVENTBRITE_API_KEY isn't set. Only attempts when the
