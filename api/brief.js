@@ -4768,81 +4768,73 @@ ${isSingleMember
       ].join("\n");
 
       const add = (movements, insight, urgency) => crossMovementInsights.push({ movements, insight, urgency });
-      const isTodayEta = (s) => { const d = parseDateLoose(s.eta); return d && dayOffsetFromToday(d) === 0; };
-      const withinDays = (s, n) => { const d = parseDateLoose(s.eta); if (!d) return false; const off = dayOffsetFromToday(d); return off >= 0 && off <= n; };
-      const activeOf = (mv) => activeSignals.filter((s) => signalMovement(s) === mv);
-      const textOf = (s) => (s?.description || "a signal");
+      const HR = 60 * 60 * 1000, HRS2 = 2 * HR;
+      const etaMs = (s) => { const t = Date.parse(s.eta || ""); return isNaN(t) ? null : t; };
+      const hasTime = (s) => /T\d|\d{1,2}:\d{2}/.test(String(s.eta || ""));
+      const isTodayMs = (ms) => ms && new Date(ms).toDateString() === new Date().toDateString();
+      const fmtTime = (ms) => { const d = new Date(ms); let h = d.getHours(); const m = d.getMinutes(); const ap = h < 12 ? "am" : "pm"; h = h % 12; if (h === 0) h = 12; return m === 0 ? `${h}${ap}` : `${h}:${String(m).padStart(2, "0")}${ap}`; };
 
-      const workActive = activeOf("work");
-      const familyActive = activeOf("family");
-      const wellnessActive = activeOf("wellness");
-      const familyToday = familyActive.filter(isTodayEta);
-      const homeServiceToday = activeOf("home").filter((s) => (s.type === "service" || s.status === "Out for Delivery") && isTodayEta(s));
-      const travelActive = activeSignals.filter((s) => (s.type || "").toLowerCase() === "travel" && (!s.state || s.state === "active" || s.state === "incoming"));
-      const poorSleep = synthesisState.healthState === "poor" || synthesisState.healthState === "low";
-
-      // Work blocks (from the user's calendar) bucketed by day-offset.
+      // Today's work calendar blocks (the requesting user's), with real times.
       const isWorkBlock = (e) => e && (!userId || e.userId === userId) && (e.type === "work" || e.workConflictCheck === true);
-      const workBlocks = (calendarEvents || []).filter(isWorkBlock).map((e) => ({ e, d: parseDateLoose(e.start) })).filter((x) => x.d);
-      const workBlocksOn = (off) => workBlocks.filter((x) => dayOffsetFromToday(x.d) === off);
-      const dayName = (off) => { const d = new Date(); d.setDate(d.getDate() + off); return d.toLocaleDateString("en-US", { weekday: "long" }); };
+      const workBlocksToday = (calendarEvents || []).filter(isWorkBlock).map((e) => {
+        const s = parseDateLoose(e.start)?.getTime();
+        const en = parseDateLoose(e.end)?.getTime() || (s ? s + HR : null);
+        return s && isTodayMs(s) ? { s, en, title: e.workTitle || null } : null;
+      }).filter(Boolean);
 
-      // Pending home tasks: home-movement service/deadline signals + vault deadlines.
-      const homePending = [
-        ...activeOf("home").filter((s) => s.type === "service" || s.type === "deadline"),
-        ...((allDeadlines || []).filter((v) => v && !v.handled)),
-      ];
-
-      // ---- HOME <-> WORK ----
-      // A clear work day in the next week + a pending home task -> good window.
-      if (homePending.length) {
-        for (let off = 0; off <= 6; off++) {
-          if (workBlocks.length && workBlocksOn(off).length === 0) {
-            add(["home", "work"], `Your calendar is clear ${off === 0 ? "today" : dayName(off)} — a good window for ${textOf(homePending[0])}.`, "normal");
-            break;
+      // ---- WORK <-> FAMILY: a work block within 2h of a crew member's
+      //      timed signal today (appointment / event / milestone). ----
+      const familyTimed = activeSignals.filter((s) => {
+        const fm = signalMovement(s) === "family" || s.crewMemberId || ["appointment", "milestone", "school", "schedule"].includes((s.type || "").toLowerCase());
+        const ms = etaMs(s);
+        return fm && ms && isTodayMs(ms) && hasTime(s);
+      }).map((s) => ({ s, ms: etaMs(s) }));
+      let wfFlagged = false;
+      for (const wb of workBlocksToday) {
+        if (wfFlagged) break;
+        for (const f of familyTimed) {
+          if (f.ms >= wb.s - HRS2 && f.ms <= wb.en + HRS2) {
+            add(["work", "family"], `Your ${wb.title ? `"${wb.title}"` : "work block"} at ${fmtTime(wb.s)} overlaps with ${f.s.description || "a family event"} at ${fmtTime(f.ms)}.`, "high");
+            wfFlagged = true; break;
           }
         }
       }
-      // Traveling -> home unattended.
+
+      // ---- HOME <-> WORK: a service signal with a scheduled time today that
+      //      collides with a work block. ----
+      const serviceTimed = activeSignals.filter((s) => {
+        const home = signalMovement(s) === "home";
+        const svc = s.type === "service" || s.status === "Out for Delivery";
+        const ms = etaMs(s);
+        return home && svc && ms && isTodayMs(ms) && hasTime(s);
+      }).map((s) => ({ s, ms: etaMs(s) }));
+      let hwFlagged = false;
+      for (const sv of serviceTimed) {
+        if (hwFlagged) break;
+        for (const wb of workBlocksToday) {
+          if (wb.s <= sv.ms + HR && wb.en >= sv.ms - HR) {
+            add(["home", "work"], `${sv.s.description || "A home service"} at ${fmtTime(sv.ms)} overlaps your work block at ${fmtTime(wb.s)} — you may not be free for it.`, "high");
+            hwFlagged = true; break;
+          }
+        }
+      }
+
+      // ---- WELLNESS <-> WORK: HRV >15% below 7-day baseline + a heavy day. ----
+      const hrvCur = healthContext?.hrv?.current;
+      const hrvBase = healthContext?.hrv?.baseline7d;
+      if (hrvCur != null && hrvBase && hrvCur < hrvBase * 0.85 && workBlocksToday.length >= 3) {
+        add(["wellness", "work"], `Your readiness is low today (HRV ${hrvCur} vs baseline ${hrvBase}) and your schedule is heavy — ${workBlocksToday.length} meetings. Pace where you can.`, "high");
+      }
+
+      // ---- Softer extras (lower urgency) ----
+      const travelActive = activeSignals.filter((s) => (s.type || "").toLowerCase() === "travel" && (!s.state || s.state === "active" || s.state === "incoming"));
       if (travelActive.length) {
-        add(["home", "work"], `Travel is in motion (${textOf(travelActive[0])}) — home is unattended; worth confirming coverage for anything time-sensitive.`, "normal");
+        add(["home", "work"], `Travel is in motion (${travelActive[0].description || "a trip"}) — home is unattended; worth confirming coverage for anything time-sensitive.`, "normal");
       }
-
-      // ---- WORK <-> FAMILY ----
-      // A work block today AND a family event today -> squeeze.
-      if (workBlocksOn(0).length && familyToday.length) {
-        const wt = workBlocksOn(0).find((x) => x.e.workTitle)?.e?.workTitle;
-        add(["work", "family"], `Today holds ${wt ? `your ${wt}` : "your work schedule"} and ${textOf(familyToday[0])} — tight back-to-back.`, "high");
-      }
-      // Travel overlapping a school/family event in the next few days.
-      const familySoon = familyActive.filter((s) => withinDays(s, 3));
-      if (travelActive.length && familySoon.length) {
-        add(["work", "family"], `${textOf(travelActive[0])} overlaps ${textOf(familySoon[0])} — check who covers it.`, "high");
-      }
-
-      // ---- FAMILY <-> WELLNESS ----
-      // An active medical/wellness signal -> recovery note.
-      if (wellnessActive.length) {
-        add(["family", "wellness"], `A medical signal is active (${textOf(wellnessActive[0])}) — keep an eye on sleep and recovery this week.`, "normal");
-      }
-      // Sleep running short lately (from wellness patterns or live state).
-      const sleepVals = mp.wellness?.sleepByWeekday ? Object.values(mp.wellness.sleepByWeekday) : [];
-      const avgSleep = sleepVals.length ? sleepVals.reduce((a, b) => a + b, 0) / sleepVals.length : null;
-      if ((avgSleep != null && avgSleep < 6.5) || poorSleep) {
-        add(["family", "wellness"], `Sleep has been running short${avgSleep != null ? ` (avg ~${avgSleep.toFixed(1)}h)` : ""} — worth noting before piling on the week.`, "low");
-      }
-
-      // ---- WELLNESS <-> HOME ----
-      // Medication renewal + insurance renewal both near -> connect them.
-      const medDue = homePending.find((v) => /\b(prescription|medication|refill|pharmacy|rx)\b/i.test(`${v.description || ""}`));
-      const insuranceDue = (allDeadlines || []).find((v) => v && !v.handled && /\binsurance\b/i.test(`${v.description || ""}`) && (() => { const d = parseDateLoose(v.eta); return d && dayOffsetFromToday(d) >= 0 && dayOffsetFromToday(d) <= 30; })());
+      const medDue = (allDeadlines || []).find((v) => v && !v.handled && /\b(prescription|medication|refill|pharmacy|rx)\b/i.test(`${v.description || ""}`));
+      const insuranceDue = (allDeadlines || []).find((v) => { if (!v || v.handled || !/\binsurance\b/i.test(`${v.description || ""}`)) return false; const d = parseDateLoose(v.eta); return d && dayOffsetFromToday(d) >= 0 && dayOffsetFromToday(d) <= 30; });
       if (medDue && insuranceDue) {
         add(["wellness", "home"], `A medication refill and an insurance renewal are both coming up — worth handling in one sitting.`, "normal");
-      }
-      // A wellness appointment colliding with a home service the same day.
-      const wellnessToday = wellnessActive.filter(isTodayEta);
-      if (wellnessToday.length && homeServiceToday.length) {
-        add(["wellness", "home"], `A health appointment (${textOf(wellnessToday[0])}) and a home service (${textOf(homeServiceToday[0])}) both land today — they may collide.`, "high");
       }
     } catch (err) {
       console.warn("[brief] movement intelligence failed:", err?.message || err);

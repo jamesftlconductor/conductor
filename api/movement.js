@@ -12,6 +12,7 @@
 
 import { Redis } from "@upstash/redis";
 import { MOVEMENTS, signalMovement } from "./movements.js";
+import { loadHouseholdCalendar } from "./calendar-loader.js";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
@@ -92,6 +93,64 @@ Be specific to what's actually here. If the movement is quiet, say so plainly an
   }
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Movement-specific content for the mobile movement screens. Each movement
+// gets the data its screen renders; absent sources degrade to []/null.
+async function buildMovementContent(movement, householdId, userId, allSignals, movementSignals) {
+  const activeMv = movementSignals.filter(isActive).map(shapeSignal);
+  const now = Date.now();
+
+  if (movement === "home") {
+    const vault = ((await redis.lrange(`household:${householdId}:vault`, 0, -1).catch(() => [])) || []).map(parse).filter(Boolean);
+    const vaultRenewals = vault
+      .filter((v) => !v.handled && v.renewalDate)
+      .map((v) => ({ v, ms: Date.parse(v.renewalDate) }))
+      .filter((x) => !isNaN(x.ms) && x.ms - now <= 60 * DAY_MS)
+      .sort((a, b) => a.ms - b.ms)
+      .slice(0, 12)
+      .map((x) => ({ description: x.v.description || x.v.name || "Renewal", renewalDate: x.v.renewalDate, category: x.v.category || null }));
+    const inv = parse(await redis.get(`household:${householdId}:inventory`).catch(() => null));
+    const inventory = inv && typeof inv === "object" ? (Array.isArray(inv) ? inv : (inv.items || Object.values(inv).filter((x) => x && typeof x === "object").slice(0, 20))) : [];
+    return { activeSignals: activeMv, vaultRenewals, inventory };
+  }
+
+  if (movement === "work") {
+    let calendar = [];
+    try { const c = await loadHouseholdCalendar(redis, householdId); calendar = Array.isArray(c) ? c : []; } catch { /* none */ }
+    const isWork = (e) => e && (!userId || e.userId === userId) && (e.type === "work" || e.workConflictCheck === true);
+    const today = new Date().toDateString();
+    const workBlocksToday = calendar.filter((e) => { if (!isWork(e)) return false; const t = Date.parse(e.start || ""); return !isNaN(t) && new Date(t).toDateString() === today; })
+      .map((e) => ({ start: e.start, end: e.end, title: e.workTitle || null }));
+    const financialSignals = allSignals.filter((s) => isActive(s) && (s.type || "").toLowerCase() === "financial").map(shapeSignal);
+    const conflicts = allSignals.filter((s) => isActive(s) && (s.type || "").toLowerCase() === "work_calendar_conflict").map(shapeSignal);
+    return { activeSignals: activeMv, workBlocksToday, financialSignals, conflicts };
+  }
+
+  if (movement === "family") {
+    const crewParsed = parse(await redis.get(`household:${householdId}:crew`).catch(() => null));
+    const crew = Array.isArray(crewParsed) ? crewParsed : (Array.isArray(crewParsed?.members) ? crewParsed.members : []);
+    const daysUntil = (raw) => { if (!raw) return null; const m = String(raw).match(/(\d{1,2})-(\d{1,2})/); if (!m) return null; const today = new Date(); const tU = Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()); let c = Date.UTC(today.getFullYear(), +m[1] - 1, +m[2]); if (c < tU) c = Date.UTC(today.getFullYear() + 1, +m[1] - 1, +m[2]); return Math.round((c - tU) / DAY_MS); };
+    const crewSummaries = crew.map((m) => ({
+      name: m.name || "Someone",
+      memberType: m.memberType || null,
+      activeSignals: movementSignals.filter((s) => isActive(s) && s.crewMemberId && String(s.crewMemberId).toLowerCase() === String(m.name || "").toLowerCase()).map(shapeSignal),
+      upcomingDates: ["birthday", "anniversary"].map((occ) => ({ occasion: occ, inDays: daysUntil(m[occ]) })).filter((o) => o.inDays != null && o.inDays <= 90),
+    }));
+    return { activeSignals: activeMv, crew: crewSummaries };
+  }
+
+  if (movement === "wellness") {
+    const health = parse(await redis.get(`user:${userId}:health`).catch(() => null));
+    const prefs = parse(await redis.get(`user:${userId}:preferences`).catch(() => null)) || {};
+    const medicalAppointments = movementSignals.filter((s) => isActive(s) && ((s.type || "").toLowerCase() === "appointment" || (s.type || "").toLowerCase() === "health")).map(shapeSignal);
+    const medicationReminders = Array.isArray(prefs.medicationReminders) ? prefs.medicationReminders : [];
+    return { activeSignals: activeMv, healthSnapshot: health || null, medicalAppointments, medicationReminders };
+  }
+
+  return { activeSignals: activeMv };
+}
+
 export default async function handler(req, res) {
   if (req.method !== "GET") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -120,6 +179,16 @@ export default async function handler(req, res) {
     const activeSignals = movementSignals.filter(isActive).map(shapeSignal);
     const parsedPatterns = parse(patterns) || {};
 
+    // Movement-specific screen content (userId enables per-user calendar/health).
+    const userId = req.query?.userId || null;
+    let content = {};
+    try {
+      content = await buildMovementContent(movement, householdId, userId, allSignals, movementSignals);
+    } catch (err) {
+      console.warn(`[movement] content build failed (${movement}):`, err?.message || err);
+      content = { activeSignals };
+    }
+
     // Cached intelligence — keyed by movement, refreshed when the cache
     // expires or the active-signal fingerprint changes.
     const fingerprint = activeSignals.map((s) => `${s.id}:${s.state}`).join("|");
@@ -144,6 +213,7 @@ export default async function handler(req, res) {
       patterns: parsedPatterns,
       intelligence,
       nextAction,
+      content,
     });
   } catch (err) {
     console.error("[movement] handler error:", err?.message || err);
